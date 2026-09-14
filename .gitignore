@@ -1,0 +1,23 @@
+.vscode/*
+src/tests.py
+tests.py
+test.py
+__pycache__/
+ *.pyc
+opentele.egg-info/*
+build/*
+pydoc-markdown.yml
+build_script*
+.generated-files.txt
+
+# fork additions
+.venv/
+venv/
+*.egg-info/
+dist/
+.env
+*.session
+*.session-journal
+*.opentele.json
+.pytest_cache/
+.ruff_cache/

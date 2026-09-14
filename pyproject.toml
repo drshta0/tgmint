@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opentele"
+version = "1.15.1.post2"
+description = "opentele 1.15.1 with audited fixes and client fingerprint data refreshed to 2026 (becoming tgmint)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "thedemons" }]
+maintainers = [{ name = "tgmint authors" }]
+keywords = ["tdata", "tdesktop", "telegram", "telethon", "opentele", "session", "fingerprint"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+]
+dependencies = [
+    "telethon>=1.24,<2",
+    "tgcrypto",
+]
+
+[project.optional-dependencies]
+# PyQt5 is needed only for tdata (Telegram Desktop session folder) read/write.
+# The import is lazy: TelegramClient / API.Generate / session minting work
+# without Qt. A pure-Python replacement is planned (PLAN.md, step 4).
+qt = ["pyqt5"]
+
+[project.urls]
+Homepage = "https://github.com/thedemons/opentele"
+Upstream = "https://github.com/thedemons/opentele"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opentele"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/opentele", "README.md", "LICENSE", "FORK.md", "CHANGELOG.md", "selfcheck.py"]
