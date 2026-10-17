@@ -39,8 +39,13 @@ What is different so far (details, sources and the audit in [FORK.md](FORK.md)):
 - **Four audited bug fixes** — `OpenTeleException` was a `BaseException`;
   `APIData.__eq__` was always False and instances were unhashable; PyQt5 was
   imported even for Telethon-only use.
-- **PyQt5 is optional** (`pip install opentele[qt]`) — needed only to read or
+- **PyQt5 is optional** (`pip install tgmint[qt]`) — needed only to read or
   write a `tdata` folder.
+- **Software passkeys** (`tgmint.passkeys`, `pip install tgmint[passkeys]`)
+  — register a passkey on an account you hold a session for, then
+  [log back in with just the passkey file](PASSKEYS.md):
+  no phone number, no OTP. Wire format reverse-engineered from the official
+  Android client (TL layer 230).
 
 Sibling forks you may prefer today: [opentele2](https://github.com/DedInc/opentele2)
 and [opentele-ng](https://github.com/stufently/opentele) both already removed
@@ -48,7 +53,8 @@ Qt and are actively maintained; both ship static (and by now stale) client
 versions. This fork's direction — a live version resolver, platform-coherent
 fingerprints minted once per account, and a freshness check in CI so the
 package cannot quietly rot — is laid out in [PLAN.md](PLAN.md). The rename to
-`tgmint` is the next step; until then the import name stays `opentele`.
+`tgmint` landed in v1.15.1.post3: the import name is now `tgmint` (it was
+`opentele` through v1.15.1.post2).
 
 ## Features
 - Convert [Telegram Desktop](https://github.com/telegramdesktop/tdesktop) **tdata** sessions to [telethon](https://github.com/LonamiWebs/Telethon) sessions and vice versa.

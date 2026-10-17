@@ -5,7 +5,7 @@ from . import shared as td
 import hashlib
 
 # if TYPE_CHECKING:
-#     from ..opentele import *
+#     from ..tgmint import *
 
 
 class AuthKeyType(IntEnum):

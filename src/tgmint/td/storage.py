@@ -7,7 +7,7 @@ import os
 import tgcrypto
 
 # if TYPE_CHECKING:
-#     from ..opentele import *
+#     from ..tgmint import *
 
 
 class Serialize(BaseObject):

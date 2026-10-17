@@ -1,4 +1,4 @@
-"""Self-check for the fresh opentele fork — prints what Generate() emits.
+"""Self-check for tgmint — prints what Generate() emits.
 
 Install the package first (editable is fine), then run it from anywhere:
 
@@ -11,9 +11,9 @@ Exit code 1 if anything stale leaks through.
 
 import sys
 
-import opentele  # noqa: E402
-from opentele.api import API  # noqa: E402
-from opentele.devices import (  # noqa: E402
+import tgmint  # noqa: E402
+from tgmint.api import API  # noqa: E402
+from tgmint.devices import (  # noqa: E402
     AndroidDevice,
     LinuxDevice,
     WindowsDevice,
@@ -21,7 +21,7 @@ from opentele.devices import (  # noqa: E402
     macOSDevice,
 )
 
-print(f"opentele loaded from: {opentele.__file__}\n")
+print(f"tgmint loaded from: {tgmint.__file__}\n")
 
 STALE_MARKERS = (
     "3.4.3", "8.4.1", "Windows 8", "Windows 7", "XWayland",

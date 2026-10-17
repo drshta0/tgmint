@@ -335,10 +335,10 @@ class APIData(object, metaclass=BaseAPIMetaClass):
 class API(BaseObject):
     """
     #### Built-in templates for Telegram API
-    - **`opentele`** offers the ability to use **`official APIs`**, which are used by `official apps`.
+    - **`tgmint`** offers the ability to use **`official APIs`**, which are used by `official apps`.
     - According to [Telegram TOS](https://core.telegram.org/api/obtaining_api_id#using-the-api-id): *all accounts that sign up or log in using unofficial Telegram API clients are automatically put under observation to avoid violations of the Terms of Service*.
     - It also uses the **[lang_pack](https://core.telegram.org/method/initConnection)** parameter, of which [telethon can't use](https://github.com/LonamiWebs/Telethon/blob/master/telethon/_client/telegrambaseclient.py#L192) because it's for official apps only.
-    - Therefore, **there are no differences** between using `opentele` and `official apps`, the server can't tell you apart.
+    - Therefore, **there are no differences** between using `tgmint` and `official apps`, the server can't tell you apart.
     - You can use `TelegramClient.PrintSessions()` to check this out.
 
     ### Attributes:

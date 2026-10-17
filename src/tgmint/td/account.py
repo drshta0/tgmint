@@ -10,7 +10,7 @@ from telethon.sessions.abstract import Session
 import logging
 
 # if TYPE_CHECKING:
-#     from ..opentele import *
+#     from ..tgmint import *
 
 
 class MapData(BaseObject):  # nocov

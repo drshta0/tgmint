@@ -1,6 +1,43 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [v1.15.1.post5] - 2026-10-17
+
+- passkeys: `login_with_passkey` sends `from_auth_key_id` as the signed long the TL field is. Telethon reads `key_id` unsigned, so half of all keys (>= 2**63) failed to serialize on the cross-DC hop (`struct.error: 'q' format requires ...`).
+
+## [v1.15.1.post4] - 2026-10-09
+
+### Fixed
+- `tgmint/__init__.py` no longer imports `td` and `tl` eagerly (PEP 562
+  lazy attributes). `tgmint.tl` extends Telethon's `TelegramClient` at
+  import, and so does the pre-rename `opentele` build; loading both in one
+  process raised `BaseException("err")` from `extend_class`. A caller that
+  needs only `tgmint.passkeys` can now import it next to an installed
+  `opentele` without touching `tgmint.tl`.
+
+## [v1.15.1.post3] - 2026-10-08
+
+### Changed
+- **Import name is now `tgmint`** (distribution name `tgmint`, package `src/tgmint/`).
+  `import opentele` no longer resolves from this wheel; install the
+  `v1.15.1.post2` wheel beside it if you still need the old name.
+
+### Added
+- `tgmint.passkeys` — software passkeys for Telegram accounts, implemented
+  from the official Android client source (TL layer 230):
+  `register_passkey()` mints a WebAuthn credential (ES256/Ed25519, `fmt:none`
+  attestation) on any account you hold an authorized session for and stores
+  the private key locally; `login_with_passkey()` later logs an unauthorized
+  client back in with just that file — no phone number, no OTP
+  (handles home-datacenter switching and the 2FA cloud password path).
+  Also `list_passkeys()` / `delete_passkey()` and the raw TL requests
+  (`account.initPasskeyRegistration`, `account.registerPasskey`,
+  `auth.initPasskeyLogin`, `auth.finishPasskeyLogin`, ...) usable directly
+  with Telethon clients. Requires the optional `cryptography` package.
+  Offline tests in `tests/test_passkeys.py` verify the WebAuthn bytes the
+  way Telegram's server would (attestation parse, COSE key rebuild,
+  signature verification). See `PASSKEYS.md`.
+
 ## [v1.15.1.post2] - 2026-09-14 (fork)
 
 First release of the fork that is becoming **tgmint**. Import name is still `opentele`.

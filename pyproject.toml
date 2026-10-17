@@ -3,15 +3,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "opentele"
-version = "1.15.1.post2"
-description = "opentele 1.15.1 with audited fixes and client fingerprint data refreshed to 2026 (becoming tgmint)"
+name = "tgmint"
+version = "1.15.1.post5"
+description = "tgmint — opentele lineage: tdata/telethon conversion, official-API fingerprints, software passkeys"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 authors = [{ name = "thedemons" }]
 maintainers = [{ name = "tgmint authors" }]
-keywords = ["tdata", "tdesktop", "telegram", "telethon", "opentele", "session", "fingerprint"]
+keywords = ["tdata", "tdesktop", "telegram", "telethon", "tgmint", "session", "fingerprint", "passkeys"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -28,13 +28,15 @@ dependencies = [
 # The import is lazy: TelegramClient / API.Generate / session minting work
 # without Qt. A pure-Python replacement is planned (PLAN.md, step 4).
 qt = ["pyqt5"]
+# cryptography is needed only for passkey create/sign (tgmint.passkeys).
+passkeys = ["cryptography"]
 
 [project.urls]
 Homepage = "https://github.com/thedemons/opentele"
 Upstream = "https://github.com/thedemons/opentele"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/opentele"]
+packages = ["src/tgmint"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/opentele", "README.md", "LICENSE", "FORK.md", "CHANGELOG.md", "selfcheck.py"]
+include = ["src/tgmint", "README.md", "LICENSE", "FORK.md", "CHANGELOG.md", "selfcheck.py"]
