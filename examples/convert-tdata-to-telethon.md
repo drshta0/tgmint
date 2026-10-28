@@ -6,9 +6,9 @@ This example will show you how to initialize a [TelegramClient][TelegramClient] 
 - The default path to `tdata` folder on Windows is located at `%appdata%\Telegram Desktop\tdata`.
 - We need to import these things:
     ```python
-    from opentele.td import TDesktop
-    from opentele.tl import TelegramClient
-    from opentele.api import API, UseCurrentSession, CreateNewSession
+    from tgmint.td import TDesktop
+    from tgmint.tl import TelegramClient
+    from tgmint.api import API, UseCurrentSession, CreateNewSession
     import asyncio
     ```
 - And we need to put the main code inside an async function:
@@ -62,9 +62,9 @@ await client.PrintSessions()
 
 ## Final result example
 ```python
-from opentele.td import TDesktop
-from opentele.tl import TelegramClient
-from opentele.api import API, UseCurrentSession
+from tgmint.td import TDesktop
+from tgmint.tl import TelegramClient
+from tgmint.api import API, UseCurrentSession
 import asyncio
 
 async def main():

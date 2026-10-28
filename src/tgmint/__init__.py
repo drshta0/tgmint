@@ -14,7 +14,16 @@ from __future__ import annotations
 
 import importlib
 
-__all__ = ["api", "td", "tl", "passkeys"]
+__all__ = ["api", "td", "tl", "passkeys", "adapters", "codec"]
+
+try:
+    # distribution metadata when installed; falls back to the literal when
+    # running straight from a checkout (PYTHONPATH=src) without installing
+    from importlib.metadata import version as _dist_version
+
+    __version__ = _dist_version("tgmint")
+except Exception:
+    __version__ = "1.16.0"
 
 
 def __getattr__(name: str):

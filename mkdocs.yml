@@ -1,6 +1,6 @@
-copyright: <a href="https://github.com/thedemons/opentele/" target="_blank" rel="noopener">thedemons.opentele</a>
+copyright: <a href="https://github.com/drshta0/tgmint/" target="_blank" rel="noopener">tgmint authors</a> — continuing <a href="https://github.com/thedemons/opentele/" target="_blank" rel="noopener">thedemons/opentele</a> (MIT)
 docs_dir: docs
-edit_uri: https://github.com/thedemons/opentele/tree/main/docs/
+edit_uri: https://github.com/drshta0/tgmint/edit/main/docs/
 extra_css:
 - assets/pymdownx-extras/extra-c12baed3e0.css
 extra_javascript:
@@ -23,7 +23,9 @@ markdown_extensions:
 - md_in_html: null
 - pymdownx.superfences:
     preserve_tabs: true
-- pymdownx.snippets: null
+- pymdownx.snippets:
+    base_path: docs
+    restrict_base_path: false
 - pymdownx.highlight:
     extend_pygments_lang:
     - lang: python
@@ -41,12 +43,12 @@ markdown_extensions:
 - pymdownx.inlinehilite: null
 - pymdownx.magiclink:
     normalize_issue_symbols: true
-    repo: opentele
+    repo: tgmint
     repo_url_shortener: true
     repo_url_shorthand: true
     social_url_shortener: true
     social_url_shorthand: true
-    user: thedemons
+    user: drshta0
 - pymdownx.tilde: null
 - pymdownx.caret: null
 - pymdownx.smartsymbols: null
@@ -68,6 +70,10 @@ markdown_extensions:
 - pymdownx.saneheaders: null
 nav:
 - Home: README.md
+- Frameworks: frameworks.md
+- Bot API recipes: bot-api.md
+- Migration from opentele: migration-from-opentele.md
+- Passkeys: passkeys.md
 - Examples:
   - Home: examples/README.md
   - Convert tdata to Telethon: examples/convert-tdata-to-telethon.md
@@ -90,10 +96,10 @@ nav:
     - LoginFlag: documentation/authorization/loginflag.md
   - Exceptions:
     - Home: documentation/exceptions/README.md
-repo_url: https://github.com/thedemons/opentele
-site_author: thedemons
-site_description: A python library created to make life easier for Telegram API Developers.
-site_name: opentele
+repo_url: https://github.com/drshta0/tgmint
+site_author: "tgmint authors (upstream: thedemons)"
+site_description: Telegram session conversion, official-client fingerprints and software passkeys — the opentele lineage, continued.
+site_name: tgmint
 theme:
   custom_dir: theme
   features:

@@ -54,8 +54,9 @@ Every file was read: `api.py`, `devices.py`, `exception.py`, `utils.py`,
 - `APIData.CustomInitConnectionList` grows by one entry per instance (upstream
   disabled removal in `destroy()`). Bounded and tiny for mint-per-login usage;
   touching the registry risks the PID lookup the wire swap depends on.
-- `Generate()` keeps the class-default `app_version` regardless of chosen
-  system (see "Known limitation" below).
+- `Generate()` kept the class-default `app_version` regardless of chosen
+  system until 2026-10; TelegramDesktop's `Generate()` now picks a
+  platform-coherent one (see "Known limitation" below for the mobile side).
 - No network calls exist anywhere in the library — nothing phones home
   (checked every module).
 
@@ -73,7 +74,7 @@ Every file was read: `api.py`, `devices.py`, `exception.py`, `utils.py`,
 | `devices.py` macOSDevice | macOS 10.12–12.1, Intel-only identifiers | **12.0.1–26.1** + Apple Silicon identifiers (M1/M2, Mac Studio) |
 | `devices.py` AndroidDevice | SDK 23–31, 2021-era devices | SDK **31–36** + 2024–25 flagships (S24/S23, Pixel 8/9, OnePlus 12/11, Xiaomi 14/13T Pro) |
 | `devices.py` iOSDeivce | iPhone ≤13, iOS ≤15 | iPhone ≤**17**, iOS ≤**26** |
-| `api.py` Web K / Z / Webogram | untouched | untouched — versions are injected at web build time and could not be verified from source |
+| `api.py` Web K / Z / Webogram | Chrome/96 UA, versions unverified | Chrome/**157.0.8103.15** UA; Web Z `12.0.47` (verified via version.txt/package.json); Web K `1.0.1 K` left as-is (build-time injected, unverifiable) |
 
 Sources for the version numbers (fetched 2026-09-12):
 
@@ -105,11 +106,13 @@ tgosint (the project this fork was born in) does **not** yet depend on this repo
 resolver and per-account fingerprint engine (`src/tgosint/sessions/fingerprint.py`),
 which composes fine with either this fork or upstream opentele.
 
-Known limitation (upstream behavior, unchanged on purpose): `Generate()` only
-randomizes `device_model` / `system_version` — `app_version` stays the class
-default (`"7.2.8 x64"`) regardless of the chosen system. Real clients vary it
-per platform (bare version on Linux, `arm64` suffix on Apple Silicon). If you
-need that, compose it yourself the way `tgosint/sessions/fingerprint.py` does.
+Known limitation (partially lifted, 2026-10): `Generate()` randomizes
+`device_model` / `system_version`; for **TelegramDesktop** it now also picks a
+platform-coherent `app_version` — the bare version on Linux and Intel macs,
+`… x64` on Windows, `… arm64` on Apple-Silicon macs (per identifier), the way
+tdesktop's 64-bit builds report it. The mobile presets (`TelegramAndroid`,
+`TelegramIOS`, `TelegramMacOS`, …) still keep their class-default
+`app_version`, which is fine: those app versions don't vary by hardware.
 
 ## Maintenance
 

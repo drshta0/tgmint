@@ -1,15 +1,19 @@
 from __future__ import annotations
 from typing import List, Dict, Tuple, TypeVar, Type
 from .utils import *
-import hashlib, os
+import hashlib, os, re
 
 _T = TypeVar("_T")
 
 
 class DeviceInfo(object):
-    def __init__(self, model, version) -> None:
+    def __init__(self, model, version, suffix: str = "") -> None:
         self.model = model
         self.version = version
+        # arch suffix tdesktop appends to app_version on 64-bit builds
+        # ("" for Android/iOS/Linux and Intel-mac rows, "x64" for Windows,
+        # "arm64" for Apple-Silicon mac rows)
+        self.suffix = suffix
 
     def __str__(self) -> str:
         return f"{self.model} {self.version}"
@@ -63,16 +67,53 @@ class SystemInfo(BaseObject):
         return " ".join(word for word in text.split(" ") if word)
 
 
+# Crawl junk that carries no hardware information: placeholder strings the
+# SMBIOS/registry dumps emit when the vendor didn't fill the field in, plus
+# HTML-entity artifacts ("&#160;" = nbsp) and backslash-escaped names that
+# slipped through the crawl un-decoded.
+_JUNK_BOARD_MODELS = frozenset(
+    {
+        "INVALID",
+        "Default string",
+        "Not Applicable",
+        "OEM",
+        "Desktop",
+        "Notebook PC",
+        "Portable PC",
+        "0000000000",
+    }
+)
+
+
+def _clean_board_models(models: List[str]) -> List[str]:
+    """Filter junk placeholder board names out of a raw crawl list.
+
+    Used by both ``WindowsDevice.__gen__`` and ``LinuxDevice.__gen__`` on the
+    shared ``GeneralDesktopDevice.device_models`` list. Order is preserved.
+    """
+    return [
+        model
+        for model in models
+        if model not in _JUNK_BOARD_MODELS
+        and "&#" not in model
+        and "\\" not in model
+    ]
+
+
 class GeneralDesktopDevice(SystemInfo):
 
-    # Total: 794 devices, update Jan 10th 2022
+    # Total: 790 raw crawl entries, update Jan 10th 2022 (recounted 2026-10);
+    # 780 usable after the junk-placeholder/HTML-entity filter applied by
+    # _clean_board_models() at generation time (see the top of this file).
     # Real device models that I crawled myself from the internet
     #
     # This is the values in HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\BIOS
     # including SystemFamily, SystemProductName, BaseBoardProduct
     #
-    # Filtered any models that exceed 15 characters
-    # just like tdesktop does in lib_base https://github.com/desktop-app/lib_base/blob/master/base/platform/win/base_info_win.cpp#L173
+    # The original crawl dropped any models exceeding 15 characters, just like
+    # tdesktop does in lib_base https://github.com/desktop-app/lib_base/blob/master/base/platform/win/base_info_win.cpp#L173
+    # (a few entries over that limit survived anyway; the junk filter now also
+    # removes placeholder names such as "INVALID" or "Default string")
     #
     # Feel free to use
     #
@@ -875,7 +916,13 @@ class GeneralDesktopDevice(SystemInfo):
 class WindowsDevice(GeneralDesktopDevice):
     # refreshed 2026-09: current Telegram Desktop builds run on Windows 10/11;
     # 7/8/8.1 are EOL and would flag the account as implausibly outdated
-    system_versions = ["Windows 11", "Windows 10"]
+    #
+    # refreshed 2026-10: tdesktop's lib_base appends the CPU arch to
+    # system_version on 64-bit builds (base/platform/win/base_info_win.cpp),
+    # so a bare "Windows 11" would be the rare 32-bit client — x64-only pool.
+    # The rare x86 form is dropped on purpose: safe direction, it can only
+    # make the fingerprint more common, never impossible.
+    system_versions = ["Windows 11 x64", "Windows 10 x64"]
 
     deviceList: List[DeviceInfo] = []
 
@@ -886,10 +933,10 @@ class WindowsDevice(GeneralDesktopDevice):
 
             results: List[DeviceInfo] = []
 
-            for model in cls.device_models:
+            for model in _clean_board_models(cls.device_models):
                 model = cls._CleanAndSimplify(model.replace("_", ""))
                 for version in cls.system_versions:
-                    results.append(DeviceInfo(model, version))
+                    results.append(DeviceInfo(model, version, suffix="x64"))
 
             cls.deviceList = results
 
@@ -959,8 +1006,9 @@ class LinuxDevice(GeneralDesktopDevice):
 
             results: List[DeviceInfo] = []
 
+            # refreshed 2026-10: same junk-placeholder filter as WindowsDevice
             for version in cls.system_versions:
-                for model in cls.device_models:
+                for model in _clean_board_models(cls.device_models):
                     results.append(DeviceInfo(model, version))
 
             cls.deviceList = results
@@ -1006,25 +1054,25 @@ class macOSDevice(GeneralDesktopDevice):
         "MacBookAir8,2",
         "MacBookAir8,1",
         "MacBookAir7,2",
-        "MacBookAir7,2",
         "MacBookAir7,1",
         "MacBookAir6,2",
         "MacBookAir6,1",
-        "MacBookAir6,2",
         "MacBook10,1",
         "MacBook9,1",
         "MacBook8,2",
         "MacBook8,1",
         "MacPro7,1",
         "MacPro6,1",
+        # refreshed 2026-10: Mac mini family was missing entirely
+        # (8,1 = 2018 Intel, 9,1 = M1 2020)
+        "Macmini8,1",
+        "Macmini9,1",
         "iMac20,2",
         "iMac20,1",
         "iMac19,1",
         "iMac18,3",
         "iMac18,2",
         "iMac18,1",
-        "iMac17,1",
-        "iMac17,1",
         "iMac17,1",
         "iMac16,2",
         "iMac16,1",
@@ -1067,7 +1115,109 @@ class macOSDevice(GeneralDesktopDevice):
         "macOS 26.1",
     ]
 
+    # refreshed 2026-10: per-identifier support table (replaces the old
+    # cross-product of marketing names x every version, which paired e.g.
+    # a 2015 MacBook Air with macOS 26).
+    # identifier -> (min_ver, max_ver, arch) where versions are numeric
+    # (major, minor) tuples compared against parsed entries of the
+    # system_versions list above, and arch is "" (Intel) or "arm64"
+    # (Apple Silicon — tdesktop appends it to app_version).
+    #
+    # Verified support windows per hardware identifier:
+    # (min_version, max_version, arch) — min is the exact lowest macOS the
+    # model is paired with; max is the highest *major* it supports (the minor
+    # in max is a placeholder and ignored by __gen__). arch "" = Intel,
+    # "arm64" = Apple Silicon (tdesktop appends it to app_version).
+    # Identifiers NOT in this table produce no combos at all
+    # (MacBookAir6,1/6,2 and MacPro6,1 max out at macOS 11; the 2012-2014
+    # iMacs and MacBookPro10,x/11,x-era leftovers beyond their window).
+    _IDENTIFIER_INFO: Dict[str, Tuple[Tuple[int, int], Tuple[int, int], str]] = {
+        "MacBookAir7,1": ((12, 0), (12, 0), ""),
+        "MacBookAir7,2": ((12, 0), (12, 0), ""),
+        "MacBookAir8,1": ((12, 0), (15, 0), ""),
+        "MacBookAir8,2": ((12, 0), (15, 0), ""),
+        "MacBookAir9,1": ((12, 0), (15, 0), ""),
+        "MacBookAir10,1": ((12, 0), (15, 0), "arm64"),  # M1 2020 — conservative: not claiming 26 on M1
+        "MacBook8,1": ((12, 0), (12, 0), ""),
+        "MacBook8,2": ((12, 0), (12, 0), ""),
+        "MacBook9,1": ((12, 0), (12, 0), ""),
+        "MacBook10,1": ((12, 0), (13, 0), ""),  # 2017 12" = last one on Ventura
+        "MacBookPro11,1": ((12, 0), (12, 0), ""),
+        "MacBookPro11,2": ((12, 0), (12, 0), ""),
+        "MacBookPro11,3": ((12, 0), (12, 0), ""),
+        "MacBookPro11,4": ((12, 0), (12, 0), ""),
+        "MacBookPro11,5": ((12, 0), (12, 0), ""),
+        "MacBookPro12,1": ((12, 0), (12, 0), ""),
+        "MacBookPro13,1": ((12, 0), (13, 0), ""),
+        "MacBookPro13,2": ((12, 0), (13, 0), ""),
+        "MacBookPro13,3": ((12, 0), (13, 0), ""),
+        "MacBookPro14,1": ((12, 0), (13, 0), ""),
+        "MacBookPro14,2": ((12, 0), (13, 0), ""),
+        "MacBookPro14,3": ((12, 0), (13, 0), ""),
+        "MacBookPro15,1": ((12, 0), (15, 0), ""),
+        "MacBookPro15,2": ((12, 0), (15, 0), ""),
+        "MacBookPro15,3": ((12, 0), (15, 0), ""),
+        "MacBookPro15,4": ((12, 0), (15, 0), ""),
+        "MacBookPro16,1": ((12, 0), (15, 0), ""),
+        "MacBookPro16,2": ((12, 0), (15, 0), ""),
+        "MacBookPro16,3": ((12, 0), (15, 0), ""),
+        "MacBookPro16,4": ((12, 0), (15, 0), ""),
+        "MacBookPro17,1": ((12, 0), (15, 0), "arm64"),
+        "MacBookPro18,1": ((12, 0), (26, 0), "arm64"),
+        "MacBookPro18,2": ((12, 0), (26, 0), "arm64"),
+        "MacBookPro18,3": ((12, 0), (26, 0), "arm64"),
+        "MacBookPro18,4": ((12, 0), (26, 0), "arm64"),
+        "MacPro7,1": ((12, 0), (15, 0), ""),
+        "iMac16,1": ((12, 0), (12, 0), ""),
+        "iMac16,2": ((12, 0), (12, 0), ""),
+        "iMac17,1": ((12, 0), (12, 0), ""),
+        "iMac18,1": ((12, 0), (13, 0), ""),
+        "iMac18,2": ((12, 0), (13, 0), ""),
+        "iMac18,3": ((12, 0), (13, 0), ""),
+        "iMac19,1": ((12, 0), (14, 0), ""),
+        "iMac20,1": ((12, 0), (15, 0), ""),
+        "iMac20,2": ((12, 0), (15, 0), ""),
+        "iMac21,1": ((12, 0), (15, 0), "arm64"),
+        "iMac21,2": ((12, 0), (15, 0), "arm64"),
+        "iMacPro1,1": ((12, 0), (14, 0), ""),
+        "MacStudio1,1": ((12, 3), (26, 0), "arm64"),  # shipped on 12.3 → must NOT pair with 12.0.1/12.1
+        "MacStudio1,2": ((12, 3), (26, 0), "arm64"),
+        "Macmini8,1": ((12, 0), (15, 0), ""),  # 2018 Intel
+        "Macmini9,1": ((12, 0), (15, 0), "arm64"),  # M1 2020
+    }
+
     deviceList: List[DeviceInfo] = []
+
+    @staticmethod
+    def FromIdentifier(model: str) -> str:
+        """Collapse an Apple board identifier ("MacBookPro18,1") into the
+        marketing name current Macs report ("MacBook Pro")."""
+        words = []
+        word = ""
+
+        for ch in model:
+            if not ch.isalpha():
+                continue
+            if ch.isupper():
+                if word != "":
+                    words.append(word)
+                    word = ""
+            word += ch
+
+        if word != "":
+            words.append(word)
+        result = ""
+        for word in words:
+            if result != "" and word != "Mac" and word != "Book":
+                result += " "
+            result += word
+
+        # Apple's marketing name for the mini line is two words, lowercase:
+        # "Mac mini" (the identifier is "Macmini8,1" with no case to split on)
+        if result == "Macmini":
+            result = "Mac mini"
+
+        return result
 
     @classmethod
     def __gen__(cls: Type[macOSDevice]) -> None:
@@ -1076,42 +1226,37 @@ class macOSDevice(GeneralDesktopDevice):
 
             # https://github.com/desktop-app/lib_base/blob/master/base/platform/mac/base_info_mac.mm#L42
 
-            def FromIdentifier(model: str):
-                words = []
-                word = ""
-
-                for ch in model:
-                    if not ch.isalpha():
-                        continue
-                    if ch.isupper():
-                        if word != "":
-                            words.append(word)
-                            word = ""
-                    word += ch
-
-                if word != "":
-                    words.append(word)
-                result = ""
-                for word in words:
-                    if result != "" and word != "Mac" and word != "Book":
-                        result += " "
-                    result += word
-
-                return result
-
-            new_devices_models = []
-            for model in cls.device_models:
-                model = cls._CleanAndSimplify(FromIdentifier(model))
-                if not model in new_devices_models:
-                    new_devices_models.append(model)
-
-            cls.device_models = new_devices_models
+            def ParseVersion(version: str) -> Tuple[int, int]:
+                numbers = version.replace("macOS ", "").split(".")
+                return (int(numbers[0]), int(numbers[1]))
 
             results: List[DeviceInfo] = []
+            seen = set()
 
-            for model in cls.device_models:
+            for identifier in cls.device_models:
+                info = cls._IDENTIFIER_INFO.get(identifier)
+
+                # unknown = excluded: an identifier without a verified
+                # support window produces nothing rather than every version
+                if info is None:
+                    continue
+
+                min_ver, max_ver, arch = info
+                name = cls._CleanAndSimplify(cls.FromIdentifier(identifier))
+
                 for version in cls.system_versions:
-                    results.append(DeviceInfo(model, version))
+                    ver = ParseVersion(version)
+
+                    # min_ver is exact ("this Mac shipped on 12.3"); max_ver is
+                    # "through this major" — max (13, 0) must still admit
+                    # "macOS 13.2" / "macOS 13.6.9", so only the major is
+                    # compared at the upper edge.
+                    if ver >= min_ver and ver[0] <= max_ver[0]:
+                        # sibling identifiers of one model (e.g. MacBookAir8,1
+                        # and 8,2) collapse to the same name — dedupe rows
+                        if (name, version, arch) not in seen:
+                            seen.add((name, version, arch))
+                            results.append(DeviceInfo(name, version, suffix=arch))
 
             cls.deviceList = results
 
@@ -5344,7 +5489,8 @@ class AndroidDevice(SystemInfo):
         "Huawei Vodafone 858",
         "Huawei MediaPad 7 Classic",
         "Huawei MediaPad 7 Lite II",
-        "Huawei MediaPad 7 Vogue" "Huawei LEO-BX9",
+        "Huawei MediaPad 7 Vogue",
+        "Huawei LEO-BX9",
         "Huawei LEO-DLXX",
         "Huawei GEM-701L",
         "Huawei GEM-702L",
@@ -6016,6 +6162,62 @@ class AndroidDevice(SystemInfo):
         "SDK 36",
     ]
 
+    # refreshed 2026-10: model -> SDK capability table (first match wins).
+    # SDKs: Android 12=31, 12L=32, 13=33, 14=34, 15=35, 16=36.
+    # A model is emitted only for n in range(min_sdk, max_sdk+1) of the FIRST
+    # rule it matches; models matching NO rule are excluded from deviceList
+    # (they stay in the raw device_models list above untouched).
+    #
+    # Excluded by design:
+    #   - all Huawei (post-2019 models = HarmonyOS; pre-2019 max SDK 29)
+    #   - all HTC (max SDK 29)
+    #   - Samsung GT-* / old SM-A codes (2012-2016 era crawl, max SDK 28-30)
+    #   - the rest of the 2012-2016 crawl
+    #   - realme RMX3700 (identity unverified)
+    # Unknown models are excluded because a smaller 100%-plausible pool beats
+    # a huge pool with impossible combos. Maintainers: GROW this verified
+    # table over time (one rule per verified model/model-line), don't loosen it.
+    _SDK_RANGES: List[Tuple[re.Pattern, int, int]] = [
+        # Samsung Galaxy S24 line, 2024, ships Android 14
+        (re.compile(r"^Samsung SM-S928B$"), 34, 36),
+        (re.compile(r"^Samsung SM-S921B$"), 34, 36),
+        (re.compile(r"^Samsung SM-S916B$"), 34, 36),
+        # Samsung Galaxy A55, 2024
+        (re.compile(r"^Samsung SM-A556B$"), 34, 36),
+        # Samsung Galaxy S10 line, 2019 — max Android 12
+        (re.compile(r"^Samsung SM-G97\d"), 31, 31),
+        # Samsung Galaxy S20 line, 2020 — max Android 13
+        (re.compile(r"^Samsung SM-G98\d"), 31, 33),
+        # Samsung Galaxy Note10, 2019 — max Android 12
+        (re.compile(r"^Samsung SM-N97\d"), 31, 31),
+        # Samsung Galaxy Note20, 2020 — max Android 13
+        (re.compile(r"^Samsung SM-N98\d"), 31, 33),
+        # Samsung Galaxy Fold, 2019 — max Android 12
+        (re.compile(r"^Samsung SM-F900"), 31, 31),
+        (re.compile(r"^Samsung SM-F907"), 31, 31),
+        # Samsung Galaxy Flip, 2019 — max Android 12
+        (re.compile(r"^Samsung SM-F700"), 31, 31),
+        (re.compile(r"^Samsung SM-F707"), 31, 31),
+        # Samsung Galaxy Z Fold2, 2020 — max Android 13
+        (re.compile(r"^Samsung SM-F916"), 31, 33),
+        # Samsung Galaxy Tab S7 / S7+, 2020 — max Android 13
+        (re.compile(r"^Samsung SM-T87\d"), 31, 33),
+        (re.compile(r"^Samsung SM-T97\d"), 31, 33),
+        # Google Pixel 8 / 9, 2023-2024 — ship Android 14
+        (re.compile(r"^Google Pixel 8$"), 34, 36),
+        (re.compile(r"^Google Pixel 8 Pro$"), 34, 36),
+        (re.compile(r"^Google Pixel 9$"), 34, 36),
+        (re.compile(r"^Google Pixel 9 Pro$"), 34, 36),
+        # OnePlus 11R, 2023 — ships Android 13
+        (re.compile(r"^OnePlus CPH2449$"), 33, 35),
+        # OnePlus 12R, 2024 — ships Android 14
+        (re.compile(r"^OnePlus CPH2581$"), 34, 36),
+        # Redmi Note 13 Pro+ (23117RA68G), 2024 — ships Android 13
+        (re.compile(r"^Xiaomi 23117RA68G$"), 33, 35),
+        # POCO X6 Pro (23116PN5BG), 2024 — ships Android 13
+        (re.compile(r"^Xiaomi 23116PN5BG$"), 33, 35),
+    ]
+
     deviceList: List[DeviceInfo] = []
 
     @classmethod
@@ -6025,58 +6227,86 @@ class AndroidDevice(SystemInfo):
 
             results: List[DeviceInfo] = []
 
+            # dedupe device_models preserving order (the raw crawl has ~420
+            # duplicate strings, some up to x5/x6), then keep only models
+            # with a verified SDK window — first matching rule wins,
+            # unknown = excluded
+            seen = set()
             for model in cls.device_models:
-                for version in cls.system_versions:
-                    results.append(DeviceInfo(model, version))
+                if model in seen:
+                    continue
+                seen.add(model)
+
+                for pattern, min_sdk, max_sdk in cls._SDK_RANGES:
+                    if pattern.search(model):
+                        for sdk in range(min_sdk, max_sdk + 1):
+                            results.append(DeviceInfo(model, f"SDK {sdk}"))
+                        break
 
             cls.deviceList = results
 
 
 class iOSDeivce(SystemInfo):
 
-    device_models = {
-        5: ["S"],
-        6: [" Plus", "", "S", "S Plus"],
-        7: ["", " Plus"],
-        8: ["", " Plus"],
-        10: ["", "S", "S Max", "R"],
-        11: ["", " Pro", " Pro Max"],
-        12: [" mini", "", " Pro", " Pro Max"],
-        13: [" Pro", " Pro Max", " Mini", ""],
-        # refreshed 2026-09: iPhone 14 through 17 (17 line adds Air)
-        14: [" Plus", "", " Pro", " Pro Max"],
-        15: ["", " Plus", " Pro", " Pro Max"],
-        16: ["", " Plus", " Pro", " Pro Max"],
-        17: [" Air", "", " Pro", " Pro Max"],
-    }
+    # refreshed 2026-10: explicit support table (exact Apple marketing name,
+    # min iOS major, max iOS major) — replaces the number-keyed dict +
+    # suffix-string trick and its buggy catch-all that paired an iPhone 5s
+    # with iOS 13. Casing is exactly as Apple writes it ("6s", "mini", "XS").
+    device_models: List[Tuple[str, int, int]] = [
+        ("iPhone 6", 12, 12),
+        ("iPhone 6 Plus", 12, 12),
+        # SE 1st gen 2016, same window as 6s
+        ("iPhone 6s", 15, 15),
+        ("iPhone 6s Plus", 15, 15),
+        ("iPhone SE", 15, 15),
+        ("iPhone 7", 15, 15),
+        ("iPhone 7 Plus", 15, 15),
+        ("iPhone 8", 16, 16),
+        ("iPhone 8 Plus", 16, 16),
+        ("iPhone X", 16, 16),
+        ("iPhone XR", 16, 18),
+        ("iPhone XS", 16, 18),
+        ("iPhone XS Max", 16, 18),
+        ("iPhone 11", 17, 26),
+        ("iPhone 11 Pro", 17, 26),
+        ("iPhone 11 Pro Max", 17, 26),
+        ("iPhone 12 mini", 17, 26),
+        ("iPhone 12", 17, 26),
+        ("iPhone 12 Pro", 17, 26),
+        ("iPhone 12 Pro Max", 17, 26),
+        ("iPhone 13 mini", 18, 26),
+        ("iPhone 13", 18, 26),
+        ("iPhone 13 Pro", 18, 26),
+        ("iPhone 13 Pro Max", 18, 26),
+        ("iPhone 14", 18, 26),
+        ("iPhone 14 Plus", 18, 26),
+        ("iPhone 14 Pro", 18, 26),
+        ("iPhone 14 Pro Max", 18, 26),
+        ("iPhone 15", 18, 26),
+        ("iPhone 15 Pro", 18, 26),
+        ("iPhone 15 Pro Max", 18, 26),
+        ("iPhone 16", 26, 26),
+        ("iPhone 16 Plus", 26, 26),
+        ("iPhone 16 Pro", 26, 26),
+        ("iPhone 16 Pro Max", 26, 26),
+        # the Sept 2025 device is officially "iPhone Air" — "iPhone 17 Air"
+        # does NOT exist
+        ("iPhone Air", 26, 26),
+        ("iPhone 17", 26, 26),
+        ("iPhone 17 Pro", 26, 26),
+        ("iPhone 17 Pro Max", 26, 26),
+    ]
 
+    # major -> {minor: [patches]} (empty patch list = bare major.minor).
+    # Majors 19-25 don't exist: Apple jumped 18 -> 26 (year-based naming
+    # introduced in 2025), so they are simply absent from this table.
     system_versions: Dict[int, Dict[int, List[int]]] = {
-        # refreshed 2026-09: majors 16/17/18/26 added (26 = year-based naming
-        # introduced 2025); 26.x and 18.x are what current devices run
-        26: {0: [], 1: []},
-        18: {5: [], 4: [], 3: [2, 1], 2: [], 1: [], 0: []},
-        17: {7: [2], 6: [1], 5: [1], 4: [1], 3: [1], 2: [1], 1: [1], 0: [2, 1]},
-        16: {
-            7: [10],
-            6: [1],
-            5: [1],
-            4: [1],
-            3: [1],
-            2: [1],
-            1: [1],
-            0: [3, 2, 1],
-        },
-        15: {2: [], 1: [1], 0: [2, 1]},
-        14: {8: [1], 7: [1], 6: [], 5: [1], 4: [2, 1], 3: [], 2: [1], 1: [], 0: [1]},
-        13: {7: [], 6: [1], 5: [1], 4: [1], 3: [1], 2: [3, 2], 1: [3, 2, 1]},
-        12: {
-            5: [5, 4, 3, 2, 1],
-            4: [9, 8, 7, 6, 5, 4, 3, 2, 1],
-            3: [2, 1],
-            2: [],
-            1: [4, 3, 2, 1],
-            0: [1],
-        },
+        12: {5: [7]},
+        15: {8: [3, 1], 7: [4, 2], 6: [1], 2: [1]},
+        16: {7: [10, 8], 6: [1], 3: [1], 1: [1]},
+        17: {7: [2], 5: [1], 3: [1], 2: [1]},
+        18: {5: [1], 4: [1], 3: [2, 1], 2: [2], 1: [1]},
+        26: {1: [], 0: [1]},
     }
 
     deviceList: List[DeviceInfo] = []
@@ -6087,47 +6317,19 @@ class iOSDeivce(SystemInfo):
         if len(cls.deviceList) == 0:
             results: List[DeviceInfo] = []
 
-            # ! SHITTY CODE BECAUSE I HAD TO CHECK FOR THE RIGHT VERSION
-            # refreshed 2026-09: launch-era pairing extended to iPhone 17 / iOS 26
-            for id_model in cls.device_models:
-                if id_model == 17:
-                    available_versions = [26]
-                elif id_model == 16:
-                    available_versions = [18, 26]
-                elif id_model == 15:
-                    available_versions = [17, 18, 26]
-                elif id_model == 14:
-                    available_versions = [16, 17, 18, 26]
-                elif id_model == 13:
-                    available_versions = [15, 16, 17, 18, 26]
-                elif id_model == 12:
-                    available_versions = [14, 15, 16, 17, 18]
-                elif id_model == 11:
-                    available_versions = [13, 14, 15, 16]
-                elif id_model == 5:
-                    available_versions = [12]
-                else:
-                    available_versions = [12, 13, 14, 15]
+            for device_model, min_major, max_major in cls.device_models:
+                for major in range(min_major, max_major + 1):
+                    # majors absent from the patch table (19-25) emit nothing
+                    for minor, patches in cls.system_versions.get(major, {}).items():
 
-                for model_name in cls.device_models[id_model]:
-
-                    if id_model == 10:
-                        id_model = "X"
-                    device_model = f"iPhone {id_model}{model_name}"
-
-                    for major in available_versions:
-                        for minor, patches in cls.system_versions[major].items():
-
-                            if len(patches) == 0:
+                        if len(patches) == 0:
+                            results.append(DeviceInfo(device_model, f"{major}.{minor}"))
+                        else:
+                            for patch in patches:
                                 results.append(
-                                    DeviceInfo(device_model, f"{major}.{minor}")
-                                )
-                            else:
-                                for patch in patches:
-                                    results.append(
-                                        DeviceInfo(
-                                            device_model, f"{major}.{minor}.{patch}"
-                                        )
+                                    DeviceInfo(
+                                        device_model, f"{major}.{minor}.{patch}"
                                     )
+                                )
 
             cls.deviceList = results

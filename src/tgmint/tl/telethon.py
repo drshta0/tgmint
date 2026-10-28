@@ -301,6 +301,99 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                 
         """
 
+    @staticmethod
+    def _apiInitKwargs(api: Union[Type[APIData], APIData]) -> Dict[str, Any]:
+        """
+        Real fingerprint fields to pass into telethon's base client.
+
+        Fork note (scoped wire patch): upstream instead smuggled a registry
+        PID through telethon's ``device_model`` argument so the globally
+        patched ``InitConnectionRequest`` constructor could swap the real
+        fingerprint in (see ``CustomInitConnectionRequest`` above). On every
+        Telethon this fork supports (>= 1.24) the base client builds the
+        request once in ``__init__`` and stores it as ``_init_request``, so
+        we pass the REAL fields here and then rewrite the stored request
+        after construction — no PID games, no reliance on the global patch,
+        and ``lang_pack`` plus the optional ``params`` timezone blob land on
+        the wire exactly the way official clients send them.
+        Fields that are None are omitted so telethon's own defaults apply.
+        """
+        return {
+            key: value
+            for key, value in {
+                "device_model": api.device_model,
+                "system_version": api.system_version,
+                "app_version": api.app_version,
+                "lang_code": api.lang_code,
+                "system_lang_code": api.system_lang_code,
+            }.items()
+            if value is not None
+        }
+
+    def _applyApiToInitRequest(self, api: Union[Type[APIData], APIData]):
+        """
+        Rewrite telethon's stored ``InitConnectionRequest`` so every wire
+        field matches the fingerprint: the eight identity fields, the
+        official ``lang_pack`` (which stock telethon hardcodes to ``""``),
+        and — when the fingerprint carries an IANA timezone — the ``params``
+        JSON blob with ``tz_offset``, matching official clients.
+        """
+        request = self._init_request
+
+        request.api_id = api.api_id
+        if api.device_model is not None:
+            request.device_model = api.device_model
+        if api.system_version is not None:
+            request.system_version = api.system_version
+        if api.app_version is not None:
+            request.app_version = api.app_version
+        if api.lang_code is not None:
+            request.lang_code = api.lang_code
+        if api.system_lang_code is not None:
+            request.system_lang_code = api.system_lang_code
+        if api.lang_pack is not None:
+            request.lang_pack = api.lang_pack
+
+        tz_zone = getattr(api, "tz_zone", None)
+        if tz_zone:
+            # cross-version guard: `params` only exists on the
+            # InitConnectionRequest of newer TL bundles (layer 196+, i.e.
+            # telethon >= ~1.36) and the Json* value types are generated
+            # from the schema — on an older telethon neither is wired, so
+            # the timezone blob is silently skipped rather than assigned
+            # to a field the serializer does not know.
+            json_object = getattr(types, "JsonObject", None)
+            json_value = getattr(types, "JsonObjectValue", None)
+            json_number = getattr(types, "JsonNumber", None)
+            offset = self._tzOffsetSeconds(tz_zone)
+            if (
+                hasattr(request, "params")
+                and offset is not None
+                and json_object is not None
+                and json_value is not None
+                and json_number is not None
+            ):
+                # telethon's numeric JSON type is JsonNumber (TL jsonObjectValue)
+                request.params = json_object(
+                    [json_value("tz_offset", json_number(offset))]
+                )
+
+    @staticmethod
+    def _tzOffsetSeconds(tz_zone: str) -> Optional[int]:
+        """
+        Seconds east of UTC for an IANA zone right now, or None if the zone
+        is unknown / tzdata is missing. Mirrors
+        tgmint.fingerprint.Fingerprint.tz_offset (kept local so this module
+        has no import cycle with the core data modules).
+        """
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            return int(datetime.now(ZoneInfo(tz_zone)).utcoffset().total_seconds())
+        except Exception:
+            return None
+
     @override
     def __init__(
         self,
@@ -321,29 +414,38 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                 api_id = api.api_id
                 api_hash = api.api_hash
 
-                # pass our hook id through the device_model
-                kwargs["device_model"] = api.pid  # type: ignore
+                # real fingerprint fields in, PID-smuggling out (see
+                # _apiInitKwargs for the full fork note)
+                kwargs.update(self._apiInitKwargs(api))
 
             else:
-                if (
-                    (isinstance(api, int) or isinstance(api, str))
-                    and api_id
-                    and isinstance(api_id, str)
-                ):
-                    api_id = api
-                    api_hash = api_id
-                api = None
+                # fork note: upstream had a dead branch here that claimed to
+                # accept an int/str api together with api_id/api_hash, but
+                # assigned `api_hash = api_id` (nonsense) and then dropped
+                # the values anyway. Anything that is not an APIData
+                # instance/class is rejected loudly now.
+                raise TypeError(
+                    "api must be an APIData instance/class, "
+                    "or pass api_id/api_hash instead"
+                )
 
         elif api_id == 0 and api_hash == None:
             api = API.TelegramDesktop
             api_id = api.api_id
             api_hash = api.api_hash
 
-            # pass our hook id through the device_model
-            kwargs["device_model"] = api.pid  # type: ignore
+            kwargs.update(self._apiInitKwargs(api))
 
         self._user_id = None
         self.__TelegramClient____init__(session, api_id, api_hash, **kwargs)
+
+        # scoped wire patch — see _applyApiToInitRequest. Guarded so exotic
+        # telethon builds without _init_request still construct fine (their
+        # request then simply carries the real fields passed above, minus
+        # lang_pack — the global CustomInitConnectionRequest patch remains
+        # registered as a compatibility path for such clients).
+        if api is not None and hasattr(self, "_init_request"):
+            self._applyApiToInitRequest(api)
 
     @property
     def UserId(self):
@@ -564,7 +666,9 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
             if newClient.session.dc_id != self.session.dc_id:
                 await newClient._switch_dc(self.session.dc_id)
         except OSError as e:
-            raise BaseException("Cannot connect")
+            raise OpenTeleException(
+                f"Cannot connect to Telegram servers: {e}"
+            ) from e
 
         if await newClient.is_user_authorized():  # nocov
 
@@ -634,7 +738,9 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                 import datetime
 
                 time_now = datetime.datetime.now(datetime.timezone.utc)
-                time_out = (qr_login.expires - time_now).seconds + 5
+                # total_seconds(), not .seconds — a token expiring in
+                # >24h would wrap through .seconds' time-of-day component
+                time_out = int((qr_login.expires - time_now).total_seconds()) + 5
 
                 resp = await self(
                     functions.auth.AcceptLoginTokenRequest(qr_login.token)

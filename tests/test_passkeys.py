@@ -24,6 +24,7 @@ from tgmint.passkeys import (
     InputPasskeyCredentialPublicKey,
     InputPasskeyResponseLogin,
     InputPasskeyResponseRegister,
+    PasskeyError,
     PasskeyStore,
     RegisterPasskeyRequest,
     SoftwareAuthenticator,
@@ -309,6 +310,65 @@ class TestSoftwareAuthenticator(unittest.TestCase):
         options = login_options(os.urandom(32), _b64u_encode(b"not-our-key"))
         with self.assertRaises(Exception):
             store.produce_assertion(options)
+
+
+class TestStoreValidation(unittest.TestCase):
+    """user_handle must be the 'dcId:userId' string Telegram sends.
+
+    A store file without that shape used to blow up later with a cryptic
+    ValueError from home_dc/user_id; PasskeyStore now rejects it loudly.
+    """
+
+    def _make_store(self, user_handle):
+        cred, _ = TestSoftwareAuthenticator()._register_and_verify_like_server(
+            ALG_ES256
+        )
+        return PasskeyStore(
+            credential_id=cred.credential_id,
+            rp_id=cred.rp_id,
+            origin=cred.origin,
+            alg=cred.alg,
+            user_handle=user_handle,
+            private_key_pem=cred.private_key_pem,
+        )
+
+    def test_construct_rejects_malformed_user_handle(self):
+        for bad in ("garbage", "2:123456789:extra", "abc:123", "2:", ":123",
+                    "2 123", "", "123456789"):
+            with self.assertRaises(PasskeyError, msg=repr(bad)):
+                self._make_store(bad)
+
+    def test_construct_error_message_is_helpful(self):
+        with self.assertRaises(PasskeyError) as ctx:
+            self._make_store("definitely not a handle")
+        self.assertIn("invalid user_handle", str(ctx.exception))
+        self.assertIn("passkey store", str(ctx.exception))
+
+    def test_construct_accepts_valid_handles(self):
+        store = self._make_store("2:123456789")
+        self.assertEqual(store.home_dc, 2)
+        self.assertEqual(store.user_id, 123456789)
+
+    def test_load_rejects_malformed_user_handle(self):
+        cred, _ = TestSoftwareAuthenticator()._register_and_verify_like_server(
+            ALG_ES256
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.json")
+            data = {
+                "version": 1,
+                "credential_id": _b64u_encode(cred.credential_id),
+                "rp_id": cred.rp_id,
+                "origin": cred.origin,
+                "alg": cred.alg,
+                "user_handle": "not-a-handle",
+                "private_key": cred.private_key_pem,
+                "sign_count": 0,
+            }
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(data, fp)
+            with self.assertRaises(PasskeyError):
+                PasskeyStore.load(path)
 
 
 class TestTlWire(unittest.TestCase):

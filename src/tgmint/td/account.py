@@ -8,6 +8,7 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions.abstract import Session
 
 import logging
+import os
 
 # if TYPE_CHECKING:
 #     from ..tgmint import *
@@ -34,8 +35,13 @@ class MapData(BaseObject):  # nocov
         self._featuredCustomEmojiKey = FileKey(0)
         self._archivedCustomEmojiKey = FileKey(0)
         self._searchSuggestionsKey = FileKey(0)
-        self._webviewStorageTokenBots = FileKey(0)
-        self._webviewStorageTokenOther = FileKey(0)
+        # fork note: tdesktop stores these as QByteArray token data, not
+        # FileKey (lskWebviewTokens = "data: QByteArray bots, QByteArray
+        # other" in storage_account.cpp) — the reader below fills them via
+        # `stream >>`. They stay empty on fresh instances, so nothing is
+        # written for this key unless a map carrying tokens is re-saved.
+        self._webviewStorageTokenBots = QByteArray()
+        self._webviewStorageTokenOther = QByteArray()
         self._savedGifsKey = FileKey(0)
         self._recentStickersKeyOld = FileKey(0)
         self._legacyBackgroundKeyDay = FileKey(0)
@@ -43,13 +49,28 @@ class MapData(BaseObject):  # nocov
 
         # self._settingsKey = FileKey(0)
         # ! TO BE ADDED
-        self._settingsKey = FileKey(1851671142505648812)
+        # fork note: upstream hardcoded 1851671142505648812 here ("MUST
+        # HAVE OR CAN'T WRITE MAPDATA") — a settings key shared by every
+        # tdata this library ever wrote. It is now random per instance;
+        # reading existing tdata is unaffected because read() overwrites
+        # this with the real settings key from the map file.
+        self._settingsKey = FileKey(int.from_bytes(os.urandom(8), "little"))
         """MUST HAVE OR CAN'T WRITE MAPDATA, I'M WOKRING TO FIX THIS"""
 
         self._recentHashtagsAndBotsKey = FileKey(0)
         self._exportSettingsKey = FileKey(0)
         self._installedMasksKey = FileKey(0)
         self._recentMasksKey = FileKey(0)
+        # fork note: map keys newer Telegram Desktop (5.x-6.x) writes —
+        # read-side tolerance ported from opentele-ng (upstream issue
+        # #120); see lskType in configs.py.
+        self._roundPlaceholder = FileKey(0)
+        self._inlineBotsDownloads = FileKey(0)
+        self._mediaLastPlaybackPositions = FileKey(0)
+        # lskBotStorages is a PeerId -> FileKey map, not a single key.
+        self._botStoragesMap: Dict[PeerId, FileKey] = {}
+        self._botStoragesNotReadMap: Dict[PeerId, bool] = {}
+        self._prefsKey = FileKey(0)
 
     def read(self, localKey: td.AuthKey, legacyPasscode: QByteArray) -> None:
 
@@ -119,14 +140,21 @@ class MapData(BaseObject):  # nocov
         featuredCustomEmojiKey = 0
         archivedCustomEmojiKey = 0
         searchSuggestionsKey = 0
-        webviewStorageTokenBots = 0
-        webviewStorageTokenOther = 0
+        webviewStorageTokenBots = QByteArray()
+        webviewStorageTokenOther = QByteArray()
         savedGifsKey = 0
         legacyBackgroundKeyDay = 0
         legacyBackgroundKeyNight = 0
         userSettingsKey = 0
         recentHashtagsAndBotsKey = 0
         exportSettingsKey = 0
+        # newer Telegram Desktop map keys (read-side tolerance)
+        roundPlaceholder = 0
+        inlineBotsDownloads = 0
+        mediaLastPlaybackPositions = 0
+        botStoragesMap: typing.Dict[PeerId, FileKey] = {}
+        botStoragesNotReadMap: typing.Dict[PeerId, bool] = {}
+        prefsKey = 0
 
         is_finished = False
 
@@ -233,7 +261,45 @@ class MapData(BaseObject):  # nocov
                 searchSuggestionsKey = map.stream.readUInt64()
 
             elif keyType == lskType.lskWebviewTokens:
-                is_finished = True
+                # fork note: this branch used to set the finished flag and
+                # break out of the read loop — upstream treated 0x19 as an
+                # end-of-map marker because the payload was unknown.
+                # tdesktop actually stores two QByteArrays here (bots,
+                # other), and stopping early made every map entry AFTER
+                # the tokens silently unreadable.
+                map.stream >> webviewStorageTokenBots
+                map.stream >> webviewStorageTokenOther
+
+            # newer Telegram Desktop map keys (read-side tolerance,
+            # ported from opentele-ng — see lskType in configs.py)
+            elif keyType == lskType.lskRoundPlaceholder:
+                roundPlaceholder = map.stream.readUInt64()
+
+            elif keyType == lskType.lskInlineBotsDownloads:
+                inlineBotsDownloads = map.stream.readUInt64()
+
+            elif keyType == lskType.lskMediaLastPlaybackPositions:
+                mediaLastPlaybackPositions = map.stream.readUInt64()
+
+            elif keyType == lskType.lskBotStorages:
+                # map: uint32 count + count x (FileKey uint64, PeerId uint64)
+                count = map.stream.readUInt32()
+                # parser-DoS cap, in the spirit of the mtp-authorization
+                # key-count check in _setMtpAuthorization: a corrupt or
+                # hostile count must not spin the loop
+                if count < 0 or count > 1024:
+                    raise TDataBadConfigData(
+                        f"implausible bot-storage count {count} in map data"
+                    )
+                for i in range(count):
+                    bs_key = FileKey(map.stream.readUInt64())
+                    bs_peerIdSerialized = map.stream.readUInt64()
+                    bs_peerId = PeerId.FromSerialized(bs_peerIdSerialized)
+                    botStoragesMap[bs_peerId] = bs_key
+                    botStoragesNotReadMap[bs_peerId] = True
+
+            elif keyType == lskType.lskPrefs:
+                prefsKey = map.stream.readUInt64()
 
             else:
                 logging.warning(f"Unknown key type in encrypted map: {keyType}")
@@ -269,6 +335,13 @@ class MapData(BaseObject):  # nocov
         self._settingsKey = userSettingsKey
         self._recentHashtagsAndBotsKey = recentHashtagsAndBotsKey
         self._exportSettingsKey = exportSettingsKey
+        # newer Telegram Desktop map keys
+        self._roundPlaceholder = roundPlaceholder
+        self._inlineBotsDownloads = inlineBotsDownloads
+        self._mediaLastPlaybackPositions = mediaLastPlaybackPositions
+        self._botStoragesMap = botStoragesMap
+        self._botStoragesNotReadMap = botStoragesNotReadMap
+        self._prefsKey = prefsKey
         self._oldMapVersion = mapData.version
 
     def prepareToWrite(self) -> td.Storage.EncryptedDescriptor:
@@ -314,8 +387,32 @@ class MapData(BaseObject):  # nocov
             mapSize += sizeof(uint32) + 3 * sizeof(uint64)
         if self._searchSuggestionsKey:
             mapSize += sizeof(uint32) + sizeof(uint64)
-        if self._webviewStorageTokenBots or self._webviewStorageTokenOther:
-            mapSize += sizeof(uint32) + 2 * sizeof(uint64)
+        # fork note: this used to be `if self._webviewStorageTokenBots or
+        # ...: mapSize += sizeof(uint32) + 2 * sizeof(uint64)` — but the
+        # fields were FileKeys while the wire format carries two
+        # QByteArrays. Byte-count via Serialize.bytearraySize now; the
+        # branch stays dead for fresh instances (both arrays empty).
+        if not self._webviewStorageTokenBots.isEmpty() or not (
+            self._webviewStorageTokenOther.isEmpty()
+        ):
+            mapSize += (
+                sizeof(uint32)
+                + td.Serialize.bytearraySize(self._webviewStorageTokenBots)
+                + td.Serialize.bytearraySize(self._webviewStorageTokenOther)
+            )
+        # newer Telegram Desktop map keys
+        if self._roundPlaceholder:
+            mapSize += sizeof(uint32) + sizeof(uint64)
+        if self._inlineBotsDownloads:
+            mapSize += sizeof(uint32) + sizeof(uint64)
+        if self._mediaLastPlaybackPositions:
+            mapSize += sizeof(uint32) + sizeof(uint64)
+        if len(self._botStoragesMap) > 0:
+            mapSize += (
+                sizeof(uint32) * 2 + len(self._botStoragesMap) * sizeof(uint64) * 2
+            )
+        if self._prefsKey:
+            mapSize += sizeof(uint32) + sizeof(uint64)
 
         mapData = td.Storage.EncryptedDescriptor(mapSize)
         stream = mapData.stream
@@ -394,10 +491,32 @@ class MapData(BaseObject):  # nocov
             stream.writeUInt32(lskType.lskSearchSuggestions)
             stream.writeUInt64(self._searchSuggestionsKey)
 
-        if self._webviewStorageTokenBots or self._webviewStorageTokenOther:
+        if not self._webviewStorageTokenBots.isEmpty() or not (
+            self._webviewStorageTokenOther.isEmpty()
+        ):
             stream.writeUInt32(lskType.lskWebviewTokens)
-            stream.writeUInt64(self._webviewStorageTokenBots)
-            stream.writeUInt64(self._webviewStorageTokenOther)
+            stream << self._webviewStorageTokenBots
+            stream << self._webviewStorageTokenOther
+
+        # newer Telegram Desktop map keys
+        if self._roundPlaceholder:
+            stream.writeUInt32(lskType.lskRoundPlaceholder)
+            stream.writeUInt64(self._roundPlaceholder)
+        if self._inlineBotsDownloads:
+            stream.writeUInt32(lskType.lskInlineBotsDownloads)
+            stream.writeUInt64(self._inlineBotsDownloads)
+        if self._mediaLastPlaybackPositions:
+            stream.writeUInt32(lskType.lskMediaLastPlaybackPositions)
+            stream.writeUInt64(self._mediaLastPlaybackPositions)
+        if len(self._botStoragesMap) > 0:
+            stream.writeUInt32(lskType.lskBotStorages)
+            stream.writeUInt32(len(self._botStoragesMap))
+            for peerId, fileKey in self._botStoragesMap.items():
+                stream.writeUInt64(fileKey)
+                stream.writeUInt64(PeerId(peerId).Serialize())
+        if self._prefsKey:
+            stream.writeUInt32(lskType.lskPrefs)
+            stream.writeUInt64(self._prefsKey)
 
         return mapData
 
@@ -803,7 +922,6 @@ class Account(BaseObject):
 
     def start(self) -> bool:
         raise NotImplementedError()
-        return self.isAuthorized()
 
     def prepareToStart(self, localKey: td.AuthKey) -> td.MTP.Config:
         """
@@ -873,10 +991,26 @@ class Account(BaseObject):
                 QDataStreamFailed("Could not read keys count from mtp authorization."),
             )
 
+            # sanity cap — a corrupt/hostile file must not make us loop a
+            # billion times (or a negative count, which range() skips
+            # silently while leaving the stream misaligned)
+            if key_count < 0 or key_count > 1024:
+                raise TDataBadConfigData(
+                    f"implausible key count {key_count} in mtp authorization"
+                )
+
             for i in range(key_count):
                 dcId = DcId(stream.readInt32())
                 keys.append(
                     td.AuthKey.FromStream(stream, td.AuthKeyType.ReadFromFile, dcId)
+                )
+                # a truncated stream reads as empty bytes and stays "Ok" in
+                # some Qt versions — check explicitly after every key
+                Expects(
+                    stream.status() == QDataStream.Status.Ok,
+                    QDataStreamFailed(
+                        "Could not read auth key from mtp authorization."
+                    ),
                 )
 
         self.__mtpKeys.clear()
@@ -1084,7 +1218,7 @@ class Account(BaseObject):
             Expects(
                 owner.accountsCount < td.TDesktop.kMaxAccounts,
                 exception=MaxAccountLimit(
-                    "You can't have more than 3 accounts in one TDesktop clent.\n"
+                    f"You can't have more than {td.TDesktop.kMaxAccounts} accounts in one TDesktop clent.\n"
                     "Please create another instance of TDesktop or use Account.FromTelethon() to create an Account() independently"
                 ),
             )

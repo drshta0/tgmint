@@ -49,6 +49,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,6 +92,11 @@ ALG_ES256 = -7   # ECDSA w/ SHA-256 on P-256, DER signature
 ALG_ED25519 = -8 # Ed25519, raw 64-byte signature
 
 _SUPPORTED_ALGS = (ALG_ES256, ALG_ED25519)
+
+# Telegram encodes the account as "dcId:userId" in the WebAuthn user handle
+# (e.g. "2:123456789"); everything downstream (home_dc, user_id, the login
+# request) depends on that shape.
+_USER_HANDLE_RE = re.compile(r"^\d+:\d+$")
 
 
 def _b64u_encode(data: bytes) -> str:
@@ -711,6 +717,17 @@ class PasskeyStore:
         self.origin = origin
         self.alg = alg
         self.user_handle = user_handle
+
+        # fail fast with a clear error instead of a cryptic ValueError from
+        # home_dc/user_id later — a store without a "dc:user" handle is not
+        # a tgmint passkey file (or the server changed its user-handle
+        # encoding, which we would need to mirror).
+        if not _USER_HANDLE_RE.match(user_handle or ""):
+            raise PasskeyError(
+                f"passkey store has an invalid user_handle {user_handle!r} "
+                "— this file does not look like a tgmint passkey store"
+            )
+
         self.private_key_pem = private_key_pem
         self.sign_count = sign_count
         self.created_at = created_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -754,10 +771,41 @@ class PasskeyStore:
         if not path:
             raise PasskeyError("no path set for passkey store")
         self.path = path
-        with open(path, "w", encoding="utf-8") as fp:
-            json.dump(self.to_dict(), fp, indent=2)
-            fp.write("\n")
-        os.chmod(path, 0o600)
+
+        # fork note: written atomically and private from the very first
+        # byte. The old plain open() created the file with the umask
+        # default (often 0644) and only chmod'ed it after the write, and a
+        # crash mid-write left a truncated JSON behind. We now write to a
+        # temp file in the SAME directory (so os.replace never crosses a
+        # filesystem), fsync it, then atomically swap it into place.
+        # os.replace is atomic on POSIX and works on Windows too.
+        directory = os.path.dirname(os.path.abspath(path))
+        tmp = os.path.join(
+            directory, f".{os.path.basename(path)}.tmp.{os.getpid()}"
+        )
+        payload = json.dumps(self.to_dict(), indent=2) + "\n"
+
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        replaced = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp, path)
+            replaced = True
+        finally:
+            if not replaced:
+                # the atomic swap never happened — don't leave the
+                # half-written temp file (and its 0600 key) behind
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            # covers pre-existing files that may have looser permissions
+            os.chmod(path, 0o600)
         return path
 
     @classmethod
@@ -863,6 +911,11 @@ async def login_with_passkey(
     #    sends initPasskeyLogin on whatever DC the connection is on).
     options_json = await client(InitPasskeyLoginRequest(client.api_id, client.api_hash))
     assertion = store.produce_assertion(options_json, origin=origin)
+
+    # persist the bumped signature counter BEFORE any network attempt, so
+    # a failed login doesn't leave the store with a stale (reusable)
+    # counter behind
+    store.save()
 
     # 2. If the account's home DC differs, switch now and pass
     #    from_dc_id/from_auth_key_id of the connection that got the

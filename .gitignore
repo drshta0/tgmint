@@ -21,3 +21,7 @@ dist/
 *.opentele.json
 .pytest_cache/
 .ruff_cache/
+
+# fork hygiene
+tests/test_profile*/
+.worktrees/

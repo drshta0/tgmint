@@ -212,9 +212,13 @@ class Storage(BaseObject):
         fullSize = size
         if fullSize & 0x0F:
             fullSize += 0x10 - (fullSize & 0x0F)
-            toEncrypt.resize(fullSize)
-            # TO BE ADDED
-            # base::RandomFill(toEncrypt.data() + size, fullSize - size);
+            # pad with random bytes like tdesktop's base::RandomFill — the
+            # padding is encrypted, but deterministic zero padding (what
+            # QByteArray.resize() leaves behind) is a fingerprint tdesktop
+            # files never had. Rebuild via python bytes to control the
+            # padding content. The no-padding case is untouched.
+            raw = bytes(toEncrypt.data()) + os.urandom(fullSize - size)
+            toEncrypt = QByteArray(raw)
 
         # *(uint32*)toEncrypt.data() = size;
         toEncrypt = QByteArray(size.to_bytes(4, "little")) + toEncrypt[4:]
@@ -245,7 +249,7 @@ class Storage(BaseObject):
             file.close()
             return True
 
-        raise OpenTeleException("what")
+        raise OpenTeleException(f"Could not write {fileName} to {basePath}")
 
     @staticmethod
     def ReadFile(fileName: str, basePath: str) -> FileReadDescriptor:
@@ -253,60 +257,59 @@ class Storage(BaseObject):
         to_try = ["s", "1", "0"]
         tries_exception = None
         for chr in to_try:
-            try:
+            # fork note: no try/except IOError here — QFile.open() signals
+            # failure through its return value, it never raises Python
+            # IOError; a real OSError (disk failure etc.) should propagate.
+            file = QFile(Storage.PathJoin(basePath, fileName + chr))
+            if not file.open(QIODevice.OpenModeFlag.ReadOnly):
+                tries_exception = TFileNotFound(f"Could not open {fileName}")
+                continue
 
-                file = QFile(Storage.PathJoin(basePath, fileName + chr))
-                if not file.open(QIODevice.OpenModeFlag.ReadOnly):
-                    tries_exception = TFileNotFound(f"Could not open {fileName}")
-                    continue
+            magic = file.read(4)
 
-                magic = file.read(4)
-
-                if magic != TDF_MAGIC:
-                    tries_exception = TDataInvalidMagic(
-                        "Invalid magic {magic} in file {fileName}"
-                    )
-                    file.close()
-                    continue
-
-                version = int.from_bytes(file.read(4), "little")
-
-                bytesdata = QByteArray(file.read(file.size()))
-
-                dataSize = bytesdata.size() - 16
-
-                check_md5 = bytesdata.data()[:dataSize]
-                check_md5 += int(dataSize).to_bytes(4, "little")
-                check_md5 += int(version).to_bytes(4, "little")
-                check_md5 += magic
-                check_md5 = hashlib.md5(check_md5)
-
-                md5 = bytesdata.data()[dataSize:]
-
-                if check_md5.hexdigest() != md5.hex():
-                    tries_exception = TDataInvalidCheckSum(
-                        "Invalid checksum {check_md5.hexdigest()} in file {fileName}"
-                    )
-                    file.close()
-                    continue
-
-                result = Storage.FileReadDescriptor()
-                result.version = version
-
-                bytesdata.resize(dataSize)
-                result.data = bytesdata
-                bytesdata = QByteArray()
-
-                result.buffer.setBuffer(result.data)
-
-                result.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-                result.stream.setDevice(result.buffer)
-                result.stream.setVersion(QDataStream.Version.Qt_5_1)
-
+            if magic != TDF_MAGIC:
+                tries_exception = TDataInvalidMagic(
+                    "Invalid magic {magic} in file {fileName}"
+                )
                 file.close()
-                return result
-            except IOError as e:
-                pass
+                continue
+
+            version = int.from_bytes(file.read(4), "little")
+
+            bytesdata = QByteArray(file.read(file.size()))
+
+            dataSize = bytesdata.size() - 16
+
+            check_md5 = bytesdata.data()[:dataSize]
+            check_md5 += int(dataSize).to_bytes(4, "little")
+            check_md5 += int(version).to_bytes(4, "little")
+            check_md5 += magic
+            check_md5 = hashlib.md5(check_md5)
+
+            md5 = bytesdata.data()[dataSize:]
+
+            if check_md5.hexdigest() != md5.hex():
+                tries_exception = TDataInvalidCheckSum(
+                    "Invalid checksum {check_md5.hexdigest()} in file {fileName}"
+                )
+                file.close()
+                continue
+
+            result = Storage.FileReadDescriptor()
+            result.version = version
+
+            bytesdata.resize(dataSize)
+            result.data = bytesdata
+            bytesdata = QByteArray()
+
+            result.buffer.setBuffer(result.data)
+
+            result.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+            result.stream.setDevice(result.buffer)
+            result.stream.setVersion(QDataStream.Version.Qt_5_1)
+
+            file.close()
+            return result
 
         raise tries_exception if tries_exception else TFileNotFound(
             f"Could not open {fileName}"

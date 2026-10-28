@@ -1,8 +1,8 @@
 [report]
 omit =
     tests/*
-    setup.py
-    src/debug.py
+    src/tgmint/debug.py
+    selfcheck.py
 exclude_lines =
     pragma: no cover
     nocov

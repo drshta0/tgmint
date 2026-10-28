@@ -1,0 +1,93 @@
+# Freshness watchdog: the anti-rot machinery.
+#
+# Weekly, with network access:
+#   1. selfcheck.py — fails if any device pool carries a stale marker.
+#   2. Version drift — resolves live versions for every checkable app
+#      (macos is pin-only: its upstream raw URL 404s) and compares them
+#      with the compiled-in PINNED table. Any drift fails the job and
+#      opens (or updates) a tracking issue, so the package cannot quietly
+#      rot the way every static fork eventually does.
+
+name: freshness
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # every Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install (library only)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Stale-marker check (device pools)
+        run: python selfcheck.py
+
+      - name: Version drift check
+        id: drift
+        run: |
+          set +e
+          python - <<'EOF' > drift.txt
+          import sys
+          from tgmint import versions
+
+          # macos is pin-only upstream (raw URL 404s) — nothing to compare.
+          drift = []
+          for app in ("tdesktop", "android", "android_x", "ios"):
+              live = versions.current_version(app, force_refresh=True, timeout=10.0)
+              pin = versions.PINNED[app]
+              status = "OK" if live == pin else "DRIFT"
+              print(f"{status} {app}: pinned={pin} live={live}")
+              if live != pin:
+                  drift.append(app)
+          if drift:
+              sys.exit(1)
+          EOF
+          rc=$?
+          cat drift.txt
+          if [ $rc -ne 0 ]; then
+            {
+              echo 'report<<EOF'
+              cat drift.txt
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+          exit $rc
+
+      - name: Open drift issue
+        if: failure() && steps.drift.outputs.report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_TITLE="freshness: pinned client versions drifted from live"
+          {
+            echo "The weekly freshness job found pinned versions that no longer match"
+            echo "the live upstream releases. Refresh the pins in"
+            echo "\`src/tgmint/versions.py\` (and the pools in \`devices.py\` /"
+            echo "\`src/tgmint/api.py\` if device data moved too), then link the"
+            echo "verifying source URLs in the PR."
+            echo
+            echo '```'
+            cat drift.txt
+            echo '```'
+          } > issue_body.md
+          EXISTING=$(gh issue list --state open --search "$ISSUE_TITLE" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue_body.md
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file issue_body.md
+          fi

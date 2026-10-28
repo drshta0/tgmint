@@ -1,6 +1,5 @@
 from __future__ import annotations
 import inspect
-import types
 import typing
 
 
@@ -20,26 +19,37 @@ class OpenTeleException(Exception):  # nocov
         self.message = message
         self.desc = self.__class__.__name__
 
-        self.frame = inspect.currentframe()
-        for i in range(stack_index):
-            self.frame = self.frame.f_back
+        # fork note: upstream stored `self.frame = inspect.currentframe()`
+        # (and walked it lazily in __str__), which pinned every caller
+        # local — passwords, keys, sessions — in memory for as long as the
+        # exception object lived. We derive the caller info eagerly, keep
+        # only plain strings, and let go of the frame before returning.
+        frame = inspect.currentframe()
+        try:
+            for _ in range(stack_index):
+                if frame.f_back is None:
+                    break
+                frame = frame.f_back
 
-        self._caller_class = (
-            self.frame.f_locals["self"].__class__
-            if "self" in self.frame.f_locals
-            else None
-        )
-        self._caller_method = self.frame.f_code.co_name
+            self._caller_class_name = (
+                frame.f_locals["self"].__class__.__name__
+                if "self" in frame.f_locals
+                else None
+            )
+            self._caller_method = frame.f_code.co_name
 
-        if self._caller_method != "<module>":
-            args, _, _, locals = inspect.getargvalues(self.frame)
-            parameters = {arg: locals[arg] for arg in args}
-            self._caller_method_params = "".join(
-                f"{i}={parameters[i]}, " for i in parameters
-            )[:-2]
-        else:
-            self._caller_method = "__main__"
-            self._caller_method_params = ""
+            if self._caller_method != "<module>":
+                args, _, _, locals = inspect.getargvalues(frame)
+                parameters = {arg: locals[arg] for arg in args}
+                self._caller_method_params = "".join(
+                    f"{i}={parameters[i]}, " for i in parameters
+                )[:-2]
+            else:
+                self._caller_method = "__main__"
+                self._caller_method_params = ""
+        finally:
+            # drop the last reference to the caller's frame
+            frame = None
 
         if self.desc == "OpenTeleException":
             self.desc = "Unexpected Exception"
@@ -51,17 +61,8 @@ class OpenTeleException(Exception):  # nocov
             reason += f": {self.message}"
 
         reason += " [ Called by "
-        if self._caller_class != None:
-
-            parent_list = []
-            base = self._caller_class
-            while hasattr(base, "__name__"):
-                parent_list.append(base.__name__)
-                base = base.__base__
-
-            parent_list.reverse()
-            reason += "".join(f"{i}." for i in parent_list[1:])
-            reason += self._caller_method + "() ]"
+        if self._caller_class_name != None:
+            reason += f"{self._caller_class_name}.{self._caller_method}() ]"
             # reason += f"\n>\t{self._caller_method}({self._caller_method_params})"
         else:
             reason += f"{self._caller_method}() ]"
@@ -318,11 +319,12 @@ def Expects(
         return condition
 
     else:
-        stack = inspect.stack()
-        frame = stack[stack_index].frame
-        tb = types.TracebackType(None, frame, frame.f_lasti, frame.f_lineno)  # type: ignore
-        exception = exception.with_traceback(tb)
-
+        # fork note: upstream built a synthetic traceback here from
+        # inspect.stack() — slow, and it pinned every frame up the call
+        # chain on the exception object. The exception is now raised
+        # normally; the real traceback already leads back to the caller,
+        # so `stack_index` is no longer needed to fabricate one (it stays
+        # in the signature for API compatibility).
         if fail != None:
             fail(exception)
 

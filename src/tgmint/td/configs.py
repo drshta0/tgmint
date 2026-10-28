@@ -27,7 +27,7 @@ from ctypes import (
     c_short as short,
     c_ushort as ushort,
 )
-from PyQt5.QtCore import (
+from .qdatastream import (
     QByteArray,
     QDataStream,
     QBuffer,
@@ -43,6 +43,26 @@ import asyncio
 
 APP_VERSION = 3004000
 TDF_MAGIC = b"TDF$"
+
+
+def ExpectStreamStatus(
+    stream: QDataStream, message: str = "Could not stream data"
+) -> None:
+    """td-scoped override of ``exception.ExpectStreamStatus``.
+
+    The version in ``tgmint.exception`` lazy-imports ``PyQt5.QtCore`` to
+    get at ``QDataStream.Status`` — a hard Qt dependency on the tdata read
+    path. This fork note override (defined after the star-import below, so
+    every ``td`` module that does ``from .configs import *`` binds THIS
+    one) checks the same condition against the pure-Python (or PyQt5
+    fallback) ``QDataStream`` from :mod:`.qdatastream`. Unlike the
+    original it also passes the caller's ``message`` through instead of a
+    hardcoded one.
+    """
+    Expects(
+        stream.status() == QDataStream.Status.Ok,
+        exception=QDataStreamFailed(message),
+    )
 
 
 _T = TypeVar("_T")
@@ -336,6 +356,15 @@ class lskType(int):  # nocov
     lskCustomEmojiKeys = 0x17  # no data
     lskSearchSuggestions = 0x18  # no data
     lskWebviewTokens = 0x19  # data: QByteArray bots, QByteArray other
+    # fork note: newer Telegram Desktop (5.x-6.x) writes these map keys —
+    # values confirmed against opentele-ng (which cross-checked tdesktop's
+    # storage_account.cpp) after upstream issue #120 reported tdata from
+    # newer clients failing to parse. Read-side tolerance only.
+    lskRoundPlaceholder = 0x1A  # no data
+    lskInlineBotsDownloads = 0x1B  # no data
+    lskMediaLastPlaybackPositions = 0x1C  # no data
+    lskBotStorages = 0x1D  # data: PeerId botId (map: count + pairs)
+    lskPrefs = 0x1E  # no data
 
 
 class BotTrustFlag(int):  # nocov

@@ -3,10 +3,13 @@ import os
 
 import platform
 
-from typing import Any, List, Dict, Type, TypeVar, Union, Optional
+from collections import OrderedDict
+from typing import Any, List, Dict, Set, Type, TypeVar, Union, Optional
 from .devices import *
 from .exception import *
 from .utils import *
+from .locales import pick_locale
+from .layers import pick_app_version, pick_mobile_app_version
 
 import typing
 
@@ -88,7 +91,28 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         `Generate()`: Generate random device model and system version
     """
 
-    CustomInitConnectionList: List[Union[Type[APIData], APIData]] = []
+    # fork note: upstream kept a plain list here (`CustomInitConnectionList`)
+    # that grew by one entry per APIData instance ever created — a leak
+    # (verified: 10k instances -> 10k entries) — and findData scanned it
+    # linearly. It is now an OrderedDict pid -> entry (class or instance)
+    # with O(1) lookup, plus a set of pinned CLASS pids: classes are few
+    # and must always resolve, so they are never evicted. Instance entries
+    # are FIFO-evicted (insertion order) once they exceed _kMaxInstanceEntries.
+    _pidRegistry: "OrderedDict[int, Union[Type[APIData], APIData]]" = OrderedDict()
+    _pinnedClassPids: Set[int] = set()
+    _instanceEntryCount: int = 0
+
+    _kMaxInstanceEntries: int = 4096
+
+    @classmethod
+    def CustomInitConnectionList(cls) -> List[Union[Type[APIData], APIData]]:
+        """
+        Backward-compat accessor: upstream exposed this NAME as a plain
+        list attribute; it is now a classmethod returning a snapshot of
+        the internal pid registry (which is bounded and dict-backed).
+        Internal callers use findData()/the registry directly.
+        """
+        return list(cls._pidRegistry.values())
 
     api_id: int = None  # type: ignore
     api_hash: str = None  # type: ignore
@@ -98,6 +122,10 @@ class APIData(object, metaclass=BaseAPIMetaClass):
     lang_code: str = None  # type: ignore
     system_lang_code: str = None  # type: ignore
     lang_pack: str = None  # type: ignore
+    # fork addition: IANA zone for initConnection's
+    # params.tz_offset — set by Generate(locale="auto") alongside the
+    # coherent lang_code/system_lang_code pair; None = send no params.
+    tz_zone: str = None  # type: ignore
 
     @typing.overload
     def __init__(self, api_id: int, api_hash: str) -> None:
@@ -217,9 +245,14 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         if isinstance(glob, type):
             return
 
-        # might cause conflict, disabled for now, it won"t be a problem
-        # if (API.findData(self.pid) != None):
-        #     API.CustomInitConnectionList.remove(self)
+        # fork note: intentionally does NOT deregister the instance from
+        # the pid registry. The CustomInitConnectionRequest patch calls
+        # data.destroy() right after every initConnection swap, while a
+        # live TelegramClient may still hold that same APIData and look it
+        # up by pid again — deregistering here would break those clients.
+        # Instances leave the registry only via FIFO eviction (see
+        # _makePID), which bounds memory without reusing pids that live
+        # clients may still reference. (Class entries are pinned forever.)
 
     def __eq__(self, __o: APIData) -> bool:
         # fork note: upstream compared `type(__o) != APIData`, which is True
@@ -269,21 +302,35 @@ class APIData(object, metaclass=BaseAPIMetaClass):
     def _makePIDEnsure(cls) -> int:
         while True:
             pid = int.from_bytes(os.urandom(8), "little")
-            if cls.findData(pid) == None:
+            if cls._pidRegistry.get(pid) is None:
                 break
         return pid
 
     @classmethod
     def _clsMakePID(cls: Type[APIData]):
         cls.pid = cls._makePIDEnsure()
-        cls.CustomInitConnectionList.append(cls)
+        cls._pidRegistry[cls.pid] = cls
+        # classes are few and looked up constantly — never evict them
+        cls._pinnedClassPids.add(cls.pid)
 
     def _makePID(self):
-        self.pid = self.get_cls()._makePIDEnsure()
-        self.get_cls().CustomInitConnectionList.append(self)
+        cls = self.get_cls()
+        self.pid = cls._makePIDEnsure()
+        cls._pidRegistry[self.pid] = self
+        cls._instanceEntryCount += 1
+
+        # bound the registry: FIFO-evict the OLDEST instance entry.
+        # Pinned class entries are skipped (re-scanned cheaply — there are
+        # only a handful of classes).
+        while cls._instanceEntryCount > cls._kMaxInstanceEntries:
+            for pid in cls._pidRegistry:
+                if pid not in cls._pinnedClassPids:
+                    del cls._pidRegistry[pid]
+                    cls._instanceEntryCount -= 1
+                    break
 
     @classmethod
-    def Generate(cls: Type[_T], unique_id: str = None) -> _T:
+    def Generate(cls: Type[_T], unique_id: str = None, locale="auto") -> _T:
         """
         Generate random device model and system version
 
@@ -292,9 +339,16 @@ class APIData(object, metaclass=BaseAPIMetaClass):
                 The unique ID to generate - can be anything.\\
                 This will be used to ensure that it will generate the same data everytime.\\
                 If not set then the data will be randomized each time we runs it.
+
+            locale (`str`, default=`"auto"`):
+                Language realism: `"auto"` picks a coherent
+                (lang_code, system_lang_code, tz_zone) triple, weighted and
+                deterministic per `unique_id`; a lang_code like `"ru"`
+                selects that locale directly; `None` keeps the legacy
+                `en`/`en-US` defaults with no timezone.
         
         ### Raises:
-            `NotImplementedError`: Not supported for web browser yet
+            `NotImplementedError`: base `APIData` (or a preset with no device pool)
 
         ### Returns:
             `APIData`: Return a copy of the api with random device data
@@ -316,20 +370,95 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         elif cls == API.TelegramMacOS:
             deviceInfo = macOSDevice.RandomDevice(unique_id)
 
-        # elif cls == API.TelegramWeb_K or cls == API.TelegramWeb_Z or cls == API.Webogram:
         else:
+            # (the web browser presets were removed outright :
+            # their versions were unverifiable from public source by design)
             raise NotImplementedError(
                 f"{cls.__name__} device not supported for randomize yet"
             )
 
-        return cls(device_model=deviceInfo.model, system_version=deviceInfo.version)
+        result = cls(device_model=deviceInfo.model, system_version=deviceInfo.version)
+        return _applyLocale(result, locale, unique_id)
 
     @classmethod
     def findData(cls: Type[_T], pid: int) -> Optional[_T]:
-        for x in cls.CustomInitConnectionList:  # type: ignore
-            if x.pid == pid:
-                return x
-        return None
+        # O(1) dict lookup; the entry can be a class or an instance
+        return cls._pidRegistry.get(pid)
+
+
+def _applyLocale(
+    api: _T, locale, unique_id: Optional[str] = None
+) -> _T:
+    """
+    Apply a coherent locale triple to a minted APIData instance.
+
+    `locale` semantics:
+        - "auto" (default in Generate): weighted, deterministic pick from
+          tgmint.locales seeded by `unique_id` — the realistic option.
+        - a lang_code like "ru": selects that locale's triple directly
+          (unknown codes raise ValueError).
+        - None/False: legacy behaviour — keep the class defaults
+          ("en"/"en-US"), no timezone.
+
+    Non-string, non-bool values (e.g. `1` or `0`) raise `ValueError` —
+    they are compared by identity, since in Python `1 == True` and
+    `0 == False` and silently accepting them would hide caller bugs.
+    """
+    if locale is None or locale is False:
+        return api
+
+    if locale is True or locale == "auto":
+        triple = pick_locale(unique_id)
+    else:
+        from .locales import LOCALES
+
+        matches = [t for t in LOCALES if t.lang_code == str(locale)]
+        if not matches:
+            raise ValueError(
+                f"locale must be 'auto', None, or one of "
+                f"{sorted({t.lang_code for t in LOCALES})}, got {locale!r}"
+            )
+        triple = matches[0]
+
+    api.lang_code = triple.lang_code
+    api.system_lang_code = triple.system_lang_code
+    api.tz_zone = triple.tz_zone
+    return api
+
+
+def _mobileGenerate(
+    cls: Type[_T],
+    platform: str,
+    device_pool: Type,
+    unique_id: Optional[str],
+    layer: Optional[int],
+    locale,
+) -> _T:
+    """Shared body of the mobile presets' Generate.
+
+    ``layer`` semantics mirror TelegramDesktop.Generate: when the caller
+    says which TL layer the client will actually speak (e.g.
+    ``telethon.tl.alltlobjects.LAYER`` — Telethon 1.43.2 speaks 224),
+    ``app_version`` is picked from tgmint.layers' verified tables by the
+    closest-lower rule instead of the newest release — e.g. layer 224
+    resolves to Android ``12.3.0 (6377)``, because no Android release
+    ever spoke 222-226 and the current 13.1.0 speaks 232 (the pair
+    (13.1.0, 224) is impossible on a real device). ``layer=None`` keeps
+    today's pinned-current behaviour; a layer below the table floor
+    raises ValueError (see pick_mobile_app_version).
+    """
+    deviceInfo = device_pool.RandomDevice(unique_id)
+
+    app_version = cls.app_version
+    if layer is not None:
+        app_version = pick_mobile_app_version(platform, int(layer), cls.app_version)
+
+    result = cls(
+        device_model=deviceInfo.model,
+        system_version=deviceInfo.version,
+        app_version=app_version,
+    )
+    return _applyLocale(result, locale, unique_id)
 
 
 class API(BaseObject):
@@ -357,14 +486,11 @@ class API(BaseObject):
         TelegramMacOS (`API`):
             Official Telegram-Swift For MacOS [View on GitHub](https://github.com/overtake/TelegramSwift)
 
-        TelegramWeb_Z (`API`):
-            Default Official Telegram Web Z For Browsers [View on GitHub](https://github.com/Ajaxy/telegram-tt) | [Visit on Telegram](https://web.telegram.org/z/)
-
-        TelegramWeb_K (`API`):
-            Official Telegram Web K For Browsers [View on GitHub](https://github.com/morethanwords/tweb) | [Visit on Telegram](https://web.telegram.org/k/)
-
-        Webogram (`API`):
-            Old Telegram For Browsers [View on GitHub](https://github.com/zhukov/webogram) | [Vist on Telegram](https://web.telegram.org/?legacy=1#/im)
+    ### Note:
+        The web-browser presets (TelegramWeb_Z, TelegramWeb_K, Webogram)
+        were removed: their versions could not be verified
+        from public source by design, and stale-by-design presets are a
+        detection liability.
     """
 
     class TelegramDesktop(APIData):
@@ -376,21 +502,27 @@ class API(BaseObject):
             api_id (`int`)           : `2040`
             api_hash (`str`)         : `"b18441a1ff607e10a989891a5462e627"`
             device_model (`str`)     : `"Desktop"`
-            system_version (`str`)   : `"Windows 11"`
-            app_version (`str`)      : `"7.2.8 x64"`
+            system_version (`str`)   : `"Windows 11 x64"`
+            app_version (`str`)      : `"7.3.3"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
             lang_pack (`str`)        : `"tdesktop"`
 
         ### Methods:
             `Generate()`: Generate random device data for `Windows`, `macOS` and `Linux`
+
+        ### Note:
+            `Generate()` picks a platform-coherent `app_version`: the bare
+            version on `Linux`, `"{version} x64"` on `Windows` and
+            `"{version} arm64"` on Apple-Silicon `macOS` rows (bare on Intel
+            macs), the way tdesktop's 64-bit builds report it.
         """
 
         api_id = 2040
         api_hash = "b18441a1ff607e10a989891a5462e627"
         device_model = "Desktop"
-        system_version = "Windows 11"
-        app_version = "7.2.8 x64"
+        system_version = "Windows 11 x64"
+        app_version = "7.3.3"  # refreshed 2026-10-24: live GitHub releases (via tgmint.versions fetchers)
         lang_code = "en"
         system_lang_code = "en-US"
         lang_pack = "tdesktop"
@@ -398,20 +530,43 @@ class API(BaseObject):
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T], system: str = "windows", unique_id: str = None
+            cls: Type[_T],
+            system: str = None,
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
         ) -> _T:
             """
             Generate random TelegramDesktop devices
             ### Arguments:
-                system (`str`, default=`"random"`):
-                    Which OS to generate, either `"windows"`, `"macos"`, or `"linux"`.\\
-                    Default is `None` or `"random"` -  which means it will be selected randomly.
+                system (`str`, default=`None`):
+                    Which OS to generate, either `"windows"`, `"macos"`, or `"linux"`
+                    (case-insensitive).\\
+                    The default is `None`, which picks one deterministically from
+                    `unique_id` (and randomly when `unique_id` is also `None`).\\
+                    Any other value raises `ValueError` — nothing is silently
+                    substituted.
             
                 unique_id (`str`, default=`None`):
                     The unique ID to generate - can be anything.\\
                     This ID will be used to ensure that it will generate the same data every single time.\\
                     If not set then the data will be randomized each time we runs it.
             
+                layer (`int`, default=`None`):
+                    The TL layer the client will actually speak. When given,
+                    `app_version` is picked from `tgmint.layers` so the
+                    identity claims a release that genuinely spoke that layer
+                    (e.g. `layer=224` -> `6.7.8`), NOT the newest release.
+            
+                locale (default=`"auto"`):
+                    `"auto"` picks a coherent (lang_code, system_lang_code,
+                    timezone) triple, deterministic per `unique_id`; a
+                    lang_code like `"ru"` selects that locale; `None` keeps
+                    the legacy `en`/`en-US` defaults with no timezone.
+            
+            ### Raises:
+                `ValueError`: `system` is not one of `"windows"`, `"macos"`, `"linux"` (after lowercasing/trimming).
+
             ### Returns:
                 `APIData`: Return a copy of the api with random device data
             
@@ -438,31 +593,58 @@ class API(BaseObject):
 
         @typing.overload
         @classmethod
-        def Generate(cls: Type[_T], system: str = "macos", unique_id: str = None) -> _T:
-            pass
-
-        @typing.overload
-        @classmethod
-        def Generate(cls: Type[_T], system: str = "linux", unique_id: str = None) -> _T:
+        def Generate(
+            cls: Type[_T], system: str = "macos", unique_id: str = None, layer: int = None, locale="auto"
+        ) -> _T:
             pass
 
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T], system: str = "random", unique_id: str = None
+            cls: Type[_T], system: str = "linux", unique_id: str = None, layer: int = None, locale="auto"
+        ) -> _T:
+            pass
+
+        @typing.overload
+        @classmethod
+        def Generate(
+            cls: Type[_T],
+            system: str = "random",
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
         ) -> _T:
             pass
 
         @classmethod
-        def Generate(cls: Type[_T], system: str = None, unique_id: str = None) -> _T:
+        def Generate(
+            cls: Type[_T],
+            system: str = None,
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
+        ) -> _T:
 
             validList = ["windows", "macos", "linux"]
-            if system == None or system not in validList:
+
+            # fork note: normalize BEFORE validating — upstream validated
+            # first, so "Windows"/"MacOS" fell into the random-pick branch
+            # and were silently replaced by a (deterministic-hash) system
+            # the caller never asked for.
+            system = system.lower().strip() if isinstance(system, str) else system
+
+            if system == None:
+                # no preference: deterministic pick derived from unique_id
+                # (itself randomized when unique_id is None)
                 system = SystemInfo._hashtovalue(
                     SystemInfo._strtohashid(unique_id), validList
                 )
 
-            system = system.lower()
+            elif system not in validList:
+                # fail loudly instead of silently substituting
+                raise ValueError(
+                    f"system must be one of {validList}, got {system!r}"
+                )
 
             if system == "windows":
                 deviceInfo = WindowsDevice.RandomDevice(unique_id)
@@ -473,7 +655,33 @@ class API(BaseObject):
             else:
                 deviceInfo = LinuxDevice.RandomDevice(unique_id)
 
-            return cls(device_model=deviceInfo.model, system_version=deviceInfo.version)
+            # layer coherence: when the caller says which TL
+            # layer the client will actually speak, claim an app_version
+            # that really spoke that layer (tgmint.layers), NOT the newest
+            # release — e.g. Telethon 1.43.2 speaks layer 224, whose
+            # newest tdesktop is 6.7.8, not the current 7.x. Gap layers
+            # resolve to the closest lower layer's version.
+            base_version = cls.app_version
+            if layer is not None:
+                base_version = pick_app_version(
+                    "tdesktop", int(layer), cls.app_version
+                )
+
+            # platform-coherent app_version: tdesktop's 64-bit builds append
+            # the arch to the version — bare on Linux and Intel macs,
+            # "x64" on Windows, "arm64" on Apple Silicon
+            app_version = (
+                f"{base_version} {deviceInfo.suffix}"
+                if deviceInfo.suffix
+                else base_version
+            )
+
+            result = cls(
+                device_model=deviceInfo.model,
+                system_version=deviceInfo.version,
+                app_version=app_version,
+            )
+            return _applyLocale(result, locale, unique_id)
 
     class TelegramAndroid(APIData):
         """
@@ -485,7 +693,7 @@ class API(BaseObject):
             api_hash (`str`)         : `"eb06d4abfb49dc3eeb1aeb98ae0f581e"`
             device_model (`str`)     : `"Samsung SM-S928B"`
             system_version (`str`)   : `"SDK 35"`
-            app_version (`str`)      : `"12.10.1 (70382)"`
+            app_version (`str`)      : `"13.1.0 (72291)"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
             lang_pack (`str`)        : `"android"`
@@ -495,10 +703,48 @@ class API(BaseObject):
         api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
         device_model = "Samsung SM-S928B"
         system_version = "SDK 35"
-        app_version = "12.10.1 (70382)"
+        app_version = "13.1.0 (72291)"
         lang_code = "en"
         system_lang_code = "en-US"
         lang_pack = "android"
+
+        @classmethod
+        def Generate(
+            cls: Type[_T],
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
+        ) -> _T:
+            """
+            Generate random Telegram for Android device data.
+
+            ### Arguments:
+                unique_id (`str`, default=`None`):
+                    The unique ID to generate - can be anything.\\
+                    This will be used to ensure that it will generate the same data everytime.\\
+                    If not set then the data will be randomized each time we runs it.
+
+                layer (`int`, default=`None`):
+                    The TL layer the client will actually speak. When given,
+                    `app_version` is picked from `tgmint.layers`' verified
+                    DrKLO table by the closest-lower rule — e.g.
+                    `layer=224` -> `12.3.0 (6377)` (no Android release ever
+                    spoke 222-226; the current 13.1.0 speaks 232), NOT the
+                    newest release. Pass the wire layer your framework
+                    speaks (`telethon.tl.alltlobjects.LAYER`) for a coherent
+                    identity; `None` keeps the pinned-current behaviour.
+                    A layer below the table floor raises `ValueError`.
+
+                locale (default=`"auto"`):
+                    `"auto"` picks a coherent (lang_code, system_lang_code,
+                    timezone) triple, deterministic per `unique_id`; a
+                    lang_code like `"ru"` selects that locale; `None` keeps
+                    the legacy `en`/`en-US` defaults with no timezone.
+
+            ### Returns:
+                `APIData`: Return a copy of the api with random device data
+            """
+            return _mobileGenerate(cls, "android", AndroidDevice, unique_id, layer, locale)
 
     class TelegramAndroidX(APIData):
         """
@@ -510,7 +756,7 @@ class API(BaseObject):
             api_hash (`str`)         : `"3e0cb5efcd52300aec5994fdfc5bdc16"`
             device_model (`str`)     : `"Samsung SM-G998B"`
             system_version (`str`)   : `"SDK 35"`
-            app_version (`str`)      : `"0.28.10 (1791)"`
+            app_version (`str`)      : `"0.29.1 (1817)"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
             lang_pack (`str`)        : `"android"`
@@ -520,10 +766,28 @@ class API(BaseObject):
         api_hash = "3e0cb5efcd52300aec5994fdfc5bdc16"
         device_model = "Samsung SM-G998B"
         system_version = "SDK 35"
-        app_version = "0.28.10 (1791)"
+        app_version = "0.29.1 (1817)"
         lang_code = "en"
         system_lang_code = "en-US"
         lang_pack = "android"
+
+        @classmethod
+        def Generate(
+            cls: Type[_T],
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
+        ) -> _T:
+            """
+            Generate random Telegram X device data.
+
+            `layer` mirrors `TelegramAndroid.Generate` — Telegram X shares
+            DrKLO's TL lineage, so the same verified layer table applies;
+            note the minted `app_version` is then a *mainline* version
+            string (e.g. `12.3.0 (6377)`), a documented approximation for
+            X's own 0.x.y scheme. `locale` wiring is identical.
+            """
+            return _mobileGenerate(cls, "androidx", AndroidDevice, unique_id, layer, locale)
 
     class TelegramIOS(APIData):
         """
@@ -535,7 +799,7 @@ class API(BaseObject):
             api_hash (`str`)         : `"33c45224029d59cb3ad0c16134215aeb"`
             device_model (`str`)     : `"iPhone 16 Pro Max"`
             system_version (`str`)   : `"18.5"`
-            app_version (`str`)      : `"12.9.3"`
+            app_version (`str`)      : `"13.1.1"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
             lang_pack (`str`)        : `"ios"`
@@ -547,10 +811,29 @@ class API(BaseObject):
         api_hash = "33c45224029d59cb3ad0c16134215aeb"
         device_model = "iPhone 16 Pro Max"
         system_version = "18.5"
-        app_version = "12.9.3"
+        app_version = "13.1.1"
         lang_code = "en"
         system_lang_code = "en-US"
         lang_pack = "ios"
+
+        @classmethod
+        def Generate(
+            cls: Type[_T],
+            unique_id: str = None,
+            layer: int = None,
+            locale="auto",
+        ) -> _T:
+            """
+            Generate random Telegram for iOS device data.
+
+            `layer` mirrors `TelegramAndroid.Generate` against the iOS
+            table in `tgmint.layers` — verified first-hand only for the
+            current schema (layer 232, Telegram-iOS commit 0d883288);
+            the table is deliberately sparse, so a layer older than its
+            floor raises `ValueError` instead of guessing. `locale`
+            wiring is identical to the other presets.
+            """
+            return _mobileGenerate(cls, "ios", iOSDeivce, unique_id, layer, locale)
 
     class TelegramMacOS(APIData):
         """
@@ -579,81 +862,6 @@ class API(BaseObject):
         system_lang_code = "en-US"
         lang_pack = "macos"
 
-    class TelegramWeb_Z(APIData):
-        """
-        Default Official Telegram Web Z For Browsers
-        [View on GitHub](https://github.com/Ajaxy/telegram-tt) | [Visit on Telegram](https://web.telegram.org/z/)
-
-        ### Attributes:
-            api_id (`int`)           : `2496`
-            api_hash (`str`)         : `"8da85b0d5bfe62527e5b244c209159c3"`
-            device_model (`str`)     : `"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"`
-            system_version (`str`)   : `"Windows"`
-            app_version (`str`)      : `"1.28.3 Z"`
-            lang_code (`str`)        : `"en"`
-            system_lang_code (`str`) : `"en-US"`
-            lang_pack (`str`)        : `""`
-        """
-
-        api_id = 2496
-        api_hash = "8da85b0d5bfe62527e5b244c209159c3"
-        device_model = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
-        system_version = "Windows"
-        app_version = "1.28.3 Z"
-        lang_code = "en"
-        system_lang_code = "en-US"
-        lang_pack = ""  # I don"t understand why Telegram Z doesn"t use langPack
-        # You can read its source here: https://github.com/Ajaxy/telegram-tt/blob/f7bc473d51c0fe3a3e8b22678b62d2360225aa7c/src/lib/gramjs/client/TelegramClient.js#L131
-
-    class TelegramWeb_K(APIData):
-        """
-        Official Telegram Web K For Browsers
-        [View on GitHub](https://github.com/morethanwords/tweb) | [Visit on Telegram](https://web.telegram.org/k/)
-
-        ### Attributes:
-            api_id (`int`)           : `2496`
-            api_hash (`str`)         : `"8da85b0d5bfe62527e5b244c209159c3"`
-            device_model (`str`)     : `"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"`
-            system_version (`str`)   : `"Win32"`
-            app_version (`str`)      : `"1.0.1 K"`
-            lang_code (`str`)        : `"en"`
-            system_lang_code (`str`) : `"en-US"`
-            lang_pack (`str`)        : `"macos"`
-        """
-
-        api_id = 2496
-        api_hash = "8da85b0d5bfe62527e5b244c209159c3"
-        device_model = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
-        system_version = "Win32"
-        app_version = "1.0.1 K"
-        lang_code = "en"
-        system_lang_code = "en-US"
-        lang_pack = "macos"  # I"m totally confused, why macos? https://github.dev/morethanwords/tweb/blob/26582590e647766f5890c79e1611c54c1e6e800c/src/config/app.ts#L23
-
-    class Webogram(APIData):
-        """
-        Old Telegram For Browsers
-        [View on GitHub](https://github.com/zhukov/webogram) | [Vist on Telegram](https://web.telegram.org/?legacy=1#/im)
-
-        ### Attributes:
-            api_id (`int`)           : `2496`
-            api_hash (`str`)         : `"8da85b0d5bfe62527e5b244c209159c3"`
-            device_model (`str`)     : `"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"`
-            system_version (`str`)   : `"Win32"`
-            app_version (`str`)      : `"0.7.0"`
-            lang_code (`str`)        : `"en"`
-            system_lang_code (`str`) : `"en-US"`
-            lang_pack (`str`)        : `""`
-        """
-
-        api_id = 2496
-        api_hash = "8da85b0d5bfe62527e5b244c209159c3"
-        device_model = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
-        system_version = "Win32"
-        app_version = "0.7.0"
-        lang_code = "en"
-        system_lang_code = "en-US"
-        lang_pack = ""  # The same problem as TelegramWeb_K, as TelegramWeb_K was built on Webogram
 
 
 class LoginFlag(int):

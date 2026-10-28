@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tgmint"
-version = "1.15.1.post5"
+version = "1.16.0"
 description = "tgmint — opentele lineage: tdata/telethon conversion, official-API fingerprints, software passkeys"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -15,7 +15,16 @@ keywords = ["tdata", "tdesktop", "telegram", "telethon", "tgmint", "session", "f
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Topic :: Communications :: Chat",
+    "Topic :: Security",
     "Development Status :: 4 - Beta",
 ]
 dependencies = [
@@ -24,16 +33,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PyQt5 is needed only for tdata (Telegram Desktop session folder) read/write.
-# The import is lazy: TelegramClient / API.Generate / session minting work
-# without Qt. A pure-Python replacement is planned (PLAN.md, step 4).
+# tdata read/write uses a pure-Python QDataStream by default (no Qt needed);
+# the [qt] extra keeps the PyQt5 path available as a fallback (set
+# TGMINT_TDATA_QT=1) and for equivalence testing.
 qt = ["pyqt5"]
 # cryptography is needed only for passkey create/sign (tgmint.passkeys).
 passkeys = ["cryptography"]
 
 [project.urls]
-Homepage = "https://github.com/thedemons/opentele"
+Homepage = "https://github.com/drshta0/tgmint"
+Repository = "https://github.com/drshta0/tgmint"
+Issues = "https://github.com/drshta0/tgmint/issues"
+Changelog = "https://github.com/drshta0/tgmint/blob/main/CHANGELOG.md"
 Upstream = "https://github.com/thedemons/opentele"
+
+[project.scripts]
+# python -m tgmint also works (src/tgmint/__main__.py); same zero-dependency
+# argparse CLI (mint | inspect | audit | freshness | parity | convert | doctor).
+tgmint = "tgmint.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tgmint"]

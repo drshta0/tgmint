@@ -66,11 +66,16 @@ class MTP(BaseObject):  # nocov
             else:
                 for endpoint in self._data[id]:
                     if (endpoint.ip == ip) and (endpoint.port == port):
-                        # skip this endpoint because it's already exists in the self._data
-                        continue
+                        # skip this endpoint because it's already exists in
+                        # the self._data — fork note: upstream `continue`d
+                        # the scan loop here but appended anyway, so every
+                        # "duplicate" call grew the list (and the passed
+                        # `secret` was dropped, Endpoint got bytes()).
+                        return
 
-            endpoint = MTP.DcOptions.Endpoint(id, flags, ip, port, bytes())
-            self._data[id].append(endpoint)
+            self._data[id].append(
+                MTP.DcOptions.Endpoint(id, flags, ip, port, secret)
+            )
 
         def constructFromBuiltIn(self) -> None:
 

@@ -61,7 +61,7 @@ class override(object):  # nocov
 
         # check if decorated_cls really is a function
         if not isinstance(decorated_func, FunctionType):
-            raise BaseException(
+            raise ValueError(
                 "@override decorator is only for functions, not classes"
             )
 
@@ -83,9 +83,10 @@ class extend_class(object):  # nocov
 
     def __new__(cls, decorated_cls: _TCLS, isOverride: bool = False) -> _TCLS:
 
-        # check if decorated_cls really is a class (type)
-        if not isinstance(cls, type):
-            raise BaseException(
+        # check if decorated_cls really is a class (type) — upstream tested
+        # `cls` here, which is always a type, so the check never fired
+        if not isinstance(decorated_cls, type):
+            raise ValueError(
                 "@extend_class decorator is only for classes, not functions"
             )
 
@@ -115,10 +116,11 @@ class extend_class(object):  # nocov
 
                         # if not override this attribute
                         if not override.isOverride(attributeValue):
-                            print(
-                                f"[{attributeName}] {id(result['value'])} - {id(attributeValue)}"
+                            raise RuntimeError(
+                                f"extend_class: attribute '{attributeName}' "
+                                f"already exists on {base.__name__} and is "
+                                "not marked @override"
                             )
-                            raise BaseException("err")
 
             [newAttributes.pop(cross) for cross in crossDelete]
 
@@ -170,7 +172,11 @@ class extend_class(object):  # nocov
         try:
             value = getattr(obj, attributeName)
             return {"owner": obj, "value": value}
-        except BaseException as e:
+        # fork note: narrowed from `except BaseException` — swallowing
+        # KeyboardInterrupt/SystemExit/GeneratorExit is never right
+        except AttributeError:
+            return None
+        except Exception:
             return None
 
 
