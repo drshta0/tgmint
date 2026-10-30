@@ -1,5 +1,5 @@
 """
-Software passkeys for Telegram accounts.
+Software passkeys for Telegram accounts — the Telethon driver.
 
 Register a passkey on an account for which you already hold an authorized
 session, and later log back into that account with nothing but the passkey
@@ -28,6 +28,36 @@ Wire format implemented from the official Android client source
     account.passkey#98613ebf flags:# id:string name:string date:int
         software_emoji_id:flags.0?long last_usage_date:flags.1?int = Passkey;
 
+What is in this module, and what is not
+---------------------------------------
+
+This module is a **thin Telethon driver** over the framework-neutral
+:mod:`tgmint.passkeys_core`. The ceremony — which call comes first, when the
+bumped signature counter must be persisted (before any network step after
+it), when to switch DCs and with which ``from_dc_id``/``from_auth_key_id``,
+what a ``SESSION_PASSWORD_NEEDED`` answer means — lives in the core, which is
+shared with the Pyrogram-family driver (and with any other driver that
+implements the same ``PasskeyInvoker`` contract). Reimplementing that state
+machine per framework is exactly how the silent variants crept in.
+
+So this file holds only what is genuinely Telethon-bound:
+
+* the six hand-written request classes plus the three credential objects —
+  Telethon 1.43.2's bundled TL layer predates these constructors, so they
+  are declared here (their bytes are pinned against
+  ``tgmint.passkeys_core.encode_request`` in ``tests/test_passkeys_core.py``);
+* :class:`TelethonInvoker`, which builds those classes out of the field
+  dicts the core's :data:`tgmint.passkeys_core.PASSKEY_TL_SPEC` describes,
+  calls ``await client(request)`` and normalizes the answer back into the
+  neutral shapes;
+* the four public functions, which are one core call each.
+
+The credential data layer (CBOR/COSE, :class:`SoftwareAuthenticator`,
+:class:`PasskeyStore`, :class:`PasskeyInfo`, the error classes) is
+*re-exported* from the core rather than copied, so both dialects share one
+implementation — and one exception class, which matters for callers that
+``except tgmint.passkeys.PasskeyError``.
+
 Typical use (while logged in)::
 
     from tgmint.passkeys import register_passkey
@@ -40,22 +70,36 @@ Later, with no phone/OTP access at all::
     me = await login_with_passkey(client, path="myaccount.passkey.json")
 
 Requires ``cryptography`` (only when actually creating/signing credentials).
+
+VERIFICATION LABELS
+-------------------
+
+* **TL request/response layer** — *verified offline*: every request class's
+  bytes are compared byte for byte against the neutral writer, and every
+  ``read_result`` has a neutral twin in ``passkeys_core.parse_result`` that
+  is tested against the same payloads.
+* **Credential + store layer** — the same code as before (now shared with the
+  core): ``tests/test_passkeys.py`` parses our attestation object, rebuilds
+  the COSE public key and verifies the ES256/Ed25519 assertion the way
+  Telegram's server does, and checks the store file is 0600 and atomic.
+* **Ceremony** — verified offline against a simulated server that checks the
+  WebAuthn signature partner-side, including the counter-before-network
+  ordering, the cross-DC handoff and the 2FA branch.
+* **NOT verified here**: no live-account passkey round trip is performed by
+  this repository; Telegram may change the layer or its origin/RP-ID policy
+  at any time; the passkey flow needs an MTProto surface, so it can never
+  work on the Bot API (TDLib has its own native passkey path).
 """
 from __future__ import annotations
 
-import base64
-import dataclasses
-import datetime
-import hashlib
-import json
-import os
-import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from telethon.errors import SessionPasswordNeededError
 from telethon.extensions import BinaryReader
 from telethon.tl.tlobject import TLObject, TLRequest
+
+from . import passkeys_core as _core
 
 __all__ = [
     "DEFAULT_ORIGIN",
@@ -75,312 +119,53 @@ __all__ = [
     "InputPasskeyCredentialPublicKey",
     "InputPasskeyResponseRegister",
     "InputPasskeyResponseLogin",
+    "TelethonInvoker",
     "register_passkey",
     "login_with_passkey",
     "list_passkeys",
     "delete_passkey",
 ]
 
+# ---------------------------------------------------------------------------
+# The data layer: one implementation, shared with the neutral core
+# ---------------------------------------------------------------------------
+#
+# These names used to be defined here; they were copied into passkeys_core so
+# a Telethon-free driver could use them. Keeping both copies meant two
+# PasskeyError classes (so a caller catching one would not catch the other)
+# and two PasskeyStore classes (so `isinstance` across the boundary was
+# false). They are re-exported now: same public API, one implementation.
+
 # The WebAuthn origin we claim in clientDataJSON. Telegram's server supplies
 # the rpId in its options; the origin string must be one it accepts. The web
 # client origin is the natural choice for a software authenticator. If the
 # server ever rejects the challenge (origin not allowed), try
 # "android:APK_CERT_HASH_BASE64URL:<b64url sha256 of official APK cert>".
-DEFAULT_ORIGIN = "https://web.telegram.org"
+DEFAULT_ORIGIN = _core.DEFAULT_ORIGIN
 
-ALG_ES256 = -7   # ECDSA w/ SHA-256 on P-256, DER signature
-ALG_ED25519 = -8 # Ed25519, raw 64-byte signature
+ALG_ES256 = _core.ALG_ES256   # ECDSA w/ SHA-256 on P-256, DER signature
+ALG_ED25519 = _core.ALG_ED25519  # Ed25519, raw 64-byte signature
 
-_SUPPORTED_ALGS = (ALG_ES256, ALG_ED25519)
+PasskeyError = _core.PasskeyError
+PasskeyRejectedError = _core.PasskeyRejectedError
+PasskeyInfo = _core.PasskeyInfo
+CreatedCredential = _core.CreatedCredential
+SoftwareAuthenticator = _core.SoftwareAuthenticator
+PasskeyStore = _core.PasskeyStore
 
-# Telegram encodes the account as "dcId:userId" in the WebAuthn user handle
-# (e.g. "2:123456789"); everything downstream (home_dc, user_id, the login
-# request) depends on that shape.
-_USER_HANDLE_RE = re.compile(r"^\d+:\d+$")
-
-
-def _b64u_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64u_decode(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-
-
-def _sha256(data: bytes) -> bytes:
-    return hashlib.sha256(data).digest()
+# helper spellings this module used to define (tests and downstream code
+# import some of them from here; they are the very same functions now)
+_b64u_encode = _core._b64u_encode
+_b64u_decode = _core._b64u_decode
+_cbor_encode = _core._cbor_encode
+_dump_json = _core._dump_json
+_sha256 = _core._sha256
+_SUPPORTED_ALGS = _core._SUPPORTED_ALGS
+_USER_HANDLE_RE = _core._USER_HANDLE_RE
 
 
 def _pack_uint32(value: int) -> bytes:
     return struct.pack("<I", value)
-
-
-def _dump_json(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), sort_keys=False)
-
-
-class PasskeyError(Exception):
-    pass
-
-
-class PasskeyRejectedError(PasskeyError):
-    """The server's allow-list does not include our credential id."""
-
-
-# ---------------------------------------------------------------------------
-# Minimal CTAP2-canonical CBOR encoder (RFC 7049 deterministic form as used
-# by WebAuthn: map keys sorted by length first, then bytewise).
-# ---------------------------------------------------------------------------
-
-def _cbor_head(major: int, length: int) -> bytes:
-    if length < 24:
-        return bytes([(major << 5) | length])
-    if length < 0x100:
-        return bytes([(major << 5) | 24, length])
-    if length < 0x10000:
-        return bytes([(major << 5) | 25]) + struct.pack(">H", length)
-    return bytes([(major << 5) | 26]) + struct.pack(">I", length)
-
-
-def _cbor_encode(item: Any) -> bytes:
-    if item is True:
-        return b"\xf5"
-    if item is False:
-        return b"\xf4"
-    if item is None:
-        return b"\xf6"
-    if isinstance(item, int):
-        if item >= 0:
-            return _cbor_head(0, item)
-        return _cbor_head(1, -item - 1)
-    if isinstance(item, bytes):
-        return _cbor_head(2, len(item)) + item
-    if isinstance(item, str):
-        raw = item.encode("utf-8")
-        return _cbor_head(3, len(raw)) + raw
-    if isinstance(item, (list, tuple)):
-        return _cbor_head(4, len(item)) + b"".join(_cbor_encode(x) for x in item)
-    if isinstance(item, dict):
-        entries = sorted(
-            ((_cbor_encode(k), _cbor_encode(v)) for k, v in item.items()),
-            key=lambda kv: (len(kv[0]), kv[0]),
-        )
-        return _cbor_head(5, len(entries)) + b"".join(k + v for k, v in entries)
-    raise TypeError(f"cannot CBOR-encode {type(item)!r}")
-
-
-# ---------------------------------------------------------------------------
-# WebAuthn software authenticator
-# ---------------------------------------------------------------------------
-
-_FLAG_UP = 0x01  # user present
-_FLAG_UV = 0x04  # user verified
-_FLAG_AT = 0x40  # attested credential data present
-
-
-def _new_keypair(alg: int) -> Tuple[Any, bytes]:
-    """Returns (private_key, cose_public_key_bytes)."""
-    if alg == ALG_ES256:
-        from cryptography.hazmat.primitives.asymmetric import ec
-
-        priv = ec.generate_private_key(ec.SECP256R1())
-        numbers = priv.public_key().public_numbers()
-        cose = _cbor_encode({
-            1: 2, 3: ALG_ES256, -1: 1,
-            -2: numbers.x.to_bytes(32, "big"),
-            -3: numbers.y.to_bytes(32, "big"),
-        })
-        return priv, cose
-    if alg == ALG_ED25519:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ed25519
-
-        priv = ed25519.Ed25519PrivateKey.generate()
-        raw = priv.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
-        cose = _cbor_encode({1: 1, 3: ALG_ED25519, -1: raw})
-        return priv, cose
-    raise PasskeyError(f"unsupported algorithm {alg}; supported: {_SUPPORTED_ALGS}")
-
-
-def _sign(priv: Any, alg: int, data: bytes) -> bytes:
-    if alg == ALG_ES256:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-
-        return priv.sign(data, ec.ECDSA(hashes.SHA256()))
-    return priv.sign(data)
-
-
-def _key_to_pem(priv: Any) -> str:
-    from cryptography.hazmat.primitives import serialization
-
-    return priv.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode("ascii")
-
-
-def _key_from_pem(pem: str) -> Any:
-    from cryptography.hazmat.primitives import serialization
-
-    return serialization.load_pem_private_key(pem.encode("ascii"), password=None)
-
-
-def _authenticator_data(
-    rp_id: str,
-    flags: int,
-    sign_count: int,
-    attested: Optional[Tuple[bytes, bytes]] = None,
-) -> bytes:
-    data = _sha256(rp_id.encode("ascii")) + bytes([flags]) + struct.pack(">I", sign_count)
-    if attested is not None:
-        credential_id, cose_public = attested
-        # aaguid all-zero (unspecified) + credIdLen + credId + COSE key
-        data += b"\x00" * 16 + struct.pack(">H", len(credential_id)) + credential_id + cose_public
-    return data
-
-
-@dataclasses.dataclass
-class CreatedCredential:
-    """A freshly minted WebAuthn credential (registration output)."""
-
-    credential_id: bytes
-    rp_id: str
-    origin: str
-    alg: int
-    user_handle: str      # decoded "dcId:userId" string from options.user.id
-    client_data_json: str
-    attestation_object: bytes
-    private_key_pem: str
-    sign_count: int = 0
-
-
-class SoftwareAuthenticator:
-    """A minimal WebAuthn authenticator whose keys live in your filesystem.
-
-    It speaks the exact subset of WebAuthn Telegram's server needs:
-    ES256/Ed25519 credentials with ``fmt: "none"`` attestation, UP|UV flags
-    and a monotonically increasing signature counter.
-    """
-
-    @staticmethod
-    def pick_algorithm(options: Dict[str, Any]) -> int:
-        offered = [p.get("alg") for p in options.get("pubKeyCredParams") or []]
-        for alg in offered:
-            if alg in _SUPPORTED_ALGS:
-                return alg
-        raise PasskeyError(
-            "server offers no supported algorithm "
-            f"(offered: {offered}, supported: {list(_SUPPORTED_ALGS)})"
-        )
-
-    @classmethod
-    def create_credential(
-        cls,
-        options: Any,
-        *,
-        origin: str = DEFAULT_ORIGIN,
-        alg: Optional[int] = None,
-    ) -> CreatedCredential:
-        if isinstance(options, str):
-            options = json.loads(options)
-        if "publicKey" in options and "rp" not in options:
-            # the server wraps the WebAuthn options in a publicKey envelope,
-            # same unwrap as PasskeysController.java:78-80
-            options = options["publicKey"]
-        rp_id = options["rp"]["id"]
-        challenge = options["challenge"]
-        user = options["user"]
-        # options.user.id is base64url bytes of "dcId:userId"; the official
-        # client decodes it before putting it on the wire, and so do we
-        # (PasskeysController.java:227-230).
-        raw_user_handle = user["id"]
-        try:
-            user_handle = _b64u_decode(raw_user_handle).decode()
-        except Exception:
-            user_handle = raw_user_handle
-        if alg is None:
-            alg = cls.pick_algorithm(options)
-
-        priv, cose_public = _new_keypair(alg)
-        credential_id = os.urandom(32)
-
-        client_data_json = _dump_json({
-            "type": "webauthn.create",
-            "challenge": challenge,
-            "origin": origin,
-        })
-        auth_data = _authenticator_data(
-            rp_id, _FLAG_UP | _FLAG_UV | _FLAG_AT, 0, (credential_id, cose_public)
-        )
-        attestation_object = _cbor_encode({
-            "fmt": "none",
-            "attStmt": {},
-            "authData": auth_data,
-        })
-        return CreatedCredential(
-            credential_id=credential_id,
-            rp_id=rp_id,
-            origin=origin,
-            alg=alg,
-            user_handle=user_handle,
-            client_data_json=client_data_json,
-            attestation_object=attestation_object,
-            private_key_pem=_key_to_pem(priv),
-        )
-
-    @staticmethod
-    def produce_assertion(
-        store: "PasskeyStore",
-        options: Any,
-        *,
-        origin: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Sign a login challenge with a stored credential.
-
-        Returns the fields needed for ``inputPasskeyResponseLogin`` and
-        bumps the stored signature counter (call ``store.save()`` after).
-        """
-        if isinstance(options, str):
-            options = json.loads(options)
-        if "publicKey" in options and "rpId" not in options and "rp" not in options:
-            options = options["publicKey"]
-        origin = origin or store.origin
-        rp_id = options.get("rpId") or store.rp_id
-        if rp_id != store.rp_id:
-            raise PasskeyError(
-                f"rpId mismatch: stored {store.rp_id!r}, server wants {rp_id!r}"
-            )
-        allow = options.get("allowCredentials") or []
-        if allow:
-            ids = {c.get("id") for c in allow}
-            if _b64u_encode(store.credential_id) not in ids:
-                raise PasskeyRejectedError(
-                    "this passkey is not in the server's allow-list "
-                    "(deleted from the account, or a different account)"
-                )
-
-        sign_count = max(store.sign_count, 0) + 1
-        client_data_json = _dump_json({
-            "type": "webauthn.get",
-            "challenge": options["challenge"],
-            "origin": origin,
-        })
-        auth_data = _authenticator_data(rp_id, _FLAG_UP | _FLAG_UV, sign_count)
-        # WebAuthn signs authenticatorData || sha256(clientDataJSON) — in THAT order
-        signature = _sign(store.private_key, store.alg, auth_data + _sha256(client_data_json.encode()))
-        store.sign_count = sign_count
-        return {
-            "id": _b64u_encode(store.credential_id),
-            "client_data_json": client_data_json,
-            "authenticator_data": auth_data,
-            "signature": signature,
-            # TL wants the *decoded* "dcId:userId" string (see PasskeysController.java:227)
-            "user_handle": store.user_handle,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -398,21 +183,6 @@ _CTOR_INPUT_RESPONSE_LOGIN = 0xC31FC14A
 _CTOR_BOOL_TRUE = 0x997275B5
 _CTOR_BOOL_FALSE = 0xBC799737
 _CTOR_VECTOR = 0x1CB5C415
-
-
-@dataclasses.dataclass
-class PasskeyInfo:
-    """account.passkey#98613ebf as returned by the server."""
-
-    id: str
-    name: str
-    date: int
-    software_emoji_id: Optional[int] = None
-    last_usage_date: Optional[int] = None
-
-    @property
-    def created_on(self) -> Optional[datetime.datetime]:
-        return datetime.datetime.fromtimestamp(self.date, tz=datetime.timezone.utc) if self.date else None
 
 
 def _read_passkey(reader: BinaryReader) -> PasskeyInfo:
@@ -649,8 +419,10 @@ class InitPasskeyLoginRequest(TLRequest):
 class FinishPasskeyLoginRequest(TLRequest):
     """auth.finishPasskeyLogin#9857ad07 → auth.Authorization
 
-    Response is deserialized with Telethon's own layer (auth.Authorization
-    is ancient and always available)."""
+    No ``read_result`` on purpose: the response is deserialized with
+    Telethon's own layer (``auth.Authorization`` is ancient and always
+    available), which is what ``client._on_login`` needs. The driver
+    re-serializes that object with ``bytes(...)`` for the neutral parser."""
 
     CONSTRUCTOR_ID = 0x9857AD07
 
@@ -685,168 +457,223 @@ class FinishPasskeyLoginRequest(TLRequest):
 
 
 # ---------------------------------------------------------------------------
-# Passkey store (your credential — back this file up, it IS the login)
+# The Telethon invoker: field dicts (from PASSKEY_TL_SPEC) -> TL classes -> client
 # ---------------------------------------------------------------------------
 
-class PasskeyStore:
-    """A saved software passkey: private key + credential id + user handle.
+_SCALAR_TL_TYPES = frozenset({"int", "long", "flags", "bytes", "string", "Bool"})
 
-    Treat the file like a password. Losing it means logging in the old way;
-    leaking it means somebody else can log in (subject to your 2FA password).
+_SPEC: Dict[str, Any] = _core.PASSKEY_TL_SPEC
+
+
+def _normalize(name: str) -> str:
+    return name.replace("_", "").replace("#", "").lower()
+
+
+def _message_spec(name: str) -> Tuple[str, Dict[str, Any]]:
+    """Resolve a message name (spec key, TL name or class name) to its spec."""
+    messages = _SPEC["messages"]
+    if name in messages:
+        return name, messages[name]
+    wanted = _normalize(name)
+    for key, spec in messages.items():
+        spellings = (key, spec["tl_name"], spec["class"])
+        if wanted in {_normalize(item) for item in spellings if item}:
+            return key, spec
+    raise PasskeyError(f"unknown passkey message {name!r}; known: {sorted(messages)}")
+
+
+def _class_by_name(name: str, what: str):
+    cls = globals().get(name)
+    if not (isinstance(cls, type) and issubclass(cls, TLObject)):
+        raise PasskeyError(
+            f"{what}: no TL class {name!r} in tgmint.passkeys — the spec "
+            "message/object names must match the classes declared above"
+        )
+    return cls
+
+
+def _build_value(type_name: str, value: Any, *, what: str) -> Any:
+    """Build the TL value for one spec field (object, union or scalar)."""
+    if type_name in _SCALAR_TL_TYPES:
+        return value
+    unions = _SPEC["unions"]
+    if type_name in unions:
+        candidates = list(unions[type_name]["constructors"])
+        constructor = value.get("_") if isinstance(value, dict) else None
+        if constructor is None:
+            if len(candidates) != 1:
+                raise PasskeyError(
+                    f"{what}: {type_name} needs a '_' constructor name, "
+                    f"one of {candidates}"
+                )
+            constructor = candidates[0]
+        if constructor not in candidates:
+            raise PasskeyError(
+                f"{what}: {constructor!r} is not a constructor of {type_name}; "
+                f"expected one of {candidates}"
+            )
+        return _construct_object(constructor, value, what=constructor)
+    return _construct_object(type_name, value, what=what)
+
+
+def _construct_object(object_key: str, values: Any, *, what: str):
+    """Build the TL object/union named by ``object_key`` from its field dict."""
+    spec = _SPEC["objects"].get(object_key)
+    if spec is None:
+        raise PasskeyError(
+            f"{what}: no TL object {object_key!r} in PASSKEY_TL_SPEC "
+            f"(scalar types: {sorted(_SCALAR_TL_TYPES)})"
+        )
+    class_name = spec.get("class")
+    if not class_name:
+        raise PasskeyError(
+            f"{what}: {object_key!r} has no Telethon class (it is parsed "
+            f"straight into {spec.get('result_class', 'a neutral value')})"
+        )
+    return _construct(class_name, spec, values, what=what)
+
+
+def _construct(class_name: str, spec: Dict[str, Any], values: Any, *, what: str):
+    """Instantiate one hand-written TL class from a spec field dict.
+
+    ``flags`` fields are never passed (the classes derive them from the flag
+    fields they carry, exactly like :func:`tgmint.passkeys_core.encode_request`
+    computes them), a flag-gated field becomes a keyword argument when the
+    dict carries it, and everything else is positional in spec order.
+    """
+    cls = _class_by_name(class_name, what)
+    if isinstance(values, str):
+        # convenience shared with the neutral writer: dataJSON accepts the
+        # bare string as well as {"data": ...}
+        string_fields = [
+            field["name"] for field in spec["fields"]
+            if field["type"] == "string" and "flag" not in field
+        ]
+        if len(spec["fields"]) == 1 and string_fields:
+            values = {string_fields[0]: values}
+    if not isinstance(values, dict):
+        raise PasskeyError(
+            f"{what}: a field dict expected, got {type(values).__name__}"
+        )
+
+    declared = [field["name"] for field in spec["fields"]]
+    args: List[Any] = []
+    kwargs: Dict[str, Any] = {}
+    for field in spec["fields"]:
+        if field["type"] == "flags":
+            continue  # derived by the class (see FinishPasskeyLoginRequest.flags)
+        name = field["name"]
+        if field.get("flag") is not None:
+            value = values.get(name)
+            if value is not None:
+                kwargs[name] = _build_value(field["type"], value, what=name)
+            continue
+        if name not in values:
+            raise PasskeyError(f"{what}: missing field {name!r}; expected {declared}")
+        args.append(_build_value(field["type"], values[name], what=name))
+    return cls(*args, **kwargs)
+
+
+def _build_request(message_key: str, spec: Dict[str, Any], fields: Optional[Dict[str, Any]]):
+    """The Telethon request instance for one ceremony step."""
+    if fields is None:
+        fields = {}
+    if not isinstance(fields, dict):
+        raise PasskeyError(
+            f"{message_key}: a field dict expected, got {type(fields).__name__}"
+        )
+    return _construct(spec["class"], spec, dict(fields), what=message_key)
+
+
+def _response_bytes(response: Any, *, what: str) -> bytes:
+    """The raw TL bytes of an already-parsed Telethon object.
+
+    Telethon's generated classes expose ``__bytes__``/``_bytes()`` rather
+    than a ``to_bytes()`` method, so ``bytes(obj)`` is the equivalent (and
+    re-serializing is lossless enough for the fields the login state machine
+    reads: constructor, flags, then the user's flags words and id).
+    """
+    try:
+        return bytes(response)
+    except TypeError as exc:  # pragma: no cover - defensive
+        raise PasskeyError(
+            f"{what}: cannot re-serialize {type(response).__name__} ({exc}); "
+            "the neutral parser needs the response bytes"
+        ) from None
+
+
+class TelethonInvoker:
+    """Drive the neutral passkey ceremony through a Telethon client.
+
+    Implements exactly one side of the
+    :class:`tgmint.passkeys_core.PasskeyInvoker` contract — the structured
+    ``native(name, fields)`` one — because Telethon hands us the response
+    already parsed (``request.read_result`` for the six hand-written classes,
+    its own TL layer for ``auth.Authorization``).
+
+    For the four response kinds the core wants a value it can adopt (options
+    JSON, a passkey, a list of passkeys, a bool) the parsed object is
+    returned as is. ``finishPasskeyLogin`` is special: the core needs an
+    :class:`tgmint.passkeys_core.AuthorizationResult`, so the framework object
+    is re-serialized with ``bytes(...)`` and parsed by
+    :func:`tgmint.passkeys_core.parse_result` — while the object itself is
+    kept in :attr:`last_response`, because ``client._on_login`` needs the real
+    ``User`` and the core cannot manufacture one.
+
+    ``SESSION_PASSWORD_NEEDED`` on the finish call means "the account has a
+    2FA cloud password" in neutral terms, so that exception is translated
+    into :class:`tgmint.passkeys_core.TwoFactorRequired`; the password entry
+    point stays in :func:`login_with_passkey`.
     """
 
-    VERSION = 1
+    def __init__(self, client):
+        self.client = client
+        self.last_response: Any = None
 
-    def __init__(
-        self,
-        *,
-        credential_id: bytes,
-        rp_id: str,
-        origin: str,
-        alg: int,
-        user_handle: str,
-        private_key_pem: str,
-        sign_count: int = 0,
-        created_at: Optional[str] = None,
-        telegram_passkey_id: Optional[str] = None,
-        name: str = "tgmint software passkey",
-        path: Optional[str] = None,
-    ):
-        self.credential_id = credential_id
-        self.rp_id = rp_id
-        self.origin = origin
-        self.alg = alg
-        self.user_handle = user_handle
-
-        # fail fast with a clear error instead of a cryptic ValueError from
-        # home_dc/user_id later — a store without a "dc:user" handle is not
-        # a tgmint passkey file (or the server changed its user-handle
-        # encoding, which we would need to mirror).
-        if not _USER_HANDLE_RE.match(user_handle or ""):
-            raise PasskeyError(
-                f"passkey store has an invalid user_handle {user_handle!r} "
-                "— this file does not look like a tgmint passkey store"
-            )
-
-        self.private_key_pem = private_key_pem
-        self.sign_count = sign_count
-        self.created_at = created_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.telegram_passkey_id = telegram_passkey_id
-        self.name = name
-        self.path = path
-        self._priv = None
-
-    @property
-    def private_key(self):
-        if self._priv is None:
-            self._priv = _key_from_pem(self.private_key_pem)
-        return self._priv
-
-    @property
-    def home_dc(self) -> int:
-        """The account's home datacenter, decoded from user_handle 'dc:userId'."""
-        return int(self.user_handle.split(":")[0])
-
-    @property
-    def user_id(self) -> int:
-        return int(self.user_handle.split(":")[1])
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "version": self.VERSION,
-            "credential_id": _b64u_encode(self.credential_id),
-            "rp_id": self.rp_id,
-            "origin": self.origin,
-            "alg": self.alg,
-            "user_handle": self.user_handle,
-            "private_key": self.private_key_pem,
-            "sign_count": self.sign_count,
-            "created_at": self.created_at,
-            "telegram_passkey_id": self.telegram_passkey_id,
-            "name": self.name,
-        }
-
-    def save(self, path: Optional[str] = None) -> str:
-        path = path or self.path
-        if not path:
-            raise PasskeyError("no path set for passkey store")
-        self.path = path
-
-        # fork note: written atomically and private from the very first
-        # byte. The old plain open() created the file with the umask
-        # default (often 0644) and only chmod'ed it after the write, and a
-        # crash mid-write left a truncated JSON behind. We now write to a
-        # temp file in the SAME directory (so os.replace never crosses a
-        # filesystem), fsync it, then atomically swap it into place.
-        # os.replace is atomic on POSIX and works on Windows too.
-        directory = os.path.dirname(os.path.abspath(path))
-        tmp = os.path.join(
-            directory, f".{os.path.basename(path)}.tmp.{os.getpid()}"
-        )
-        payload = json.dumps(self.to_dict(), indent=2) + "\n"
-
-        fd = os.open(
-            tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-        )
-        replaced = False
+    async def native(self, name: str, fields: Dict[str, Any]) -> Any:
+        key, spec = _message_spec(name)
+        request = _build_request(key, spec, fields)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fp:
-                fp.write(payload)
-                fp.flush()
-                os.fsync(fp.fileno())
-            os.replace(tmp, path)
-            replaced = True
-        finally:
-            if not replaced:
-                # the atomic swap never happened — don't leave the
-                # half-written temp file (and its 0600 key) behind
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-            # covers pre-existing files that may have looser permissions
-            os.chmod(path, 0o600)
-        return path
+            response = await self.client(request)
+        except SessionPasswordNeededError as exc:
+            if spec["result"]["kind"] == "authorization":
+                raise _core.TwoFactorRequired() from exc
+            raise
+        self.last_response = response
+        if spec["result"]["kind"] == "authorization":
+            return _core.parse_result(key, _response_bytes(response, what=key))
+        return response
 
-    @classmethod
-    def load(cls, path: str) -> "PasskeyStore":
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-        if data.get("version") != cls.VERSION:
-            raise PasskeyError(f"unsupported passkey store version {data.get('version')!r}")
-        return cls(
-            credential_id=_b64u_decode(data["credential_id"]),
-            rp_id=data["rp_id"],
-            origin=data["origin"],
-            alg=data["alg"],
-            user_handle=data["user_handle"],
-            private_key_pem=data["private_key"],
-            sign_count=data.get("sign_count", 0),
-            created_at=data.get("created_at"),
-            telegram_passkey_id=data.get("telegram_passkey_id"),
-            name=data.get("name", "tgmint software passkey"),
-            path=path,
+
+def _auth_user(invoker: TelethonInvoker, result: "_core.AuthorizationResult"):
+    """The Telethon ``User`` behind a finished passkey login.
+
+    The invoker keeps the framework object; if a caller replaced it (or only
+    kept the bytes), the object is rebuilt from ``result.raw`` — the bytes
+    the core already parsed — through Telethon's own TL layer.
+    """
+    response = getattr(invoker, "last_response", None)
+    if response is None:
+        from telethon.tl import types as tl_types
+
+        constructors = _SPEC["messages"]["finishPasskeyLogin"]["result"]["constructors"]
+        if result.constructor == constructors["authorization"]:
+            cls = tl_types.auth.Authorization
+        else:
+            cls = tl_types.auth.AuthorizationSignUpRequired
+        response = cls.from_reader(BinaryReader(result.raw))
+    user = getattr(response, "user", None)
+    if user is None:
+        raise PasskeyError(
+            "auth.finishPasskeyLogin answered auth.authorizationSignUpRequired: "
+            "the account behind this passkey no longer exists, so there is no "
+            "user to return"
         )
-
-    @classmethod
-    def from_credential(cls, cred: CreatedCredential, path: Optional[str] = None) -> "PasskeyStore":
-        return cls(
-            credential_id=cred.credential_id,
-            rp_id=cred.rp_id,
-            origin=cred.origin,
-            alg=cred.alg,
-            user_handle=cred.user_handle,
-            private_key_pem=cred.private_key_pem,
-            sign_count=cred.sign_count,
-            path=path,
-        )
-
-    def produce_assertion(self, options: Any, *, origin: Optional[str] = None) -> Dict[str, Any]:
-        return SoftwareAuthenticator.produce_assertion(self, options, origin=origin)
+    return user
 
 
 # ---------------------------------------------------------------------------
-# High-level flows
+# High-level flows — one core call each
 # ---------------------------------------------------------------------------
 
 async def register_passkey(
@@ -865,22 +692,12 @@ async def register_passkey(
 
     Returns ``(server_passkey_info, store)``.
     """
-    options_json = await client(InitPasskeyRegistrationRequest())
-    cred = SoftwareAuthenticator.create_credential(options_json, origin=origin)
-    tl_credential = InputPasskeyCredentialPublicKey(
-        id=_b64u_encode(cred.credential_id),
-        raw_id=_b64u_encode(cred.credential_id),
-        response=InputPasskeyResponseRegister(
-            client_data=_DataJSONObject(cred.client_data_json),
-            attestation_data=cred.attestation_object,
-        ),
+    return await _core.register_passkey_core(
+        TelethonInvoker(client),
+        store_path=path,
+        origin=origin,
+        name=name,
     )
-    info = await client(RegisterPasskeyRequest(tl_credential))
-    store = PasskeyStore.from_credential(cred, path=path)
-    store.name = name
-    store.telegram_passkey_id = info.id
-    store.save()
-    return info, store
 
 
 async def login_with_passkey(
@@ -903,54 +720,43 @@ async def login_with_passkey(
     """
     from telethon import utils as tl_utils
 
+    session = client.session
     store = PasskeyStore.load(path)
-    origin = origin or store.origin
+    invoker = TelethonInvoker(client)
 
     # 1. Fetch the challenge on the CURRENT connection first — the server
     #    binds it to this connection's auth key (PasskeysController.java
     #    sends initPasskeyLogin on whatever DC the connection is on).
-    options_json = await client(InitPasskeyLoginRequest(client.api_id, client.api_hash))
-    assertion = store.produce_assertion(options_json, origin=origin)
-
-    # persist the bumped signature counter BEFORE any network attempt, so
-    # a failed login doesn't leave the store with a stale (reusable)
-    # counter behind
-    store.save()
-
-    # 2. If the account's home DC differs, switch now and pass
-    #    from_dc_id/from_auth_key_id of the connection that got the
-    #    challenge — exactly like the official client does.
-    home_dc = store.home_dc
-    from_dc_id = None
-    from_auth_key_id = None
-    if getattr(client.session, "dc_id", None) not in (None, home_dc):
-        from_dc_id = client.session.dc_id
-        auth_key = client.session.auth_key
-        from_auth_key_id = auth_key.key_id if auth_key else None
-        # Telethon reads key_id UNSIGNED; the TL field is a signed long.
-        # Half of all keys are >= 2**63 and failed to serialize.
-        if from_auth_key_id is not None and from_auth_key_id >= 1 << 63:
-            from_auth_key_id -= 1 << 64
-        await client._switch_dc(home_dc)
-
-    request = FinishPasskeyLoginRequest(
-        credential=InputPasskeyCredentialPublicKey(
-            id=assertion["id"],
-            raw_id=assertion["id"],
-            response=InputPasskeyResponseLogin(
-                client_data=_DataJSONObject(assertion["client_data_json"]),
-                authenticator_data=assertion["authenticator_data"],
-                signature=assertion["signature"],
-                user_handle=assertion["user_handle"],
-            ),
-        ),
-        from_dc_id=from_dc_id,
-        from_auth_key_id=from_auth_key_id,
+    options_json = await _core.fetch_login_challenge(
+        invoker, api_id=client.api_id, api_hash=client.api_hash
     )
 
+    # 2. Sign it. The core persists the bumped signature counter BEFORE any
+    #    further network step (a failed login must not leave a stale,
+    #    reusable counter behind) and works out the cross-DC handoff: the
+    #    auth key id of the connection that got the challenge, normalized to
+    #    the signed int64 the TL field wants (half of all key ids are
+    #    >= 2**63).
+    auth_key = getattr(session, "auth_key", None)
+    plan = await _core.login_passkey_assertion(
+        store,
+        options_json,
+        origin=origin,
+        connection_dc=getattr(session, "dc_id", None),
+        connection_auth_key_id=getattr(auth_key, "key_id", None),
+        home_dc=store.home_dc,
+    )
+
+    # 3. If the account's home DC differs, switch now and pass
+    #    from_dc_id/from_auth_key_id of the connection that got the
+    #    challenge — exactly like the official client does.
+    if plan["switch_to_dc"] is not None:
+        await client._switch_dc(plan["switch_to_dc"])
+
+    # 4. Finish on the home DC.
     try:
-        result = await client(request)
-    except SessionPasswordNeededError:
+        result = await _core.finish_login(invoker, plan["finish_fields"])
+    except _core.TwoFactorRequired:
         if password is None:
             raise PasskeyError(
                 "the account has a 2FA cloud password; call again with password=..."
@@ -960,16 +766,16 @@ async def login_with_passkey(
         return me
 
     store.save()
-    me = await client._on_login(result.user)
-    await tl_utils.maybe_async(client.session.save())
+    me = await client._on_login(_auth_user(invoker, result))
+    await tl_utils.maybe_async(session.save())
     return me
 
 
 async def list_passkeys(client) -> List[PasskeyInfo]:
     """Passkeys currently registered on the logged-in account."""
-    return await client(GetPasskeysRequest())
+    return await _core.list_passkeys_core(TelethonInvoker(client))
 
 
 async def delete_passkey(client, passkey_id: str) -> bool:
     """Remove a passkey from the account (does not delete your local file)."""
-    return await client(DeletePasskeyRequest(passkey_id))
+    return await _core.delete_passkey_core(TelethonInvoker(client), passkey_id)

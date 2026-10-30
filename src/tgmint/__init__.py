@@ -8,13 +8,28 @@ needs `tgmint.passkeys` (which talks plain Telethon) must therefore be able
 to import it without pulling `tgmint.tl` in — `from tgmint import passkeys`
 now does exactly that. `tgmint.tl` / `tgmint.td` / `tgmint.api` still work
 as attributes and as submodule imports.
+
+`tgmint.passkeys_core` is the framework-neutral half of the passkey
+feature (no Telethon import at all), so it loads lazily like the rest and
+is reachable as both `tgmint.passkeys_core` and `from tgmint import
+passkeys_core`. `tgmint.passkeys_pyrogram` is the Pyrogram-family driver
+(kurigram/pyrofork); it imports no framework until it is actually used.
 """
 
 from __future__ import annotations
 
 import importlib
 
-__all__ = ["api", "td", "tl", "passkeys", "adapters", "codec"]
+__all__ = [
+    "api",
+    "td",
+    "tl",
+    "passkeys",
+    "passkeys_core",
+    "passkeys_pyrogram",
+    "adapters",
+    "codec",
+]
 
 try:
     # distribution metadata when installed; falls back to the literal when
@@ -23,7 +38,7 @@ try:
 
     __version__ = _dist_version("tgmint")
 except Exception:
-    __version__ = "1.16.1"
+    __version__ = "1.17.0"
 
 
 def __getattr__(name: str):

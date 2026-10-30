@@ -1,6 +1,51 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [v1.17.0] - 2026-10-30
+
+The "passkeys everywhere they can physically be" release. Software
+passkeys were Telethon-only because the ceremony logic lived inside the
+Telethon client glue. They are now built on a framework-neutral core:
+`tgmint.passkeys_core` (no telethon imports, offline-tested against a
+simulated server) drives the Telethon driver, a new native Pyrogram-family
+driver, and any future non-Python port through one JSON TL spec. The
+handshake itself is now data: `PASSKEY_TL_SPEC` carries the constructor
+ids and field orders, pinned byte-for-byte against the hand-written
+classes and against kurigram's generated layer (layer 229 ships every
+passkey constructor natively, proven by serializing both to identical
+hex).
+
+### Added
+- `tgmint.passkeys_core` — framework-neutral passkey data + ceremony
+  layer: credential engine and store (moved, single identity with
+  `tgmint.passkeys`), a machine-readable TL wire spec
+  (`PASSKEY_TL_SPEC`), a neutral writer/parser (`encode_request`,
+  `parse_result`, `TLReader`), and the ceremony state machine
+  (`register_passkey_core`, `login_passkey_assertion`,
+  `finish_login`, `list_passkeys_core`, `delete_passkey_core`) with a
+  documented driver contract (`PasskeyInvoker`: one async method,
+  `request_bytes` or `native`). Zero telethon imports, asserted by test.
+- `tgmint.passkeys_pyrogram` — native passkeys for the Pyrogram family:
+  `register_passkey` / `login_with_passkey` / `list_passkeys` /
+  `delete_passkey` on a connected kurigram client, including the
+  cross-DC login (challenge-DC switch with from_dc_id/from_auth_key_id,
+  snapshot/restore on failure) and 2FA via `check_password`. Constructor
+  lookup is by TL id, so forks that ship the constructors work and forks
+  that do not (hydrogram, layer 181) get a clear error.
+- `tgmint login-passkey` CLI — the cross-framework bridge: sign in with
+  only a passkey file (the one command that touches the network), written
+  out in any session format (telethon/pyrogram/gramjs/tdata), on a client
+  minted with a coherent tgmint fingerprint. Output is never overwritten.
+- 111 new offline tests (51 core + 30 ceremony + 14 CLI + 61 Pyrogram
+  driver, the Pyrogram ones skip cleanly without kurigram installed).
+
+### Changed
+- `tgmint.passkeys` is now a thin Telethon driver over the core: same
+  public API, same behavior (27 legacy tests pass unchanged; the
+  byte-identical wire bytes are pinned by the core tests). The signed
+  int64 auth-key-id handling and the counter-before-network discipline
+  moved into the core so every driver inherits them.
+
 ## [v1.16.1] - 2026-10-30
 
 The "the convert command actually works" patch. v1.16.0 shipped a CLI

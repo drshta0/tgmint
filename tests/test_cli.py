@@ -514,6 +514,205 @@ class ConvertCliTest(unittest.TestCase):
             self.assertEqual(pyrogram.read_string(string).auth_key, self.KEY)
 
 
+class LoginPasskeyCliTest(unittest.TestCase):
+    """`login-passkey` — validation and refusal paths only.
+
+    The command's real path (passkey ceremony -> login -> convert) needs a
+    live account with a registered passkey, so it stays manually testable.
+    What is pinned here is everything that must happen *before* a socket
+    is opened: argparse requiredness, preset/format choice validation, the
+    missing/corrupt passkey refusal, the existing-output refusal, and the
+    --json error shape. None of these tests may touch the network.
+    """
+
+    PRESETS = ("desktop", "android", "android-x", "ios", "macos")
+    FORMATS = (
+        "telethon-session",
+        "telethon-string",
+        "pyrogram-session",
+        "pyrogram-string",
+        "gramjs-string",
+        "tdata",
+    )
+
+    def _argv(self, tmp, passkey=None, preset=None, fmt="telethon-session"):
+        argv = [
+            "login-passkey",
+            "--passkey", passkey or os.path.join(tmp, "missing.passkey.json"),
+        ]
+        if preset is not None:
+            argv += ["--preset", preset]
+        argv += [
+            "--to", os.path.join(tmp, "out.session"),
+            "--to-format", fmt,
+        ]
+        return argv
+
+    def _stub_passkey(self, tmp):
+        """A file that exists but is not a passkey store: enough to get
+        past the existence check and reach the later refusals offline."""
+        path = os.path.join(tmp, "stub.passkey.json")
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write("{}")
+        return path
+
+    def test_missing_passkey_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                run_cli(
+                    [
+                        "login-passkey",
+                        "--to", os.path.join(tmp, "out.session"),
+                        "--to-format", "telethon-session",
+                    ]
+                )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_missing_to_path_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            run_cli(
+                [
+                    "login-passkey", "--passkey", "acct.passkey.json",
+                    "--to-format", "telethon-session",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_missing_to_format_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            run_cli(
+                [
+                    "login-passkey", "--passkey", "acct.passkey.json",
+                    "--to", "out.session",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_unknown_preset_rejected_by_argparse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                run_cli(self._argv(tmp, preset="web"))
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_unknown_to_format_rejected_by_argparse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                run_cli(self._argv(tmp, fmt="hydrogram-string"))
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_every_preset_and_format_is_accepted(self):
+        # argparse-level acceptance only: each value gets past the parser
+        # and then fails on the missing passkey (exit 2, not SystemExit) —
+        # so no value is silently rejected as a choice
+        for preset in self.PRESETS:
+            for fmt in self.FORMATS:
+                with tempfile.TemporaryDirectory() as tmp:
+                    code, out, err = run_cli(
+                        self._argv(tmp, preset=preset, fmt=fmt)
+                    )
+                self.assertEqual(code, 2, (preset, fmt, err))
+                self.assertIn("no such file", err, (preset, fmt))
+
+    def test_bad_passkey_path_exits_2_with_clear_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "gone.passkey.json")
+            code, out, err = run_cli(self._argv(tmp, passkey=missing))
+            self.assertEqual(code, 2)
+            self.assertIn(f"--passkey {missing}: no such file", err)
+            self.assertIn("tgmint:", err)
+            # nothing is created when the command refuses up front
+            self.assertFalse(os.path.exists(os.path.join(tmp, "out.session")))
+
+    def test_corrupt_passkey_store_is_a_refusal(self):
+        # a session we cannot even read is a usage refusal (2), never a
+        # failed login (1) — and it is caught before any connection
+        with tempfile.TemporaryDirectory() as tmp:
+            passkey = os.path.join(tmp, "corrupt.passkey.json")
+            with open(passkey, "w", encoding="utf-8") as fp:
+                fp.write("{not json")
+            code, out, err = run_cli(self._argv(tmp, passkey=passkey))
+            self.assertEqual(code, 2)
+            self.assertIn("not a usable passkey store", err)
+
+    def test_macos_layer_refused(self):
+        # macos stays pin-only (no verified layer table): the mint helper's
+        # refusal surfaces as exit 2, before any login is attempted
+        with tempfile.TemporaryDirectory() as tmp:
+            passkey = self._stub_passkey(tmp)
+            code, out, err = run_cli(
+                self._argv(tmp, passkey=passkey, preset="macos")
+                + ["--layer", "200"]
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("--layer is not supported for the macos preset", err)
+
+    def test_existing_output_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passkey = self._stub_passkey(tmp)
+            to = os.path.join(tmp, "precious.session")
+            with open(to, "w", encoding="utf-8") as fp:
+                fp.write("keep me")
+            code, out, err = run_cli(
+                [
+                    "login-passkey", "--passkey", passkey,
+                    "--to", to, "--to-format", "telethon-session",
+                ]
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("output already exists", err)
+            with open(to, encoding="utf-8") as fp:
+                self.assertEqual(fp.read(), "keep me")
+
+    def test_json_error_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "gone.passkey.json")
+            code, out, err = run_cli(
+                self._argv(tmp, passkey=missing) + ["--json"]
+            )
+            self.assertEqual(code, 2)
+            payload = json.loads(out)  # machine-readable, must parse
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["command"], "login-passkey")
+            self.assertIn("no such file", payload["error"])
+            self.assertIn("tgmint:", err)  # the human line stays on stderr
+
+    def test_json_error_shape_for_refused_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passkey = self._stub_passkey(tmp)
+            to = os.path.join(tmp, "taken.session")
+            with open(to, "w", encoding="utf-8") as fp:
+                fp.write("x")
+            code, out, err = run_cli(
+                [
+                    "login-passkey", "--passkey", passkey,
+                    "--to", to, "--to-format", "telethon-session",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 2)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertIn("output already exists", payload["error"])
+
+    def test_exit_2_when_tgmint_tl_missing(self):
+        # a build without telethon must fail cleanly with a "needs the
+        # telethon extra" message, never a traceback
+        with tempfile.TemporaryDirectory() as tmp:
+            passkey = self._stub_passkey(tmp)
+            with mock.patch.dict(sys.modules, {"tgmint.tl": None}):
+                code, out, err = run_cli(self._argv(tmp, passkey=passkey))
+        self.assertEqual(code, 2)
+        self.assertIn("telethon extra", err)
+
+    def test_help_keeps_the_own_account_language(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main(["login-passkey", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("a session you own", out.getvalue())
+
+
 class MacosPresetCliTest(unittest.TestCase):
     def test_mint_macos_json(self):
         code, out, err = run_cli(

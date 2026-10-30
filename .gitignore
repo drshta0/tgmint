@@ -26,3 +26,4 @@ dist/
 tests/test_profile*/
 .worktrees/
 .pytestbox/
+

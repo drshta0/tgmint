@@ -8,6 +8,67 @@ exactly like a password manager or hardware key would produce.
 
 Verified working live (two real accounts, full end-to-end).
 
+## Which frameworks can use passkeys
+
+The data and ceremony layer lives in `tgmint.passkeys_core`: it has no
+Telethon imports and is driven through one small invoker contract, so each
+framework only supplies TL plumbing. What each one gets today:
+
+| Framework | Passkeys | How |
+|---|---|---|
+| Telethon | Full | `tgmint.passkeys` (`register_passkey`, `login_with_passkey`, same API as before) |
+| Pyrogram family: kurigram | Full, including cross-DC logins | `tgmint.passkeys_pyrogram`, native. Needs kurigram >= 2.2 (TL layer 229), which ships all fourteen passkey constructors |
+| Pyrogram family: pyrofork | Partial: register, list, delete and same-DC login | `tgmint.passkeys_pyrogram`; pyrofork has no cross-DC session move, so a login whose home DC differs raises an error that says so |
+| Pyrogram family: hydrogram | Unsupported | hydrogram 0.2.0 is TL layer 181 and does not ship the passkey constructors; the driver reports that instead of failing obscurely |
+| Any other framework (GramJS/Node, tdata, Go, Rust, ...) | Bridged through the CLI | `login-passkey` in (network, once), `convert` out (offline) |
+| Bot API | Never | a different protocol with no MTProto surface, so there is nothing to present a passkey to |
+
+The bridge is what makes a passkey-created session usable everywhere. The
+`login-passkey` command logs in with only the passkey file over the network,
+then writes the session in any codec format; the conversion step is offline.
+The client is built from a minted fingerprint, so the session it creates
+carries a real device identity rather than a default one.
+
+```sh
+# passkey in, session out in any format (offline conversion after one login)
+python -m tgmint login-passkey --passkey acc1.passkey.json --preset android \
+    --to out.session --to-format gramjs-string
+```
+
+For the Pyrogram family the driver is native, so no bridge is needed:
+
+```python
+from pyrogram import Client
+
+from tgmint.adapters.pyrogram import client_kwargs
+from tgmint.api import API
+from tgmint.fingerprint import Fingerprint
+from tgmint.passkeys_pyrogram import login_with_passkey, register_passkey
+
+fp = Fingerprint.from_apidata(API.TelegramAndroid.Generate())
+
+# once: an already authorized client registers the passkey
+creator = Client("acct", **client_kwargs(fp), in_memory=True)
+await creator.connect()
+info, store = await register_passkey(creator, path="acc1.passkey.json")
+await creator.disconnect()
+
+# later: a fresh connected client, not authorized, plus only the file
+client = Client("acc1", **client_kwargs(fp), in_memory=True)
+await client.connect()                    # connected, NOT started
+me = await login_with_passkey(client, path="acc1.passkey.json")
+await client.storage.save()               # the framework owns its storage
+```
+
+Use `client.connect()`, never `client.start()`: start is interactive and
+prompts for a phone number, which is exactly what a passkey login avoids.
+
+**Own account only.** Registration needs a session you are already logged
+into and login needs the passkey file you created there. tgmint never
+registers a passkey on somebody else's account and never enables passkey
+login for an account you cannot already access. Whoever holds the file (plus
+the 2FA password, if one is set) can log in, so treat it like a password.
+
 ---
 
 ## Install

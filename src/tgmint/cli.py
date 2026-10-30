@@ -1,7 +1,9 @@
-"""tgmint command line — mint, inspect, audit, freshness, parity, convert, doctor.
+"""tgmint command line — mint, inspect, audit, freshness, parity, convert,
+login-passkey, doctor.
 
 CLI v1. Zero new dependencies: argparse +
-stdlib only, everything offline-safe except an explicit ``convert``.
+stdlib only, everything offline-safe except ``login-passkey`` — the one
+command that signs in over the network (``convert`` itself is offline).
 Every command takes ``--json`` for machine-readable output; the human
 format is stable but not a contract.
 
@@ -13,17 +15,23 @@ Exit codes (also shown in ``--help``)::
        or an optional module missing from this build (e.g. codec)
 
 Optional modules are imported lazily and probed defensively:
-``tgmint.parity.describe_envelope`` (envelope builder, parallel work)
-and ``tgmint.codec`` (session converter — ``convert_session``) — the
-CLI must not crash when either is absent.
+``tgmint.parity.describe_envelope`` (envelope builder, parallel work),
+``tgmint.codec`` (session converter — ``convert_session``) and the
+telethon-backed ``tgmint.tl`` / ``tgmint.passkeys`` pair used by
+``login-passkey`` — the CLI must not crash when any of them is absent;
+the command that needs one exits 2 with a "needs the … extra" message.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json as _json
+import os
 import platform
+import shutil
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -94,6 +102,28 @@ def _print_fields(payload: Dict[str, Any], order: List[str]) -> None:
 def _fail(message: str) -> int:
     print(f"tgmint: {message}", file=sys.stderr)
     return EXIT_ERROR
+
+
+def _fail_json(
+    args: argparse.Namespace, message: str, code: int = EXIT_ERROR
+) -> int:
+    """Error for a command whose failures are also machine-readable.
+
+    The human line always goes to stderr (shell users and grep keep
+    working); when ``--json`` was asked for, a
+    ``{"ok": false, "command": ..., "error": ...}`` object joins it on
+    stdout, so a caller parsing JSON never has to scrape stderr.
+    """
+    print(f"tgmint: {message}", file=sys.stderr)
+    if getattr(args, "json", False):
+        _print_json(
+            {
+                "ok": False,
+                "command": getattr(args, "command", None),
+                "error": message,
+            }
+        )
+    return code
 
 
 def _load_sidecar(path: str) -> Optional[Fingerprint]:
@@ -478,6 +508,180 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+class _LoginPasskeyRefusal(Exception):
+    """A refusal inside ``login-passkey`` (exit 2), not a runtime failure.
+
+    Raised for things like an output path ``convert_session`` refuses to
+    overwrite — a usage/refusal condition the user can fix, distinct from
+    a login that genuinely failed (exit 1, runtime error).
+    """
+
+
+async def _login_passkey_flow(
+    api: Any, args: argparse.Namespace, passkey_path: str
+) -> Dict[str, Any]:
+    """Sign in over the network, then write the session in ``args.to_format``.
+
+    Everything here is network-bound (``asyncio.run`` calls it from the
+    synchronous handler). The Telethon session lives in a private temp
+    directory that is removed on the way out — passkey logins are one
+    step in a bridge, not a session to keep; the requested ``--to``
+    output is the only artifact that survives.
+    """
+    import inspect
+
+    import tgmint.codec as codec
+
+    from . import tl as tgmint_tl
+    from .passkeys import login_with_passkey
+
+    tmpdir = tempfile.mkdtemp(prefix="tgmint-login-passkey-")
+    try:
+        session_path = os.path.join(tmpdir, "login.session")
+        # a fresh sqlite session in a temp location: the client is born
+        # with the minted fingerprint (api=APIData) and nothing else
+        client = tgmint_tl.TelegramClient(session_path, api=api)
+        try:
+            await client.connect()
+            me = await login_with_passkey(
+                client,
+                path=passkey_path,
+                password=args.password,
+                origin=args.origin,
+            )
+            user_id = getattr(me, "id", None)
+            dc_id = getattr(client.session, "dc_id", None)
+            # flush the auth key to the sqlite file BEFORE converting:
+            # the conversion reads that file, not the live session
+            saved = client.session.save()
+            if inspect.isawaitable(saved):
+                await saved
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:  # already closed / never connected
+                pass
+
+        try:
+            converted = codec.convert_session(
+                session_path, "telethon-session", args.to_path, args.to_format
+            )
+        except FileExistsError as exc:
+            raise _LoginPasskeyRefusal(
+                f"--to {args.to_path}: output already exists — "
+                "convert_session never overwrites an existing session "
+                f"({exc}); the login succeeded, re-run with a new --to path"
+            ) from None
+
+        if not isinstance(converted, dict):
+            raise RuntimeError(
+                f"codec returned {type(converted).__name__}, "
+                "expected a result dict"
+            )
+        return {
+            "user_id": user_id,
+            "dc_id": dc_id,
+            "converted": converted,
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cmd_login_passkey(args: argparse.Namespace) -> int:
+    """Log in with a passkey and write the session in any supported format."""
+    passkey_path = args.passkey
+
+    # --- refusals first: never open a socket for a request we can reject
+    if not os.path.exists(passkey_path):
+        return _fail_json(args, f"--passkey {passkey_path}: no such file")
+    if not os.path.isfile(passkey_path):
+        return _fail_json(
+            args, f"--passkey {passkey_path}: not a regular file"
+        )
+    if os.path.exists(args.to_path):
+        return _fail_json(
+            args,
+            f"--to {args.to_path}: output already exists — refusing to "
+            "overwrite it (session conversion never overwrites; pick a new "
+            "path or move the old one away)",
+        )
+
+    # --- the identity the new session is born with (reused, not copied:
+    #     `mint`, `parity` and this command mint through _mint_api)
+    try:
+        api = _mint_api(
+            args.preset,
+            system=args.system,
+            layer=args.layer,
+            unique_id=args.unique_id,
+            locale=args.locale,
+        )
+    except (ValueError, NotImplementedError) as exc:
+        return _fail_json(args, f"login-passkey failed: {exc}")
+
+    # --- optional modules: a build without telethon must fail cleanly
+    try:
+        import tgmint.tl  # noqa: F401
+        from .passkeys import PasskeyError as _PasskeyError
+        from .passkeys import PasskeyStore
+    except ImportError as exc:
+        return _fail_json(
+            args,
+            "login-passkey needs the telethon extra (tgmint.tl / "
+            f"tgmint.passkeys are not importable: {exc}); install tgmint "
+            "together with telethon to use this command",
+        )
+
+    # a corrupted/foreign passkey file is a refusal, not a failed login
+    try:
+        PasskeyStore.load(passkey_path)
+    except _PasskeyError as exc:
+        return _fail_json(args, f"--passkey {passkey_path}: {exc}")
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        return _fail_json(
+            args,
+            f"--passkey {passkey_path}: not a usable passkey store ({exc})",
+        )
+
+    # --- the network part
+    try:
+        result = asyncio.run(_login_passkey_flow(api, args, passkey_path))
+    except _LoginPasskeyRefusal as exc:
+        return _fail_json(args, str(exc), EXIT_ERROR)
+    except ImportError as exc:
+        return _fail_json(
+            args,
+            "login-passkey needs the passkeys extra (cryptography is "
+            f"required to sign the assertion: {exc}); install tgmint's "
+            "passkeys dependencies",
+        )
+    except Exception as exc:  # login/convert failure -> runtime error
+        return _fail_json(args, f"login-passkey failed: {exc}", EXIT_PROBLEMS)
+
+    converted = result["converted"]
+    payload: Dict[str, Any] = {
+        "target": args.to_path,
+        "to_format": args.to_format,
+        "user_id": result["user_id"],
+        "dc_id": result["dc_id"],
+        "preset": args.preset,
+        "api_id": api.api_id,
+        "passkey": passkey_path,
+        "conversion": converted,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print(
+            f"logged in with passkey {passkey_path} "
+            f"(user_id {result['user_id']}, dc_id {result['dc_id']})"
+        )
+        print(f"wrote {args.to_path} ({args.to_format})")
+        for note in converted.get("notes", ()):
+            print(f"  note: {note}")
+    return EXIT_OK
+
+
 def _module_version(name: str) -> Optional[str]:
     """Installed version of an optional module, or None if absent."""
     try:
@@ -572,12 +776,18 @@ def _add_json(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_mint_options(parser: argparse.ArgumentParser) -> None:
+def _add_mint_options(
+    parser: argparse.ArgumentParser,
+    preset_required: bool = True,
+    preset_default: Optional[str] = None,
+) -> None:
     parser.add_argument(
         "--preset",
-        required=True,
+        required=preset_required,
+        default=preset_default,
         choices=_PRESET_ORDER,
-        help="official client family to impersonate",
+        help="official client family to impersonate"
+        + ("" if preset_required else " (default: desktop)"),
     )
     parser.add_argument(
         "--system",
@@ -732,6 +942,58 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_json(p)
 
     p = sub.add_parser(
+        "login-passkey",
+        help="log in with a passkey and write the session in any format",
+        description=(
+            "Bridge: log in with a tgmint software passkey for a session "
+            "you own, then write the resulting session in any supported "
+            "format (telethon, pyrogram, gramjs, tdata). The client is "
+            "created with a freshly minted fingerprint, so the new session "
+            "is born with a coherent tgmint identity instead of stock "
+            "python-telethon's. This is the ONLY command that touches the "
+            "network (the passkey sign-in); the conversion afterwards is "
+            "offline. Needs telethon (the telethon extra); when tgmint.tl "
+            "or telethon is missing this command exits 2. The output path "
+            "is never overwritten — an existing file is refused with exit 2."
+        ),
+        epilog=_EXIT_EPILOG,
+    )
+    p.add_argument(
+        "--passkey",
+        required=True,
+        metavar="FILE",
+        help="passkey store to sign in with — a session you own "
+        "(written by tgmint.passkeys.register_passkey)",
+    )
+    p.add_argument(
+        "--password",
+        metavar="2FA",
+        help="the account's 2FA cloud password, when it has one",
+    )
+    p.add_argument(
+        "--origin",
+        metavar="ORIGIN",
+        help="WebAuthn origin the passkey was registered under "
+        "(default: the store's own origin)",
+    )
+    _add_mint_options(p, preset_required=False, preset_default="desktop")
+    p.add_argument(
+        "--to",
+        dest="to_path",
+        required=True,
+        metavar="PATH",
+        help="destination session file (or tdata folder) to write",
+    )
+    p.add_argument(
+        "--to-format",
+        dest="to_format",
+        required=True,
+        choices=_CONVERT_FORMATS,
+        help="destination format of the logged-in session",
+    )
+    _add_json(p)
+
+    p = sub.add_parser(
         "doctor",
         help="environment report (python, telethon, tzdata, extras, pins)",
         description=(
@@ -754,6 +1016,7 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace], int]] = {
     "freshness": _cmd_freshness,
     "parity": _cmd_parity,
     "convert": _cmd_convert,
+    "login-passkey": _cmd_login_passkey,
     "doctor": _cmd_doctor,
 }
 

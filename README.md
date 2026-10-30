@@ -41,7 +41,8 @@ What is different so far (details, sources and the audit in [FORK.md](FORK.md)):
   bundle; the Bot API has **no fingerprint surface** and we say so instead of
   papering over it (see [Frameworks](#frameworks)).
 - **CLI** — `python -m tgmint mint | inspect | audit | freshness | parity |
-  convert | doctor`, every command `--json`-able for non-Python callers.
+  convert | login-passkey | doctor`, every command `--json`-able for
+  non-Python callers.
 - **Layer coherence** — `Generate(layer=N)` picks an app version that
   genuinely spoke wire layer N (old version + old layer = plausible; new
   version + old layer = impossible — that mismatch is the tell it fixes).
@@ -76,8 +77,8 @@ package cannot quietly rot — is laid out in [PLAN.md](PLAN.md). The rename to
 - Randomize [device info](./docs/documentation/authorization/api.md) using real, current data recognized by the Telegram server — coherent per platform, deterministic per `unique_id`, and sticky per account via a sidecar file.
 - Mint **layer-coherent** identities: `Generate(layer=N)` claims an app version that actually spoke wire layer N.
 - Use the **Pyrogram family** with the same fingerprints — `Client` kwargs adapter, no monkey-patching — and export **TDLib** parameters.
-- Drive everything from the **CLI**: `python -m tgmint mint | inspect | audit | freshness | parity | convert | doctor`, all `--json`-able.
-- **Software passkeys** — register once, then log in with just the passkey file ([PASSKEYS.md](PASSKEYS.md)).
+- Drive everything from the **CLI**: `python -m tgmint mint | inspect | audit | freshness | parity | convert | login-passkey | doctor`, all `--json`-able.
+- **Software passkeys** ([PASSKEYS.md](PASSKEYS.md)) — register once, then log in with just the passkey file: native in Telethon and in the Pyrogram family (full on kurigram, partial on pyrofork), and bridged to **any** session format through `python -m tgmint login-passkey`. The Bot API cannot use them and the docs say so.
 
 ## Frameworks
 
@@ -87,7 +88,7 @@ version (details and mechanisms: [docs/frameworks.md](./docs/frameworks.md)).
 | Framework | What you get | Mechanism |
 |---|---|---|
 | [Telethon](https://github.com/LonamiWebs/Telethon) | Full: patched client + conversion + passkeys | `tgmint.tl.TelegramClient` (scoped `initConnection` override, `lang_pack=tdesktop` on the wire) |
-| [Pyrogram](https://github.com/pyrogram/pyrogram) family — [kurigram](https://github.com/KurimuzonAkuma/pyrogram), [pyrofork](https://github.com/Mayuri-Chan/pyrofork), [hydrogram](https://github.com/hydrogram/hydrogram) | Fingerprint kwargs adapter + session codec | `Client(**kwargs)` — Pyrogram's own `device_model` / `system_version` / `app_version` / `lang_code` / `lang_pack` parameters; no monkey-patching |
+| [Pyrogram](https://github.com/pyrogram/pyrogram) family — [kurigram](https://github.com/KurimuzonAkuma/pyrogram), [pyrofork](https://github.com/Mayuri-Chan/pyrofork), [hydrogram](https://github.com/hydrogram/hydrogram) | Fingerprint kwargs adapter + session codec + native passkeys (kurigram; pyrofork partial; hydrogram no) | `Client(**kwargs)` — Pyrogram's own `device_model` / `system_version` / `app_version` / `lang_code` / `lang_pack` parameters; no monkey-patching. Passkeys: `tgmint.passkeys_pyrogram` |
 | [TDLib](https://github.com/tdlib/td) (python-tdlib, aiotdlib) | Parameters bundle | `device_model` / `system_version` / `app_version` exported for `setOption` and auth params |
 | Bot API ([python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot), aiogram) | Recipes and docs only | The Bot API has **no fingerprint surface** (HTTPS, no `initConnection`) — documented, not papered over |
 | [GramJS](https://github.com/gram-js/gramjs) (Node), [MadelineProto](https://github.com/danog/MadelineProto) (PHP) | CLI `--json` + session codec | `python -m tgmint mint --json`; string-session conversion |
