@@ -1,6 +1,58 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [v1.16.1] - 2026-10-30
+
+The "the convert command actually works" patch. v1.16.0 shipped a CLI
+`convert` that was dead code: it probed for `tgmint.codec.convert_session`,
+which did not exist anywhere in the tree, so every invocation exited 2
+with "no convert_session entrypoint". Worse, the only CLI test covering
+it skipped itself precisely when the codec was importable — the suite
+stayed green while the advertised command was broken. Both are fixed,
+and the replacement tests cannot skip.
+
+### Fixed
+- **`tgmint convert` was dead on arrival** (the bug this patch exists
+  for): the codec package had all the readers and writers but no
+  orchestrator, and the CLI's defensive "optional module" probe turned
+  that into a silent exit-2 for every user who tried the command the
+  README documents. The self-skipping test was not a victim of bad luck
+  — it asserted the skip condition backwards, skipping when the codec
+  was *present*. It is replaced by unconditional end-to-end tests that
+  run real conversions through the CLI handler.
+
+### Added
+- `tgmint.codec.convert_session()` — the entrypoint the CLI was probing
+  for: every documented from→to cell via the existing readers/writers,
+  stdlib-only, offline, no login. String destinations are written to the
+  output path as mode-0600 files (never echoed); existing outputs are
+  never overwritten; tdata destinations route through `tgmint.td`'s
+  `SaveTData`. When the destination needs a field the source format
+  cannot store (Telethon/GramJS carry no `user_id`/`api_id`), a labelled
+  placeholder is written and reported in the result — not hidden. For
+  string formats, `--from` accepts the session string itself or a path to
+  a file containing it (a saved `StringSession`).
+- `gramjs-string` as a CLI convert format (`--from-format`/`--to-format`),
+  wired end to end.
+- `macos` as a `mint`/`parity` preset (the existing `API.TelegramMacOS`
+  pool). `--layer` is refused with a clear error there: macOS stays
+  pin-only because no verified macOS layer table exists (the
+  TelegramSwift source URL 404s — see `tgmint.layers`), and refusing
+  beats inventing layer data.
+- Non-skippable end-to-end CLI convert tests: a fixed 256-byte auth_key
+  round-trips telethon-string → pyrogram-string, pyrogram-string →
+  gramjs-string, sqlite→string and string→sqlite cells, a tdata
+  destination, and a `python -m tgmint` subprocess run — every output
+  parsed back and compared against the seed key.
+- Hydrogram rows in the framework tables in `README.md` and
+  `docs/frameworks.md` (same release; the Pyrogram-family adapter and
+  codec cover it like kurigram/pyrofork).
+
+### Changed
+- CLI `convert` human output now prints dc_id, the output path/kind and
+  any placeholder-fill notes (the JSON shape is unchanged);
+  `--help` lists `gramjs-string` and the `macos` preset.
+
 ## [v1.16.0] - 2026-10-28
 
 The "all frameworks" release — everything below was built, tested and

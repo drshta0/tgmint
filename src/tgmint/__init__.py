@@ -23,7 +23,7 @@ try:
 
     __version__ = _dist_version("tgmint")
 except Exception:
-    __version__ = "1.16.0"
+    __version__ = "1.16.1"
 
 
 def __getattr__(name: str):

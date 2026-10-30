@@ -9,8 +9,9 @@ kwargs for the **Pyrogram family** of MTProto clients:
 * vanilla `pyrogram <https://github.com/pyrogram/pyrogram>`_
 * `hydrogram <https://github.com/hydrogram/hydrogram>`_
 
-They all ship the identical import name ``pyrogram`` (hydrogram mirrors the
-same constructor), and that is the whole point: Pyrogram's ``Client`` accepts
+Three of them ship the identical import name ``pyrogram``; hydrogram ships
+as ``hydrogram`` and mirrors the same constructor — and that is the whole
+point: Pyrogram's ``Client`` accepts
 ``device_model``, ``system_version``, ``app_version``, ``lang_code`` and
 ``lang_pack`` as native constructor arguments and forwards them verbatim into
 its ``initConnection``

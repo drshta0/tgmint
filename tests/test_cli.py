@@ -2,13 +2,14 @@
 
 All offline: minting is seeded with --unique-id, sidecars live in
 tempfile dirs, and `freshness` is asserted to never touch the network.
-The `convert` test EXPECTS the codec module to be absent (it is, in
-this tree) and skips itself in builds where a codec landed.
+`convert` is exercised end-to-end through the real handler with a fixed
+auth_key, unconditionally — the v1.16.0 predecessor of this test class
+skipped itself whenever `tgmint.codec` was importable, which is exactly
+how a dead command stayed green (see the v1.16.1 changelog).
 """
 
 import contextlib
 import dataclasses
-import importlib.util
 import io
 import json
 import os
@@ -19,10 +20,19 @@ import unittest
 from unittest import mock
 
 from tgmint import cli
+from tgmint.codec import SessionData, gramjs, pyrogram, telethon
+from tgmint.codec.dcs import PROD_DC
 from tgmint.fingerprint import SCHEMA_VERSION
 from tgmint.versions import PINNED
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+
+try:  # tdata destinations route through tgmint.td (needs tgcrypto)
+    import tgmint.td  # noqa: F401
+
+    HAVE_TD = True
+except Exception:  # pragma: no cover - optional dependency absent
+    HAVE_TD = False
 
 
 def run_cli(argv):
@@ -253,23 +263,293 @@ class ParityCliTest(unittest.TestCase):
 
 
 class ConvertCliTest(unittest.TestCase):
-    def _codec_present(self):
-        return importlib.util.find_spec("tgmint.codec") is not None
+    """Every cell runs through the REAL CLI handler (`cli.main`) with a
+    fixed 256-byte auth_key; outputs are parsed back and must round-trip
+    to the same key. None of these tests may skip when the codec exists
+    — that is the regression this class pins.
+    """
+
+    KEY = bytes(range(256))  # fixed seed; the only secret that moves
+    DC = 2
+    USER = 777000
+    API = 2040
+
+    def _telethon_string(self):
+        return telethon.write_string(
+            SessionData(
+                dc_id=self.DC,
+                auth_key=self.KEY,
+                server_address=PROD_DC[self.DC],
+                port=443,
+            )
+        )
+
+    def _pyrogram_string(self):
+        return pyrogram.write_string(
+            SessionData(
+                dc_id=self.DC, auth_key=self.KEY,
+                user_id=self.USER, api_id=self.API,
+            )
+        )
+
+    def test_telethon_string_to_pyrogram_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.pyrogram.string")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", self._telethon_string(),
+                    "--from-format", "telethon-string",
+                    "--to", out,
+                    "--to-format", "pyrogram-string",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out_txt)
+            result = payload["result"]
+            self.assertEqual(result["dc_id"], self.DC)
+            # the source format stores no identity: the CLI reports the
+            # placeholder fills instead of hiding them
+            self.assertEqual(sorted(result["filled"]), ["api_id", "user_id"])
+            self.assertTrue(result["notes"])
+            with open(out, encoding="ascii") as fp:
+                string = fp.read().strip()
+            data = pyrogram.read_string(string)
+            self.assertEqual(data.auth_key, self.KEY)
+            self.assertEqual(data.dc_id, self.DC)
+
+    def test_telethon_string_from_file(self):
+        # --from may point at a file that holds the session string
+        # (what anyone who saved their StringSession to disk does)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "saved.string")
+            with open(src, "w", encoding="ascii") as fp:
+                fp.write(self._telethon_string() + "\n")
+            out = os.path.join(tmp, "out.pyrogram.string")
+            code, _out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", src,
+                    "--from-format", "telethon-string",
+                    "--to", out,
+                    "--to-format", "pyrogram-string",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            with open(out, encoding="ascii") as fp:
+                string = fp.read().strip()
+            data = pyrogram.read_string(string)
+            self.assertEqual(data.auth_key, self.KEY)
+            self.assertEqual(data.dc_id, self.DC)
+
+    def test_pyrogram_string_to_gramjs_string(self):
+        # gramjs-string must be accepted as a --to format end to end
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.gramjs.string")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", self._pyrogram_string(),
+                    "--from-format", "pyrogram-string",
+                    "--to", out,
+                    "--to-format", "gramjs-string",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out_txt)
+            self.assertEqual(payload["to_format"], "gramjs-string")
+            with open(out, encoding="ascii") as fp:
+                string = fp.read().strip()
+            data = gramjs.read_string(string)
+            self.assertEqual(data.auth_key, self.KEY)
+            self.assertEqual(data.dc_id, self.DC)
+            # endpoint not representable in the source string; the writer
+            # resolved it from the DC table
+            self.assertEqual(data.server_address, PROD_DC[self.DC])
+
+    def test_telethon_string_to_telethon_session_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.session")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", self._telethon_string(),
+                    "--from-format", "telethon-string",
+                    "--to", out,
+                    "--to-format", "telethon-session",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            self.assertIn("converted", out_txt)  # human mode
+            self.assertIn(f"dc_id: {self.DC}", out_txt)
+            self.assertEqual(telethon.read_sqlite(out).auth_key, self.KEY)
+            # sqlite output is created private, never world-readable
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o600)
+
+    def test_pyrogram_session_sqlite_to_telethon_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.session")
+            pyrogram.write_sqlite(
+                SessionData(
+                    dc_id=self.DC, auth_key=self.KEY,
+                    user_id=self.USER, api_id=self.API,
+                ),
+                src,
+                variant="pyrogram",
+            )
+            out = os.path.join(tmp, "out.telethon.string")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", src,
+                    "--from-format", "pyrogram-session",
+                    "--to", out,
+                    "--to-format", "telethon-string",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            with open(out, encoding="ascii") as fp:
+                string = fp.read().strip()
+            data = telethon.read_string(string)
+            self.assertEqual(data.auth_key, self.KEY)
+            # vanilla pyrogram sqlite stores no endpoint; the telethon
+            # writer filled it from the DC table
+            self.assertEqual(data.server_address, PROD_DC[self.DC])
+            self.assertEqual(data.port, 443)
+
+    @unittest.skipUnless(HAVE_TD, "tgmint.td (tgcrypto) not installed — tdata destination skipped")
+    def test_telethon_string_to_tdata_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", self._telethon_string(),
+                    "--from-format", "telethon-string",
+                    "--to", folder,
+                    "--to-format", "tdata",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            result = json.loads(out_txt)["result"]
+            self.assertEqual(result["output_kind"], "tdata-directory")
+            from tgmint.codec import tdata
+
+            data = tdata.read(folder)
+            self.assertEqual(data.auth_key, self.KEY)
+            self.assertEqual(data.dc_id, self.DC)
+
+    def test_existing_output_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "precious.string")
+            with open(out, "w", encoding="utf-8") as fp:
+                fp.write("keep me")
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", self._telethon_string(),
+                    "--from-format", "telethon-string",
+                    "--to", out,
+                    "--to-format", "pyrogram-string",
+                ]
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("convert failed", err)
+            with open(out, encoding="utf-8") as fp:
+                self.assertEqual(fp.read(), "keep me")
+
+    def test_unknown_format_rejected_by_argparse(self):
+        with self.assertRaises(SystemExit) as ctx:
+            run_cli(
+                [
+                    "convert",
+                    "--from", "x", "--from-format", "telethon-string",
+                    "--to", "y", "--to-format", "hydrogram-string",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
 
     def test_exit_2_when_codec_missing(self):
-        if self._codec_present():
-            self.skipTest("tgmint.codec exists in this build")
-        code, out, err = run_cli(
-            [
-                "convert",
-                "--from", "in.session",
-                "--from-format", "telethon-session",
-                "--to", "out.tdata",
-                "--to-format", "tdata",
-            ]
-        )
+        # a build without the codec must still fail cleanly, never crash:
+        # a None entry in sys.modules makes `import tgmint.codec` raise
+        with mock.patch.dict(sys.modules, {"tgmint.codec": None}):
+            code, out_txt, err = run_cli(
+                [
+                    "convert",
+                    "--from", "in.session",
+                    "--from-format", "telethon-session",
+                    "--to", "out.tdata",
+                    "--to-format", "tdata",
+                ]
+            )
         self.assertEqual(code, 2)
         self.assertIn("codec module not available", err)
+
+    def test_convert_via_python_dash_m(self):
+        # the console path too: `python -m tgmint convert` in a subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.pyrogram.string")
+            env = dict(os.environ, PYTHONPATH=_SRC)
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "tgmint", "convert",
+                    "--from", self._telethon_string(),
+                    "--from-format", "telethon-string",
+                    "--to", out,
+                    "--to-format", "pyrogram-string",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("converted", proc.stdout)
+            with open(out, encoding="ascii") as fp:
+                string = fp.read().strip()
+            self.assertEqual(pyrogram.read_string(string).auth_key, self.KEY)
+
+
+class MacosPresetCliTest(unittest.TestCase):
+    def test_mint_macos_json(self):
+        code, out, err = run_cli(
+            ["mint", "--preset", "macos", "--unique-id", "cli-mac", "--json"]
+        )
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["preset"], "macos")
+        self.assertEqual(data["lang_pack"], "macos")
+        self.assertEqual(data["origin"], "macos")
+        self.assertEqual(data["api_id"], 2834)
+        self.assertTrue(data["device_model"])
+        self.assertTrue(data["system_version"].startswith("macOS"))
+        # default locale=auto mints a coherent triple
+        self.assertIn("tz_zone", data)
+        self.assertIsInstance(data["tz_offset"], int)
+
+    def test_mint_macos_deterministic(self):
+        args = ["mint", "--preset", "macos", "--unique-id", "stable-mac", "--json"]
+        code_a, out_a, _ = run_cli(args)
+        code_b, out_b, _ = run_cli(args)
+        self.assertEqual(code_a, 0)
+        self.assertEqual(code_b, 0)
+        a, b = json.loads(out_a), json.loads(out_b)
+        self.assertEqual(a["device_model"], b["device_model"])
+        self.assertEqual(a["app_version"], b["app_version"])
+
+    def test_mint_macos_layer_refused(self):
+        # no verified macOS layer table exists, so --layer must surface a
+        # clear refusal (exit 2), not a guess and not a crash
+        code, out, err = run_cli(
+            ["mint", "--preset", "macos", "--layer", "200", "--json"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("mint failed", err)
+        self.assertIn("--layer is not supported for the macos preset", err)
 
 
 class DoctorCliTest(unittest.TestCase):

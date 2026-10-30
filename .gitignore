@@ -25,3 +25,4 @@ dist/
 # fork hygiene
 tests/test_profile*/
 .worktrees/
+.pytestbox/

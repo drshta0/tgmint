@@ -33,8 +33,9 @@ What is different so far (details, sources and the audit in [FORK.md](FORK.md)):
   `QDataStream` implementation). PyQt5 is no longer a dependency; it remains
   an optional fallback via `pip install tgmint[qt]`.
 - **Session codec matrix** — Telethon (SQLite + string), Pyrogram-family
-  (kurigram / pyrofork / vanilla) and GramJS session formats convert into
-  each other and into tdata, offline, seeded only by the `auth_key`.
+  (kurigram / pyrofork / vanilla / hydrogram) and GramJS session formats
+  convert into each other and into tdata, offline, seeded only by the
+  `auth_key`.
 - **Pyrogram-family adapter** — a minted fingerprint expands to
   `pyrogram.Client` kwargs; no monkey-patching. TDLib gets a parameter
   bundle; the Bot API has **no fingerprint surface** and we say so instead of
@@ -70,7 +71,7 @@ package cannot quietly rot — is laid out in [PLAN.md](PLAN.md). The rename to
 
 ## Features
 - Convert [Telegram Desktop](https://github.com/telegramdesktop/tdesktop) **tdata** sessions to [telethon](https://github.com/LonamiWebs/Telethon) sessions and vice versa — **Qt-free** (pure-Python tdata codec; PyQt5 optional).
-- Convert **any supported session format** to any other — Telethon, Pyrogram-family (kurigram / pyrofork), GramJS, tdata — offline, from the `auth_key`.
+- Convert **any supported session format** to any other — Telethon, Pyrogram-family (kurigram / pyrofork / hydrogram), GramJS, tdata — offline, from the `auth_key`.
 - Use **telethon** with [official APIs](#authorization): a scoped client override puts the real fingerprint (and `lang_pack`) on the wire — no global monkey-patching.
 - Randomize [device info](./docs/documentation/authorization/api.md) using real, current data recognized by the Telegram server — coherent per platform, deterministic per `unique_id`, and sticky per account via a sidecar file.
 - Mint **layer-coherent** identities: `Generate(layer=N)` claims an app version that actually spoke wire layer N.
@@ -86,7 +87,7 @@ version (details and mechanisms: [docs/frameworks.md](./docs/frameworks.md)).
 | Framework | What you get | Mechanism |
 |---|---|---|
 | [Telethon](https://github.com/LonamiWebs/Telethon) | Full: patched client + conversion + passkeys | `tgmint.tl.TelegramClient` (scoped `initConnection` override, `lang_pack=tdesktop` on the wire) |
-| [Pyrogram](https://github.com/pyrogram/pyrogram) family — [kurigram](https://github.com/KurimuzonAkuma/pyrogram), [pyrofork](https://github.com/Mayuri-Chan/pyrofork) | Fingerprint kwargs adapter + session codec | `Client(**kwargs)` — Pyrogram's own `device_model` / `system_version` / `app_version` / `lang_code` / `lang_pack` parameters; no monkey-patching |
+| [Pyrogram](https://github.com/pyrogram/pyrogram) family — [kurigram](https://github.com/KurimuzonAkuma/pyrogram), [pyrofork](https://github.com/Mayuri-Chan/pyrofork), [hydrogram](https://github.com/hydrogram/hydrogram) | Fingerprint kwargs adapter + session codec | `Client(**kwargs)` — Pyrogram's own `device_model` / `system_version` / `app_version` / `lang_code` / `lang_pack` parameters; no monkey-patching |
 | [TDLib](https://github.com/tdlib/td) (python-tdlib, aiotdlib) | Parameters bundle | `device_model` / `system_version` / `app_version` exported for `setOption` and auth params |
 | Bot API ([python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot), aiogram) | Recipes and docs only | The Bot API has **no fingerprint surface** (HTTPS, no `initConnection`) — documented, not papered over |
 | [GramJS](https://github.com/gram-js/gramjs) (Node), [MadelineProto](https://github.com/danog/MadelineProto) (PHP) | CLI `--json` + session codec | `python -m tgmint mint --json`; string-session conversion |
@@ -179,7 +180,7 @@ Use tgmint only on accounts you own or are entitled to hold a session for: it ke
 ## Roadmap
 - [x] Writing data to tdata for converting telethon sessions to tdesktop.
 - [x] Random device information for [initConnection](https://core.telegram.org/method/initConnection) with coherent, cited data.
-- [x] Support for the [pyrogram](https://github.com/pyrogram/pyrogram) family (kurigram / pyrofork) via the kwargs adapter — see [Frameworks](#frameworks).
+- [x] Support for the [pyrogram](https://github.com/pyrogram/pyrogram) family (kurigram / pyrofork / hydrogram) via the kwargs adapter — see [Frameworks](#frameworks).
 - [ ] A tgmint TUI using [textual](https://github.com/Textualize/textual) for non-experienced users.
 
 ## Examples

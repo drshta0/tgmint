@@ -11,7 +11,7 @@ framework is listed as "supported" without saying what that means.
 | Framework | Level of support | Mechanism |
 |---|---|---|
 | **Telethon** | **Full** — patched client + conversion + passkeys | `tgmint.tl.TelegramClient` |
-| **Pyrogram family** (kurigram, pyrofork, vanilla pyrogram) | **Fingerprint kwargs + session codec** | `Client(**client_kwargs(fingerprint))` — from `tgmint.adapters.pyrogram` |
+| **Pyrogram family** (kurigram, pyrofork, vanilla pyrogram, hydrogram) | **Fingerprint kwargs + session codec** | `Client(**client_kwargs(fingerprint))` — from `tgmint.adapters.pyrogram` |
 | **TDLib** wrappers (python-tdlib, aiotdlib) | **Parameters bundle** | exported device/app strings for `setOption` / auth params |
 | **Bot API** (python-telegram-bot, aiogram) | **Docs & recipes only** — no fingerprint surface exists | n/a (HTTPS API) |
 | **GramJS** (Node) | **CLI `--json` + session codec** | `python -m tgmint mint --json`; string sessions |
@@ -39,7 +39,9 @@ share the `pyrogram` import name, and their `Client` constructor already
 accepts `device_model`, `system_version`, `app_version`, `lang_code` and
 `lang_pack` as plain keyword arguments
 ([docs](https://docs.pyrogram.org/api/client)). So the adapter is exactly one
-step: a `Fingerprint` expands to those kwargs.
+step: a `Fingerprint` expands to those kwargs. hydrogram imports as
+`hydrogram` rather than `pyrogram`, but its `Client` mirrors the same
+constructor, so the same kwargs apply.
 
 ```python
 from tgmint.adapters.pyrogram import client_kwargs

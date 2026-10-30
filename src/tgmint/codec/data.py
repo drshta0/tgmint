@@ -40,7 +40,15 @@ import typing
 from contextlib import closing
 from pathlib import Path
 
-__all__ = ["SessionData", "CodecError", "validate", "decode_b64", "read_sqlite_row", "write_sqlite_file"]
+__all__ = [
+    "SessionData",
+    "CodecError",
+    "validate",
+    "decode_b64",
+    "read_sqlite_row",
+    "write_sqlite_file",
+    "write_text_file",
+]
 
 
 class CodecError(ValueError):
@@ -144,6 +152,35 @@ def read_sqlite_row(path: typing.Union[str, Path], required: typing.Set[str]) ->
         raise CodecError(
             "Cannot read session database; close its client and check the format"
         ) from None
+
+
+def write_text_file(
+    path: typing.Union[str, Path],
+    text: str,
+) -> None:
+    """Publish a session-string file privately.
+
+    Same discipline as :func:`write_sqlite_file` (its hard-link publish is
+    copied verbatim): the text is written to a temporary file next to the
+    destination and hard-linked into place, so an existing file is never
+    replaced and a failed write leaves no partial output.  Output is chmod
+    0600 — a session string is a credential.
+    """
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"Output already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".tgmint-codec-", suffix=".string", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as fp:
+            fp.write(text)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.chmod(temporary, 0o600)
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_sqlite_file(

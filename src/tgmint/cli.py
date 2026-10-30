@@ -14,8 +14,8 @@ Exit codes (also shown in ``--help``)::
 
 Optional modules are imported lazily and probed defensively:
 ``tgmint.parity.describe_envelope`` (envelope builder, parallel work)
-and ``tgmint.codec`` (session converter, parallel work) — the CLI must
-not crash when either is absent.
+and ``tgmint.codec`` (session converter — ``convert_session``) — the
+CLI must not crash when either is absent.
 """
 
 from __future__ import annotations
@@ -41,16 +41,18 @@ _PRESETS: Dict[str, str] = {
     "android": "TelegramAndroid",
     "android-x": "TelegramAndroidX",
     "ios": "TelegramIOS",
+    "macos": "TelegramMacOS",
 }
 
 # ordered for --help; validated by argparse choices
-_PRESET_ORDER = ["desktop", "android", "android-x", "ios"]
+_PRESET_ORDER = ["desktop", "android", "android-x", "ios", "macos"]
 
 _CONVERT_FORMATS = [
     "telethon-session",
     "telethon-string",
     "pyrogram-session",
     "pyrogram-string",
+    "gramjs-string",
     "tdata",
 ]
 
@@ -154,6 +156,19 @@ def _mint_api(
         return cls.Generate(
             system=system, unique_id=unique_id, layer=layer, locale=locale_arg
         )
+
+    if preset == "macos":
+        # macOS stays pin-only (tgmint.layers has no verified macOS
+        # table — the TelegramSwift source URL 404s, see layers.py), so
+        # --layer is refused loudly instead of ignored or guessed from
+        # invented data
+        if layer is not None:
+            raise ValueError(
+                "--layer is not supported for the macos preset: no "
+                "verified macOS layer table exists, so Generate stays "
+                "pin-only (refusing beats inventing one)"
+            )
+        return cls.Generate(unique_id=unique_id, locale=locale_arg)
 
     # mobile presets have their own first-hand-verified layer tables; a
     # layer below the verified floor raises ValueError (refusing to mint
@@ -433,19 +448,14 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         result = convert(
             args.from_path, args.from_format, args.to_path, args.to_format
         )
-    except TypeError:
-        # keyword-spelled variant, in case the codec lands with that shape
-        try:
-            result = convert(
-                src=args.from_path,
-                src_format=args.from_format,
-                dst=args.to_path,
-                dst_format=args.to_format,
-            )
-        except Exception as exc:
-            return _fail(f"convert failed: {exc}")
     except Exception as exc:
         return _fail(f"convert failed: {exc}")
+
+    if not isinstance(result, dict):
+        return _fail(
+            f"convert failed: codec returned {type(result).__name__}, "
+            "expected a result dict"
+        )
 
     payload = {
         "from": args.from_path,
@@ -461,7 +471,10 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             f"converted {args.from_path} ({args.from_format}) -> "
             f"{args.to_path} ({args.to_format})"
         )
-        print(f"  result: {result}")
+        print(f"  dc_id: {result.get('dc_id')}")
+        print(f"  output: {result.get('output')} ({result.get('output_kind')})")
+        for note in result.get("notes", ()):
+            print(f"  note: {note}")
     return EXIT_OK
 
 
@@ -681,9 +694,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "convert",
         help="convert sessions between formats (needs the codec module)",
         description=(
-            "Convert a session file/string between telethon, pyrogram "
-            "and tdata formats. Requires the optional codec module; "
-            "when it is absent this command exits 2."
+            "Convert a session file/string you own between telethon, "
+            "pyrogram, gramjs and tdata formats — offline, no login, no "
+            "network; the auth_key is the only secret moved. Requires the "
+            "optional codec module; when it is absent this command exits 2."
         ),
         epilog=_EXIT_EPILOG,
     )
