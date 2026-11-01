@@ -74,6 +74,9 @@ nav:
 - Bot API recipes: bot-api.md
 - Migration from opentele: migration-from-opentele.md
 - Passkeys: passkeys.md
+- Android import: android-acquisition.md
+- Post-auth bootstrap: bootstrap.md
+- Keepalive cadence: cadence.md
 - Examples:
   - Home: examples/README.md
   - Convert tdata to Telethon: examples/convert-tdata-to-telethon.md

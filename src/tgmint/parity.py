@@ -10,13 +10,13 @@ suggest".
 Two exports:
 
 - ``PING_PRESETS`` — pure DATA. Per-preset suggested keepalive kwargs
-  for ``TelegramClient``. Telethon's own defaults are untouched and
-  remain what any tgmint client actually uses until the caller passes
-  these explicitly. The per-official-client cadences have NOT yet been
-  verified from first-party source; every value below is
-  the Telethon baseline (``ping_interval`` default 60.0 s), exposed so
-  the audit can diff a session against it and so F6 verification has a
-  landing spot. Do not treat these as measured official numbers.
+  for ``TelegramClient``, still the Telethon baseline (``ping_interval``
+  default 60.0 s) rather than measured official numbers. The official
+  cadences *have* since been read out of first-party source:
+  they live in :mod:`tgmint.cadence` with a ``file:line`` per number and
+  an opt-in ``apply()`` that sets what a framework allows. This table is
+  kept as inert reference data for the audit only; use
+  :func:`tgmint.cadence.describe` for the verified schedule.
 
 - ``describe_envelope(target, layer=None)`` — the exact initConnection
   field dict a preset (or a minted ``APIData``) would send: the 8
@@ -32,10 +32,16 @@ Two exports:
   the table's commit-verified string).
 
 Bootstrap-sequence parity (which requests fire right
-after auth, in what order) is deliberately NOT included here: there is
-no live oracle to verify such a sequence against offline, and shipping
-an unverified sequence would be exactly the kind of confidently-wrong
-data this fork exists to eliminate. It stays opt-in future work.
+after auth, in what order) used to be absent here on purpose, because
+there was no source-verified sequence to point at. That is no longer
+true: the sequence is now read out of the
+official Android 12.10.6 and Desktop 7.3.3 trees with a file:line per
+row, and :mod:`tgmint.bootstrap` ships it as an **opt-in replay** with a
+read-only allowlist. ``describe_envelope`` therefore also reports a
+``bootstrap`` summary (platform, step count, cosmetic step count) so
+``tgmint parity`` shows what a given identity would replay. Nothing in
+this module sends anything; only :func:`tgmint.bootstrap.replay_startup`
+does, and only when the caller asks for it.
 """
 from __future__ import annotations
 
@@ -48,7 +54,7 @@ __all__ = ["PING_PRESETS", "describe_envelope"]
 
 # Keys map to presets; values are SUGGESTED TelegramClient kwargs.
 # Inert data — see module docstring. Values are Telethon's baseline,
-# not measured official cadences (verification pending).
+# not measured official cadences: the verified ones are tgmint.cadence.
 PING_PRESETS: Dict[str, Dict[str, float]] = {
     "tdesktop": {"ping_interval": 60.0},
     "android": {"ping_interval": 60.0},
@@ -81,6 +87,34 @@ def _tz_offset_seconds(zone: str) -> int:
     return int(datetime.now(ZoneInfo(zone)).utcoffset().total_seconds())
 
 
+def _bootstrap_summary(target: Any) -> Dict[str, Any]:
+    """The ``bootstrap`` block of the envelope: platform + step counts.
+
+    Pure and defensive: importing :mod:`tgmint.bootstrap` or deriving the
+    platform from the identity never touches the network or Telethon, and
+    any failure degrades to ``{"platform": None, "steps": 0,
+    "cosmetic_steps": 0}`` (an identity whose family has no verified
+    sequence, e.g. iOS, reports zero steps rather than guessing).
+    """
+    empty: Dict[str, Any] = {"platform": None, "steps": 0, "cosmetic_steps": 0}
+    try:
+        from .bootstrap import BootstrapError, describe, platform_for
+    except Exception:  # pragma: no cover - defensive, bootstrap is stdlib-only
+        return empty
+    try:
+        platform = platform_for(target)
+    except BootstrapError:
+        return empty
+    except Exception:  # pragma: no cover - defensive
+        return empty
+    info = describe(platform)
+    return {
+        "platform": platform,
+        "steps": info["count"],
+        "cosmetic_steps": info["cosmetic_steps"],
+    }
+
+
 def describe_envelope(
     target: Union[str, Type[APIData], APIData], layer: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -105,8 +139,12 @@ def describe_envelope(
     minted ``app_version`` genuinely speaks, reverse-looked-up from
     ``tgmint.layers`` (``None`` when the version is not in a table —
     e.g. a pinned-current string whose build code differs from the
-    commit-verified table row). See the module docstring for why
-    bootstrap-sequence parity is deliberately absent.
+    commit-verified table row).
+
+    ``bootstrap``: ``{"platform": ..., "steps": n, "cosmetic_steps": n}``
+    — what :func:`tgmint.bootstrap.replay_startup` would replay for this
+    identity (``None`` / ``0`` for a family with no verified sequence,
+    i.e. iOS and macOS). It is a summary only: nothing is sent here.
     """
     if isinstance(target, str):
         try:
@@ -142,4 +180,5 @@ def describe_envelope(
         "lang_code": target.lang_code,
         "params": params,
         "layer": resolved_layer,
+        "bootstrap": _bootstrap_summary(target),
     }

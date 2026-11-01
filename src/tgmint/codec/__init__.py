@@ -12,6 +12,7 @@ kurigram SQLite (v7 schema)   :func:`tgmint.codec.pyrogram.read_sqlite`
 Pyrogram-family string        :func:`tgmint.codec.pyrogram.read_string`
 GramJS StringSession          :func:`tgmint.codec.gramjs.read_string`
 tdata folder                  :func:`tgmint.codec.tdata.read`
+``.tgmint`` profile envelope  :func:`tgmint.profile.open_profile`
 ============================  ==============================================
 
 Writers (← :class:`SessionData`): Telethon SQLite + string, Pyrogram
@@ -22,6 +23,13 @@ tdata *writing* stays with :mod:`tgmint.td` (``SaveTData``).
 call covers every documented from→to cell (it is what the
 ``tgmint convert`` CLI drives; string destinations are written to the
 output path as mode-0600 files, never echoed).
+
+The ``.tgmint`` envelope (:mod:`tgmint.profile`, ``"profile"``) is a
+**source** format only: it is read here, never written — converting the
+other way (session → envelope) is ``tgmint profile seal``, which also
+carries the fingerprint and the passkey. The reader is imported lazily so
+``tgmint.codec`` stays importable without touching the envelope module's
+crypto path (an unsealed profile needs none).
 
 Honest verification status (details in each module docstring, pinned by
 ``tests/test_codec_matrix.py``):
@@ -64,6 +72,11 @@ __all__ = [
     "SessionData",
     "CodecError",
     "convert_session",
+    "read_session",
+    "write_session",
+    "infer_source_format",
+    "PROFILE_FORMATS",
+    "SOURCE_FORMATS",
     "data",
     "dcs",
     "telethon",
@@ -88,6 +101,15 @@ _READERS = {
     "gramjs-string": gramjs.read_string,
 }
 
+#: names that mean "a .tgmint envelope" (see tgmint.profile).  It is a
+#: source-only format; the alias set exists so callers can say the obvious
+#: thing (`profile`, `tgmint`, or the format id itself).
+PROFILE_FORMATS = frozenset({"profile", "tgmint", "tgmint-profile", "tgmint-profile/1"})
+
+#: formats `convert_session` accepts as a `source_format`
+SOURCE_FORMATS = tuple(sorted(_READERS)) + ("tdata", "profile")
+
+
 #: destination formats that store a user_id / api_id and therefore need one
 #: supplied (see `_PLACEHOLDER_*` below for what happens when the source
 #: format cannot carry the field)
@@ -105,10 +127,70 @@ _PLACEHOLDER_USER_ID = 777000
 _PLACEHOLDER_API_ID = 2040
 
 
+def _read_profile_source(source: str, passphrase: str) -> SessionData:
+    """Read one ``.tgmint`` envelope as a source authorization.
+
+    Delegates to :func:`tgmint.profile.open_profile` (imported lazily: the
+    envelope module is not needed by the rest of the matrix, and its
+    sealed path is the only one that wants ``cryptography``).  A
+    :class:`tgmint.profile.ProfileError` is a
+    :class:`~tgmint.codec.data.CodecError` already, so callers that catch
+    the codec error keep working; the cross-validation messages
+    (session vs fingerprint vs passkey) come through verbatim.
+    """
+    from ..profile import open_profile
+
+    opened = open_profile(source, passphrase=passphrase or None)
+    return opened.session
+
+
+def infer_source_format(source: str) -> str:
+    """Infer a source format from the path: ``.tgmint`` -> ``profile``.
+
+    The fallback is ``telethon-session`` (the format this repository is
+    centred on).  Both :func:`read_session` and :func:`convert_session`
+    use it when the caller passes no format at all; an explicit format is
+    never second-guessed.
+    """
+    return "profile" if str(source).endswith(".tgmint") else "telethon-session"
+
+
+def read_session(
+    source: str,
+    source_format: Optional[str] = None,
+    *,
+    passcode: str = "",
+    passphrase: str = "",
+) -> SessionData:
+    """Read one authorization from any source format (public entrypoint).
+
+    The thin public wrapper around the reader dispatch that
+    :func:`convert_session` uses — ``tgmint profile seal`` and
+    ``tgmint heal`` both need exactly this and nothing more.
+
+    Args:
+        source: the session string (``*-string`` formats), a SQLite file
+            path, a ``tdata`` folder, or a ``.tgmint`` envelope file.
+        source_format: one of the names in :data:`SOURCE_FORMATS`, or
+            ``None`` to infer it (``.tgmint`` -> ``profile``, otherwise
+            ``telethon-session``).
+        passcode: the local passcode of a ``tdata`` folder.
+        passphrase: the passphrase of a sealed ``.tgmint`` envelope
+            (ignored by every other format).
+    """
+    if source_format in (None, "", "auto"):
+        source_format = infer_source_format(source)
+    if source_format in PROFILE_FORMATS:
+        return _read_profile_source(source, passphrase)
+    return _read_source(source, source_format, passcode)
+
+
 def _read_source(
-    source: str, source_format: str, passcode: str
+    source: str, source_format: str, passcode: str, passphrase: str = ""
 ) -> SessionData:
     """Dispatch on `source_format` and read one authorization."""
+    if source_format in PROFILE_FORMATS:
+        return _read_profile_source(source, passphrase)
     if source_format == "tdata":
         if tdata is None:  # pragma: no cover - defensive import guard
             raise CodecError("tdata reader unavailable in this build")
@@ -117,7 +199,7 @@ def _read_source(
     if reader is None:
         raise CodecError(
             f"unknown source format {source_format!r}; expected one of "
-            f"{sorted(_READERS) + ['tdata']}"
+            f"{sorted(_READERS) + ['tdata', 'profile']}"
         )
     if source_format.endswith("-string") and os.path.isfile(source):
         # convenience: `--from` may name a file holding the session
@@ -219,15 +301,88 @@ def _fill_note(field: str, source_format: str, value: int) -> str:
     )
 
 
-def convert_session(
-    source: str,
-    source_format: str,
+def _fill_for_destination(
+    data: SessionData,
+    destination_format: str,
+    user_id: Optional[int],
+    api_id: Optional[int],
+) -> "tuple":
+    """Fill the fields a destination requires but the source cannot hold."""
+    filled = []
+    if destination_format in _NEEDS_USER_ID and data.user_id is None:
+        value = _PLACEHOLDER_USER_ID if user_id is None else user_id
+        data = data._replace(user_id=value)
+        filled.append(("user_id", value))
+    if destination_format in _NEEDS_API_ID and data.api_id is None:
+        value = _PLACEHOLDER_API_ID if api_id is None else api_id
+        data = data._replace(api_id=value)
+        filled.append(("api_id", value))
+    return data, filled
+
+
+def write_session(
+    data: SessionData,
     destination: str,
     destination_format: str,
     *,
     user_id: Optional[int] = None,
     api_id: Optional[int] = None,
     passcode: str = "",
+    variant: str = "pyrogram",
+    source_label: str = "an in-memory session",
+) -> Dict[str, Any]:
+    """Write one in-memory :class:`SessionData` in a destination format.
+
+    The writer half of :func:`convert_session`, public because callers
+    that mint a session themselves (``tgmint heal`` after a passkey login)
+    need exactly this: a format writer plus the documented placeholder
+    policy, without a source format in the way.
+
+    Existing outputs are refused (:class:`FileExistsError`) and every
+    file is published with mode 0600, like the rest of the matrix.
+
+    Returns:
+        ``{"output", "output_kind", "dc_id", "user_id", "filled",
+        "notes", "preserved", "dropped"}``.
+    """
+    data, filled = _fill_for_destination(data, destination_format, user_id, api_id)
+    output_kind = _write_destination(
+        data, destination, destination_format, passcode, variant
+    )
+    keeps = _preserves(destination_format)
+    result: Dict[str, Any] = {
+        "destination_format": destination_format,
+        "dc_id": data.dc_id,
+        "user_id": data.user_id if "user_id" in keeps else None,
+        "output": str(destination),
+        "output_kind": output_kind,
+        "preserved": sorted(keeps),
+        "dropped": sorted(
+            field
+            for field in SessionData._fields
+            if field not in keeps
+            and field not in ("dc_id", "auth_key")
+            and getattr(data, field) is not None
+        ),
+    }
+    if filled:
+        result["filled"] = [field for field, _ in filled]
+        result["notes"] = [
+            _fill_note(field, source_label, value) for field, value in filled
+        ]
+    return result
+
+
+def convert_session(
+    source: str,
+    source_format: Optional[str],
+    destination: str,
+    destination_format: str,
+    *,
+    user_id: Optional[int] = None,
+    api_id: Optional[int] = None,
+    passcode: str = "",
+    passphrase: str = "",
     variant: str = "pyrogram",
 ) -> Dict[str, Any]:
     """Convert one session between any two formats of the matrix above.
@@ -240,9 +395,14 @@ def convert_session(
     Args:
         source: the session string itself for ``*-string`` formats, the
             SQLite file path for ``*-session``, the folder for ``tdata``.
-        source_format / destination_format: one of ``telethon-session``,
-            ``telethon-string``, ``pyrogram-session``, ``pyrogram-string``,
-            ``gramjs-string``, ``tdata``.
+        source_format / destination_format: the sources are
+            ``telethon-session``, ``telethon-string``, ``pyrogram-session``,
+            ``pyrogram-string``, ``gramjs-string``, ``tdata`` and
+            ``profile`` (a ``.tgmint`` envelope); the destinations are the
+            same set minus ``profile`` (write that one with
+            ``tgmint profile seal``).  ``source_format=None`` infers it from
+            the path: ``.tgmint`` -> ``profile``, anything else
+            ``telethon-session``.
         destination: output path — a file for every format except
             ``tdata`` (a folder).  Existing outputs are never overwritten
             (:class:`FileExistsError`); string outputs are files written
@@ -255,6 +415,8 @@ def convert_session(
             refreshes ``user_id`` from the server on first connect.
         passcode: the local passcode of a source ``tdata`` folder (also
             used when writing one).
+        passphrase: the passphrase of a sealed ``profile`` source; every
+            other source format ignores it.
         variant: pyrogram SQLite variant for ``pyrogram-session``
             destinations (``"pyrogram"`` or ``"kurigram"``).
 
@@ -270,44 +432,27 @@ def convert_session(
     It performs no login and touches no network; the auth_key is the
     only secret moved.
     """
-    data = _read_source(source, source_format, passcode)
+    if source_format in (None, "", "auto"):
+        source_format = infer_source_format(source)
+    if source_format in PROFILE_FORMATS:
+        data = _read_profile_source(source, passphrase)
+        source_format = "profile"
+    else:
+        data = _read_source(source, source_format, passcode)
 
-    filled: list = []
-    if destination_format in _NEEDS_USER_ID and data.user_id is None:
-        value = _PLACEHOLDER_USER_ID if user_id is None else user_id
-        data = data._replace(user_id=value)
-        filled.append(("user_id", value))
-    if destination_format in _NEEDS_API_ID and data.api_id is None:
-        value = _PLACEHOLDER_API_ID if api_id is None else api_id
-        data = data._replace(api_id=value)
-        filled.append(("api_id", value))
-
-    output_kind = _write_destination(
-        data, destination, destination_format, passcode, variant
-    )
-
-    keeps = _preserves(destination_format)
-    dropped = sorted(
-        field
-        for field in SessionData._fields
-        if field not in keeps
-        and field not in ("dc_id", "auth_key")
-        and getattr(data, field) is not None
+    written = write_session(
+        data,
+        destination,
+        destination_format,
+        user_id=user_id,
+        api_id=api_id,
+        passcode=passcode,
+        variant=variant,
+        source_label=source_format,
     )
     result: Dict[str, Any] = {
         "source_format": source_format,
-        "destination_format": destination_format,
-        "dc_id": data.dc_id,
-        "user_id": data.user_id if "user_id" in keeps else None,
         "test_mode": bool(data.test_mode),
-        "output": str(destination),
-        "output_kind": output_kind,
-        "preserved": sorted(keeps),
-        "dropped": dropped,
     }
-    if filled:
-        result["filled"] = [field for field, _ in filled]
-        result["notes"] = [
-            _fill_note(field, source_format, value) for field, value in filled
-        ]
+    result.update(written)
     return result

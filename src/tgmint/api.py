@@ -142,6 +142,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         lang_code: str = None,
         system_lang_code: str = None,
         lang_pack: str = None,
+        tz_zone: str = None,
     ) -> None:
         """
         Create your own customized API
@@ -171,6 +172,11 @@ class APIData(object, metaclass=BaseAPIMetaClass):
             lang_pack (`str`, default=`""`):
                 `[Language pack](API.lang_pack)`
 
+            tz_zone (`str`, default=`None`):
+                IANA zone name for `initConnection`'s `params.tz_offset`
+                (`None` = send no timezone params). Part of the identity, so
+                it survives `copy()` and participates in `==`/`hash()`.
+
         ### Warning:
             Use at your own risk!:
                 Using the wrong API can lead to your account banned.
@@ -188,6 +194,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         lang_code: str = None,
         system_lang_code: str = None,
         lang_pack: str = None,
+        tz_zone: str = None,
     ) -> None:
 
         Expects(
@@ -207,6 +214,11 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         )
         self.lang_pack = lang_pack if lang_pack else cls.lang_pack
         self.lang_code = lang_code if lang_code else cls.lang_code
+        # fork note: tz_zone is part of the identity (it is sent as
+        # params.tz_offset), so it must be constructor-visible like every
+        # other field — otherwise copy() silently demoted a minted identity
+        # back to "sends no timezone".
+        self.tz_zone = tz_zone if tz_zone else cls.tz_zone
 
         if self.device_model == None:
             system = platform.uname()
@@ -234,6 +246,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
             glob.lang_code,  # type: ignore
             glob.system_lang_code,  # type: ignore
             glob.lang_pack,  # type: ignore
+            glob.tz_zone,  # type: ignore
         )  # type: ignore
 
     @sharemethod
@@ -269,6 +282,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
             self.lang_code,
             self.system_lang_code,
             self.lang_pack,
+            self.tz_zone,
         ) == (
             __o.api_id,
             __o.api_hash,
@@ -278,10 +292,13 @@ class APIData(object, metaclass=BaseAPIMetaClass):
             __o.lang_code,
             __o.system_lang_code,
             __o.lang_pack,
+            __o.tz_zone,
         )
 
     def __hash__(self) -> int:
-        # fork note: defining __eq__ without __hash__ made instances unhashable
+        # fork note: defining __eq__ without __hash__ made instances unhashable;
+        # tz_zone is part of the identity, so it is hashed too (== and hash
+        # must agree or dict/set lookups silently mix two identities)
         return hash(
             (
                 self.api_id,
@@ -292,6 +309,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
                 self.lang_code,
                 self.system_lang_code,
                 self.lang_pack,
+                self.tz_zone,
             )
         )
 
@@ -501,7 +519,7 @@ class API(BaseObject):
         ### Attributes:
             api_id (`int`)           : `2040`
             api_hash (`str`)         : `"b18441a1ff607e10a989891a5462e627"`
-            device_model (`str`)     : `"Desktop"`
+            device_model (`str`)     : `"HP Pavilion 15"`
             system_version (`str`)   : `"Windows 11 x64"`
             app_version (`str`)      : `"7.3.3"`
             lang_code (`str`)        : `"en"`
@@ -520,7 +538,7 @@ class API(BaseObject):
 
         api_id = 2040
         api_hash = "b18441a1ff607e10a989891a5462e627"
-        device_model = "Desktop"
+        device_model = "HP Pavilion 15"
         system_version = "Windows 11 x64"
         app_version = "7.3.3"  # refreshed 2026-10-24: live GitHub releases (via tgmint.versions fetchers)
         lang_code = "en"
@@ -544,6 +562,8 @@ class API(BaseObject):
                     (case-insensitive).\\
                     The default is `None`, which picks one deterministically from
                     `unique_id` (and randomly when `unique_id` is also `None`).\\
+                    `"random"` is the explicit spelling of that same pick — it is
+                    deterministic per `unique_id`, not a per-call coin flip.\\
                     Any other value raises `ValueError` — nothing is silently
                     substituted.
             
@@ -633,9 +653,13 @@ class API(BaseObject):
             # the caller never asked for.
             system = system.lower().strip() if isinstance(system, str) else system
 
-            if system == None:
-                # no preference: deterministic pick derived from unique_id
-                # (itself randomized when unique_id is None)
+            if system == None or system == "random":
+                # no preference — or the explicitly advertised "random"
+                # wildcard, which used to raise ValueError even though the
+                # overloads above document it. Same deterministic pick from
+                # unique_id (random only when unique_id is None too), so
+                # "random" stays reproducible per identity like the rest of
+                # Generate().
                 system = SystemInfo._hashtovalue(
                     SystemInfo._strtohashid(unique_id), validList
                 )
@@ -683,27 +707,57 @@ class API(BaseObject):
             )
             return _applyLocale(result, locale, unique_id)
 
+    class TelegramDesktopFlatpak(TelegramDesktop):
+        """
+        Official Telegram for Desktop as shipped by the Flathub build
+        (a distinct api_id Telegram grants the Linux flatpak distribution;
+        the binary's own "official api_id" whitelist is {2040, 611335,
+        17349-test}).
+
+        Verified 2026-11-01 against the installed flathub build (stable
+        `7444df4f`, tdesktop commit `668a91bd`): the values are injected at
+        build time via `-DTDESKTOP_API_ID` / `-DTDESKTOP_API_HASH` and are
+        recorded in the app's embedded build manifest
+        (`files/manifest.json`); in the stripped binary the hash sits
+        plaintext at `.rodata` 0x76a1cb8 with the `0x95407` (611335)
+        immediate at every use site.
+
+        Everything else inherits from `TelegramDesktop` — same device
+        pools, same `Generate()`.
+
+        ### Attributes:
+            api_id (`int`)           : `611335`
+            api_hash (`str`)         : `"d524b414d21f4d37f08684c1df41ac9c"`
+        """
+
+        api_id = 611335
+        api_hash = "d524b414d21f4d37f08684c1df41ac9c"
+
     class TelegramAndroid(APIData):
         """
         Official Telegram for Android
         [View on GitHub](https://github.com/DrKLO/Telegram)
 
         ### Attributes:
-            api_id (`int`)           : `6`
-            api_hash (`str`)         : `"eb06d4abfb49dc3eeb1aeb98ae0f581e"`
+            api_id (`int`)           : `4`
+            api_hash (`str`)         : `"014b35b6184100b085b0d0572f9b5103"`
             device_model (`str`)     : `"Samsung SM-S928B"`
             system_version (`str`)   : `"SDK 35"`
-            app_version (`str`)      : `"13.1.0 (72291)"`
+            app_version (`str`)      : `"13.1.0 (7229)"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
             lang_pack (`str`)        : `"android"`
         """
 
-        api_id = 6
-        api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+        api_id = 4
+        api_hash = "014b35b6184100b085b0d0572f9b5103"
+        # refreshed 2026-11-01 from the shipped official APK (13.1.1,
+        # telegram.org/dl/android/apk): BuildVars disassembled from
+        # classes.dex. The 2022 pair 6/"eb06d4ab..." appears nowhere in
+        # the current APK (rotated).
         device_model = "Samsung SM-S928B"
         system_version = "SDK 35"
-        app_version = "13.1.0 (72291)"
+        app_version = "13.1.0 (7229)"  # DrKLO wire string; "72291" is the split versionCode, not the printed build
         lang_code = "en"
         system_lang_code = "en-US"
         lang_pack = "android"
@@ -754,7 +808,7 @@ class API(BaseObject):
         ### Attributes:
             api_id (`int`)           : `21724`
             api_hash (`str`)         : `"3e0cb5efcd52300aec5994fdfc5bdc16"`
-            device_model (`str`)     : `"Samsung SM-G998B"`
+            device_model (`str`)     : `"Google Pixel 9"`
             system_version (`str`)   : `"SDK 35"`
             app_version (`str`)      : `"0.29.1 (1817)"`
             lang_code (`str`)        : `"en"`
@@ -764,7 +818,7 @@ class API(BaseObject):
 
         api_id = 21724
         api_hash = "3e0cb5efcd52300aec5994fdfc5bdc16"
-        device_model = "Samsung SM-G998B"
+        device_model = "Google Pixel 9"
         system_version = "SDK 35"
         app_version = "0.29.1 (1817)"
         lang_code = "en"
@@ -798,7 +852,7 @@ class API(BaseObject):
             api_id (`int`)           : `10840`
             api_hash (`str`)         : `"33c45224029d59cb3ad0c16134215aeb"`
             device_model (`str`)     : `"iPhone 16 Pro Max"`
-            system_version (`str`)   : `"18.5"`
+            system_version (`str`)   : `"26.1"`
             app_version (`str`)      : `"13.1.1"`
             lang_code (`str`)        : `"en"`
             system_lang_code (`str`) : `"en-US"`
@@ -810,7 +864,7 @@ class API(BaseObject):
         api_id = 10840
         api_hash = "33c45224029d59cb3ad0c16134215aeb"
         device_model = "iPhone 16 Pro Max"
-        system_version = "18.5"
+        system_version = "26.1"
         app_version = "13.1.1"
         lang_code = "en"
         system_lang_code = "en-US"

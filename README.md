@@ -41,15 +41,17 @@ What is different so far (details, sources and the audit in [FORK.md](FORK.md)):
   bundle; the Bot API has **no fingerprint surface** and we say so instead of
   papering over it (see [Frameworks](#frameworks)).
 - **CLI** — `python -m tgmint mint | inspect | audit | freshness | parity |
-  convert | login-passkey | doctor`, every command `--json`-able for
-  non-Python callers.
+  convert | login-passkey | profile | heal | bootstrap | cadence | doctor`,
+  every command `--json`-able for non-Python callers.
 - **Layer coherence** — `Generate(layer=N)` picks an app version that
   genuinely spoke wire layer N (old version + old layer = plausible; new
   version + old layer = impossible — that mismatch is the tell it fixes).
   The unverifiable web presets (`TelegramWeb_Z`, `TelegramWeb_K`,
   `Webogram`) were removed rather than shipped stale.
-- **Ping-cadence presets** — shipped as inert reference data (numbers from
-  official-client source), with no behavioral claim attached.
+- **Ping-cadence reference data** — `parity.PING_PRESETS` stays the inert
+  Telethon baseline it always was; the verified official schedule (with the
+  `file:line` behind every number) and the `apply()` that sets what each
+  framework allows live in [docs/cadence.md](./docs/cadence.md).
 - **Four audited bug fixes** — `OpenTeleException` was a `BaseException`;
   `APIData.__eq__` was always False and instances were unhashable; PyQt5 was
   imported even for Telethon-only use; the global `InitConnectionRequest`
@@ -59,6 +61,13 @@ What is different so far (details, sources and the audit in [FORK.md](FORK.md)):
   [log back in with just the passkey file](PASSKEYS.md):
   no phone number, no OTP. Wire format reverse-engineered from the official
   Android client (TL layer 230).
+- **Portable identity envelope** (`.tgmint`, `tgmint.profile`) — bundle the
+  session, the fingerprint it was born with and the passkey that recovers it
+  into one file, optionally sealed with a passphrase (AES-256-GCM under a
+  PBKDF2-SHA256 key; `pip install tgmint[passkeys]` is needed only to
+  *seal*, never to read an unsealed profile). The envelope is a codec
+  **source**, so `convert` reads it, and `python -m tgmint heal` uses the
+  bundled passkey to sign a dead session back in and rewrite it in place.
 
 Sibling forks you may prefer today: [opentele2](https://github.com/DedInc/opentele2)
 and [opentele-ng](https://github.com/stufently/opentele) both removed Qt early
@@ -77,8 +86,22 @@ package cannot quietly rot — is laid out in [PLAN.md](PLAN.md). The rename to
 - Randomize [device info](./docs/documentation/authorization/api.md) using real, current data recognized by the Telegram server — coherent per platform, deterministic per `unique_id`, and sticky per account via a sidecar file.
 - Mint **layer-coherent** identities: `Generate(layer=N)` claims an app version that actually spoke wire layer N.
 - Use the **Pyrogram family** with the same fingerprints — `Client` kwargs adapter, no monkey-patching — and export **TDLib** parameters.
-- Drive everything from the **CLI**: `python -m tgmint mint | inspect | audit | freshness | parity | convert | login-passkey | doctor`, all `--json`-able.
+- Drive everything from the **CLI**: `python -m tgmint mint | inspect | audit | freshness | parity | convert | login-passkey | profile | heal | bootstrap | cadence | doctor`, all `--json`-able.
 - **Software passkeys** ([PASSKEYS.md](PASSKEYS.md)) — register once, then log in with just the passkey file: native in Telethon and in the Pyrogram family (full on kurigram, partial on pyrofork), and bridged to **any** session format through `python -m tgmint login-passkey`. The Bot API cannot use them and the docs say so.
+- **Portable identity envelope** (`.tgmint`) — one file holding a session, its fingerprint and its passkey, optionally sealed with a passphrase; readable by `convert` and repaired by `heal`.
+- **Official keepalive cadence** ([docs/cadence.md](./docs/cadence.md)) — `python -m tgmint cadence` prints the schedule the real apps use (Android 12.10.6: every 19 s, `disconnect_delay` 35; Desktop 7.3.3: every 30 s, 60) next to what Telethon (plain `PING` every 60 s) and the Pyrogram family (every 5 s, delay 25) ship with. `tgmint.cadence.apply(client, platform)` sets only what a framework allows, per instance, and reports the rest as unsupported. Offline plan; no ban-evasion claim.
+- **Post-auth startup replay** ([docs/bootstrap.md](./docs/bootstrap.md)) — `python -m tgmint bootstrap` sends the read-only batch the official client sends right after auth, in the order its source proves, for the Android or Desktop preset; `--dry-run` prints the plan without a session. `account.updateStatus` / `account.registerDevice` / `auth.*` are refused by an allowlist, and `initConnection` is never touched.
+
+| Command | What it does | Network |
+|---|---|---|
+| `mint` / `inspect` / `audit` | mint a fingerprint, print a sidecar, audit it | no |
+| `freshness` / `parity` / `doctor` | pinned versions, the initConnection envelope, environment report | no |
+| `convert` | any supported session format to any other (including `--from-format profile`) | no |
+| `profile seal` / `open` / `inspect` | build / unpack / summarize a `.tgmint` envelope | no |
+| `login-passkey` | passkey sign-in, session out in any format | yes |
+| `heal` | probe ONE session, re-login with its passkey, rewrite it in place | `--live` only |
+| `bootstrap` | replay the official post-auth startup batch (read-only) for android or desktop | live mode only (`--dry-run` is offline) |
+| `cadence` | official ping schedule vs the framework defaults, and what is settable | no |
 
 ## Frameworks
 

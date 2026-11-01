@@ -62,7 +62,7 @@ def check(label: str, values: list[str], show: int = 12) -> list[str]:
 
 # -- class defaults -------------------------------------------------------------
 
-for name in ("TelegramDesktop", "TelegramAndroid", "TelegramAndroidX",
+for name in ("TelegramDesktop", "TelegramDesktopFlatpak", "TelegramAndroid", "TelegramAndroidX",
              "TelegramIOS", "TelegramMacOS"):
     api = getattr(API, name)
     print(f"{name}: model={api.device_model!r} system={api.system_version!r} app={api.app_version!r}")

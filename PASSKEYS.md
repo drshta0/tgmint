@@ -110,7 +110,48 @@ No phone number involved anywhere. If the account has a 2FA cloud
 password, pass `password="..."` (the passkey replaces the OTP, not the
 password — by design).
 
-### 3. Manage
+### 3. Recover a dead session (and keep the passkey with it)
+
+A session the server has logged out cannot be repaired locally - which is
+exactly when the passkey pays off. `heal` repairs ONE session you own:
+
+```sh
+# probe first; an alive session is left untouched
+python -m tgmint heal myaccount.session --passkey acc1.passkey.json --live
+
+# no probe, re-login anyway (e.g. you know the session is gone)
+python -m tgmint heal myaccount.session --passkey acc1.passkey.json --force
+```
+
+It reads the session (any codec format), probes it with a single `get_me`,
+and when the server rejects the auth key it signs back in with the passkey
+on a client minted from the session's *recorded* fingerprint (a sidecar, or
+the fingerprint inside a `.tgmint` envelope, else a freshly minted identity)
+and rewrites the session file in place, atomically, in the same format. It
+refuses when the passkey belongs to a different account than the session, and
+there is deliberately no batch mode: one account, one session, per
+invocation.
+
+To make that pairing portable in the first place, put the session, its
+fingerprint and the passkey into one envelope:
+
+```sh
+# needs the passkeys extra only to SEAL (cryptography)
+TGMINT_PASS='...' python -m tgmint profile seal \
+    --session myaccount.session --from-format telethon-session \
+    --passkey acc1.passkey.json --passphrase-env TGMINT_PASS \
+    --out myaccount.tgmint
+
+python -m tgmint profile inspect myaccount.tgmint          # no secrets, no passphrase
+TGMINT_PASS='...' python -m tgmint heal myaccount.tgmint --passkey acc1.passkey.json \
+    --passphrase-env TGMINT_PASS --live
+```
+
+`heal` is verified offline only (fake clients, mocked ceremony, mocked
+probe): the live "the dead session really came back" round trip needs an
+account whose session you can afford to lose.
+
+### 4. Manage
 
 ```python
 from tgmint.passkeys import list_passkeys, delete_passkey

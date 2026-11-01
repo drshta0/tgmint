@@ -18,6 +18,9 @@ history is preserved on purpose; see the repo's
 - **Coming from opentele?** [Migration from opentele](migration-from-opentele.md)
   covers the import renames, the Qt-free tdata change, the extras, the
   sidecar pattern, and the API changes (web presets were removed).
+- **Make a session behave like the app it claims to be:**
+  [Post-auth bootstrap](bootstrap.md) replays the official startup batch
+  (read-only only) for the Android or Desktop preset.
 - **Log in without a phone number:** [Passkeys](passkeys.md) — register a
   passkey on an account you hold a session for, then log back in with just
   the passkey file.

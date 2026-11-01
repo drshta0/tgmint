@@ -1,6 +1,164 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [1.18.0] - 2026-11-01
+
+The "one file that is an account" release, part one. A session, the
+fingerprint it was born with and the passkey that can recover it now travel
+together in a single portable `.tgmint` envelope, optionally sealed with a
+passphrase. Because it is registered as a codec **source**, everything that
+already reads sessions reads envelopes too - and the new `heal` command can
+sign a dead session back in with the bundled passkey and rewrite it in
+place.
+
+### Added
+- `API.TelegramAndroid` ROTATED to the current official pair (`api_id` 4 /
+  `014b35b6184100b085b0d0572f9b5103`), verified 2026-11-01 by
+  disassembling the shipped official APK (13.1.1, telegram.org/dl/android/apk,
+  `BuildVars.<clinit>` in classes.dex): the 2022 pair `6`/`eb06d4...`
+  appears nowhere in the current APK.
+- `API.TelegramDesktopFlatpak` — the second, current official Desktop
+  credential pair (`api_id` 611335 / `d524b414d21f4d37f08684c1df41ac9c`)
+  extracted from the shipped flathub build (stable `7444df4f`, tdesktop
+  `668a91bd`): the embedded build manifest injects it via
+  `-DTDESKTOP_API_ID/HASH`, and the stripped binary whitelists
+  `{2040, 611335, 17349}` as official ids — so classic `2040` is confirmed
+  NOT rotated. Inherits device pools and `Generate()` from
+  `TelegramDesktop`; selected explicitly, never as a default.
+- `tgmint.profile` - the portable identity envelope (`tgmint-profile/1`):
+  `seal`, `open_profile`, `write_profile`, `read_profile`, `inspect_profile`.
+  The session is stored as its format family's session string (an
+  authorization is `dc_id` + `auth_key`), the fingerprint sidecar and the
+  passkey store ride along as JSON, and `meta` records `created` / `tgmint` /
+  `note`. Files are written atomically, mode 0600, and an existing path is
+  never overwritten.
+- Sealed profiles: AES-256-GCM over the plaintext container bytes, keyed by
+  PBKDF2-HMAC-SHA256 (600000 iterations, 16-byte salt, 12-byte nonce) with
+  the format id as GCM associated data. `cryptography` is imported lazily, so
+  an unsealed profile (and every other codec path) keeps working without the
+  `[passkeys]` extra; a missing extra is a one-line "install tgmint[passkeys]"
+  message, not an ImportError traceback.
+- Cross-validation on open: a container whose session, fingerprint (optional
+  `user_id`/`dc_id` keys) and passkey (`dc:user` handle) disagree about the
+  account raises one `ProfileError` naming both sides. Wrong passphrase and
+  tampered ciphertext are indistinguishable by construction and share that
+  same exception.
+- `tgmint profile seal | open | inspect` - bundle a session with its sidecar
+  and passkey, unpack one into any codec format, or print a secret-free
+  summary (formats, dc/user, has-fingerprint, has-passkey, sealed or locked).
+  Passphrases are never taken from argv: `--passphrase-env VAR` or
+  `--passphrase-stdin`, with a `getpass` prompt when neither is given and
+  stdin is a terminal.
+- `tgmint heal` / `tgmint.heal.heal_session` - repair ONE session with its
+  passkey: read it (any source format, including an envelope), probe it with
+  a single `get_me`, leave an alive session untouched, and when the server
+  rejects the auth key, sign back in on a client minted from the *recorded*
+  fingerprint (envelope or sidecar; a minted identity otherwise) and rewrite
+  the session in place, atomically, in the same format. No batch mode, no
+  glob, no daemon: one account, one session, invoked by its owner. Without
+  `--live` nothing is probed and `--force` is required; an inconclusive probe
+  (a network failure, not an auth rejection) refuses unless forced; another
+  account's passkey is refused before any socket is opened.
+- 85 new offline tests (43 envelope + 24 heal + 18 CLI), including plain and
+  sealed round trips, wrong passphrase, tampered ciphertext/salt/nonce,
+  cross-validation, the envelope as a `convert` source, and heal driven end
+  to end through injected fake clients (alive -> no-op, dead -> rewrite,
+  refusals, `.tgmint` repair keeping fingerprint and passkey).
+- `tgmint.bootstrap` / `tgmint bootstrap` - an **opt-in post-auth startup
+  replay**: the read-only batch the official client sends right after
+  authorization, in the order its source proves, for the Android 12.10.6 and
+  Desktop 7.3.3 presets (`BOOTSTRAP_SEQUENCES`, `Step`, `sequence()`,
+  `describe()`, `replay_startup()`, `platform_for()`; each row cites the
+  official client's source `file:line`).
+  19 safe steps for Android (starting `help.getConfig`) and 13 for Desktop
+  (starting `help.getConfig` then `updates.getState`), each tagged
+  `session` / `account` / `dialogs` / `cosmetic`. Safety is an allowlist, not
+  a denylist: a step may only send a method from `SAFE_METHODS` (plus
+  `COSMETIC_METHODS` when `include_cosmetic=True`, 8 more on Android), and
+  `account.updateStatus`, `account.registerDevice`,
+  `account.resetAuthorization` and `auth.*` are refused on every use
+  (`BootstrapError`), so a sequence that drifts is rejected at runtime, not
+  reviewed. `initConnection` is never touched: it is fixed at connect time
+  by the client. A failing request is recorded and the replay continues;
+  connection/auth failures are re-raised. `tgmint bootstrap --preset
+  {auto,android,desktop} [--include-cosmetic] [--dry-run] [--json]` prints
+  the plan without a session and never connects, or replays into ONE session
+  you own (`--session`, `--from-format`, `--api-preset`), refusing with exit 2
+  when live mode is asked for without a session; `--preset auto` derives the
+  platform from the session's fingerprint sidecar and names why `ios` /
+  `macos` have no verified sequence yet. `parity.describe_envelope()` now
+  carries a `bootstrap` summary (`platform`, `steps`, `cosmetic_steps`), so
+  `tgmint parity` shows what an identity would replay.
+- 78 new offline tests (75 in `tests/test_bootstrap.py`, including the
+  parity integration, plus 3 in `tests/test_cli.py`): the
+  shipped order against the spec, the allowlist/forbidden gates, cosmetic
+  filtering, the replay loop against a fake client (exact order, one failing
+  request recorded while the rest continue, fatal errors re-raised, dry run
+  sending nothing), the default builder producing real Telethon objects, and
+  `import tgmint.bootstrap` with Telethon absent. Nothing here has been
+  replayed against a live account yet, and the docs say so.
+
+- `tgmint.cadence` - the official keepalive cadence as data, plus the smallest
+  honest way to set it. `PING_CADENCE` carries Telegram Android 12.10.6
+  (ping every 19 s, `disconnect_delay` 35) and Desktop 7.3.3 (every 30 s,
+  60), each with the `file:line` it was read from; `target()` /
+  `describe()` are pure (no framework import, no socket, no client) and
+  `apply(client, platform=None, dry_run=False)` detects the client family and
+  writes only what that family allows, reporting the rest as `unsupported`
+  with the reason: Telethon gets its `_keepalive_loop` replaced **on the
+  instance** (there is no interval attribute - 60 is a literal in
+  `updates.py`, verified against the installed loop before patching) and its
+  `disconnect_delay` is reported unsupported because Telethon only ever sends
+  a plain `ping`; the Pyrogram family gets `PING_INTERVAL` as an instance
+  attribute on every `Session` object (the worker re-reads it each tick, class
+  default untouched) and keeps the derived `WAIT_TIMEOUT + 10` delay because
+  `WAIT_TIMEOUT` is also the request/startup timeout. `platform=None` reads a
+  fingerprint off the client and says to pass the platform when there is
+  none; `dry_run=True` mutates nothing; `restore(client)` undoes the patch.
+  `tgmint cadence [--preset {android,desktop}] [--json]` prints the official
+  schedule next to the framework defaults it can fix - a pure plan that never
+  connects, and the docs say plainly that matching a cadence is not ban
+  evasion. `tgmint.parity.PING_PRESETS` stays the inert Telethon baseline it
+  always was and now points at the verified table instead of promising it.
+- 47 new offline tests in `tests/test_cadence.py`: the numbers and their
+  sources, the framework defaults checked against the *installed* telethon and
+  kurigram (so a bump that changes its own default fails the suite), the
+  copied Telethon loop driven for several ticks, `apply`/`restore`/`dry_run`
+  against a real `TelegramClient` and fake Pyrogram-family clients, and every
+  refusal path (unknown platform, undetectable family, an unrecognised
+  Telethon loop, a Pyrogram client with no Session yet).
+
+### Fixed
+- `tgmint.cadence` no longer caps the Pyrogram family at 9.5 s, because the
+  reason for the cap was a bug in the framework, not a Telegram policy. A live
+  transport-level investigation (2026-11-01, own accounts) showed the Pyrogram transport's hardcoded
+  10 s socket-read timeout (`TCP.TIMEOUT`, `tcp.py:159`) closing its own
+  connection via `recv_worker` whenever the next inbound packet was more than
+  10 s away - a logging TCP proxy proved the server neither sends nor FINs at
+  that point. `apply()` now installs a patient `_recv_from_socket`
+  (`2 x interval + 7 s`, min 25 s) through the client's `connection_factory` so
+  it lands before the first read of every connection (including reconnects),
+  and wraps `Session.send` to rewrite the hardcoded `disconnect_delay = 25`
+  to the official 35 s / 60 s (the server does enforce it). Verified live:
+  one reconnect at apply time, then 100 s of pings at 19.0-19.1 s (Android)
+  and 30 s (desktop) with no further reconnects. `describe()` and
+  `tgmint cadence` now print the socket read timeout and the applied delay
+  instead of a cap.
+### Changed
+- `tgmint.codec` gained `read_session` and `write_session` as public
+  entrypoints (the reader/writer halves `convert_session` already had;
+  `heal` needs the writer without a source format in the way), plus the
+  `profile` source format, `.tgmint` suffix inference and format aliases
+  (`profile`, `tgmint`, `tgmint-profile`). `convert_session` takes
+  `passphrase=` for sealed envelopes and accepts `source_format=None`.
+  Existing format strings are unchanged; `--from-format profile` is the only
+  new CLI choice, and `profile` is a source, never a `convert` destination.
+- `tgmint.parity.describe_envelope()` reports a `bootstrap` block
+  (`platform`, `steps`, `cosmetic_steps`) instead of stating in its docstring
+  that bootstrap parity is deliberately absent: the sequence now exists in
+  `tgmint.bootstrap` as an opt-in replay. The envelope itself is unchanged
+  otherwise, and `tgmint parity` stays offline.
+
 ## [v1.17.0] - 2026-10-30
 
 The "passkeys everywhere they can physically be" release. Software

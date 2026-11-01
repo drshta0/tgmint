@@ -9,7 +9,8 @@ Covers:
   than silently minting an impossible (new-version, old-layer) pair;
 - layer=None keeps the pinned-current behaviour, locale wiring intact;
 - every table row in layers.py carries provenance (sha/URL comment);
-- parity.PING_PRESETS / describe_envelope shape;
+- parity.PING_PRESETS / describe_envelope shape (bootstrap summary
+  included since F5 shipped tgmint.bootstrap);
 - the web presets are gone (F9).
 """
 import re
@@ -178,10 +179,10 @@ class TestParityHelpers(unittest.TestCase):
             {
                 "api_id", "api_hash", "device_model", "system_version",
                 "app_version", "system_lang_code", "lang_pack", "lang_code",
-                "params", "layer",
+                "params", "layer", "bootstrap",
             },
         )
-        self.assertEqual(env["api_id"], 6)
+        self.assertEqual(env["api_id"], 4)
         self.assertEqual(env["lang_pack"], "android")
         self.assertEqual(env["params"], {})
 
@@ -223,6 +224,88 @@ class TestWebPresetsRemoved(unittest.TestCase):
                 hasattr(API, gone), f"{gone} must be removed"
             )
         self.assertTrue(hasattr(API, "TelegramMacOS"))  # the rest kept
+
+
+class TestPinMatchesVerifiedTable(unittest.TestCase):
+    """The current-version pin must be the string the official app PRINTS.
+
+    Telegram's APK ships an ABI-split versionCode (13.1.0 -> 72291) while
+    `app_version` on the wire carries the DrKLO build code (7229). The pin
+    used to carry the split code, so the reverse layer lookup missed and
+    parity reported `layer: None` for every pinned-current Android identity.
+    """
+
+    def test_android_pin_equals_the_verified_layer_row(self):
+        # layers.py rows are first-hand from DrKLO TLRPC.java at a pinned sha
+        self.assertEqual(API.TelegramAndroid.app_version, layers.ANDROID_LAYERS[232])
+        self.assertEqual(API.TelegramAndroid.app_version, "13.1.0 (7229)")
+
+    def test_pinned_table_agrees_with_the_presets(self):
+        from tgmint.versions import PINNED
+
+        self.assertEqual(PINNED["android"], API.TelegramAndroid.app_version)
+        self.assertEqual(PINNED["android_x"], API.TelegramAndroidX.app_version)
+        self.assertEqual(PINNED["ios"], API.TelegramIOS.app_version)
+        self.assertEqual(PINNED["macos"], API.TelegramMacOS.app_version)
+        self.assertEqual(PINNED["tdesktop"], API.TelegramDesktop.app_version)
+
+    def test_no_pin_carries_a_split_version_code(self):
+        # 5+ digit build codes are APK versionCodes, never printed strings
+        from tgmint.versions import PINNED
+
+        for app, version in PINNED.items():
+            if "(" in version:
+                code = version.split("(")[1].rstrip(")")
+                self.assertLess(len(code), 5, f"{app}: split code leaked: {version!r}")
+
+    def test_describe_envelope_reverse_lookup_of_the_pin(self):
+        env = describe_envelope("android")
+        self.assertEqual(env["app_version"], "13.1.0 (7229)")
+        self.assertEqual(env["layer"], 232)  # reverse lookup now resolves
+        # and the instance form agrees
+        api = API.TelegramAndroid.Generate(unique_id="pin-env")
+        self.assertEqual(describe_envelope(api)["layer"], 232)
+
+
+class TestPresetDefaultsAreInTheirPools(unittest.TestCase):
+    """A preset's (device_model, system_version) must exist in its own pool.
+
+    The old class defaults were pairs the generator excludes — an iOS
+    18.5 pair on a model that only ever ran 26.x, an Android model with no
+    SDK-35 rows, a Windows board name the junk filter drops — so `API.X`
+    (without Generate()) advertised an identity the pool says is impossible.
+    """
+
+    def test_mobile_defaults_exist_in_the_pool(self):
+        from tgmint.devices import AndroidDevice, iOSDeivce
+
+        AndroidDevice.__gen__()
+        iOSDeivce.__gen__()
+
+        android_rows = {(d.model, d.version) for d in AndroidDevice.deviceList}
+        for preset in (API.TelegramAndroid, API.TelegramAndroidX):
+            pair = (preset.device_model, preset.system_version)
+            self.assertIn(pair, android_rows, preset.__name__)
+
+        ios_rows = {(d.model, d.version) for d in iOSDeivce.deviceList}
+        self.assertIn(
+            (API.TelegramIOS.device_model, API.TelegramIOS.system_version), ios_rows
+        )
+
+    def test_desktop_default_device_is_a_real_board(self):
+        from tgmint.devices import WindowsDevice
+
+        WindowsDevice.__gen__()
+        models = {d.model for d in WindowsDevice.deviceList}
+        self.assertIn(API.TelegramDesktop.device_model, models)
+        # and it is not one of the junk placeholders the pool filters out
+        self.assertNotIn(
+            API.TelegramDesktop.device_model, ("Desktop", "INVALID", "OEM")
+        )
+        self.assertIn(
+            API.TelegramDesktop.system_version,
+            {d.version for d in WindowsDevice.deviceList},
+        )
 
 
 if __name__ == "__main__":
