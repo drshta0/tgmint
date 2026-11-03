@@ -916,9 +916,13 @@ async def login_with_passkey(
        framework's ``types.User``.
 
     If the account has a 2FA cloud password the finish call answers
-    ``SESSION_PASSWORD_NEEDED``; pass the password as ``password`` (or catch
-    :class:`tgmint.passkeys_core.TwoFactorRequired` from a lower-level run)
-    and ``client.check_password`` completes the login on the home DC.
+    ``SESSION_PASSWORD_NEEDED``; pass the password as ``password`` and
+    ``client.check_password`` completes the login on the home DC. Without a
+    password the neutral :class:`tgmint.passkeys_core.TwoFactorRequired`
+    signal propagates unchanged (it is deliberately not a
+    :class:`tgmint.passkeys_core.PasskeyError`), and the previous session is
+    restored first, so calling again with ``password=`` starts from the DC the
+    client originally connected to.
 
     A failed finish after the DC switch restores the previous session and
     storage best-effort, so a retry starts from where it left off.
@@ -955,9 +959,17 @@ async def login_with_passkey(
         result = await core.finish_login(invoker, plan["finish_fields"])
     except core.TwoFactorRequired:
         if password is None:
-            raise core.PasskeyError(_TWO_FACTOR_MESSAGE) from None
+            # nothing can be finished without the password: restore the
+            # session/storage first, then let the neutral 2FA signal
+            # propagate unchanged (it is deliberately NOT a PasskeyError, so
+            # a caller guarding against a corrupt store cannot swallow the
+            # password prompt)
+            if snapshot is not None:
+                await _restore_dc(client, snapshot)
+            raise
         # check_password finishes the login and does the same storage
-        # bookkeeping, then parses the user — on the home-DC session
+        # bookkeeping, then parses the user — on the home-DC session, so the
+        # switch is intentionally kept for the password step
         return await client.check_password(password)
     except BaseException:
         if snapshot is not None:

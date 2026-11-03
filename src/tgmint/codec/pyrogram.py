@@ -141,8 +141,20 @@ def read_sqlite(path: typing.Union[str, Path]) -> SessionData:
     """
     row = read_sqlite_row(path, _REQUIRED_COLUMNS)
     auth_key = row["auth_key"]
+    if auth_key is None:
+        # `bytes(None)` would raise TypeError; a NULL key is a broken file
+        raise CodecError(
+            "Pyrogram session row has no auth_key; the file was never "
+            "authorized (log in with the client once)"
+        )
     if not isinstance(auth_key, bytes):
-        auth_key = bytes(auth_key)
+        try:  # e.g. stored as memoryview/str
+            auth_key = bytes(auth_key)
+        except (TypeError, ValueError):
+            raise CodecError(
+                "Pyrogram session row has an auth_key of the wrong type; "
+                "expected a BLOB of 256 bytes"
+            ) from None
     validate(row["dc_id"], auth_key, row["user_id"] or None)
     address: typing.Optional[str] = row.get("server_address")
     if address is not None:

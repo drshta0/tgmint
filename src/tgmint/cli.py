@@ -43,6 +43,9 @@ from .audit import audit_fingerprint
 from .fingerprint import Fingerprint
 
 EXIT_OK = 0
+#: exit 1 belongs to `audit` alone ("problems found in the fingerprint");
+#: every runtime failure is EXIT_ERROR so a shell script can tell the two
+#: apart without parsing text
 EXIT_PROBLEMS = 1
 EXIT_ERROR = 2
 
@@ -212,6 +215,31 @@ def _resolve_passphrase(
     except (EOFError, OSError) as exc:
         raise ValueError(f"could not read a passphrase from the terminal ({exc})") from None
     return value or None
+
+
+def _resolve_passcode(args: argparse.Namespace) -> Optional[str]:
+    """The ``tdata`` passcode from ``--passcode-env`` (never argv).
+
+    A folder passcode unlocks the same auth-key material a session file
+    holds, so it is a secret with the same rule as a profile passphrase:
+    it comes from an environment variable, never from the command line
+    (argv lands in shell history and the process list).  ``None`` means
+    "the flag was not given"; the caller decides whether it is needed.
+
+    Raises ``ValueError`` (exit 2 at the CLI) when the named variable is
+    unset or empty — a typo'd variable name must not read as "no passcode".
+    """
+    var = getattr(args, "passcode_env", None)
+    if not var:
+        return None
+    value = os.environ.get(var)
+    if value is None:
+        raise ValueError(
+            f"--passcode-env {var}: that environment variable is not set"
+        )
+    if not value:
+        raise ValueError(f"--passcode-env {var}: it is set but empty")
+    return value
 
 
 def _load_sidecar(path: str) -> Optional[Fingerprint]:
@@ -507,15 +535,20 @@ def _envelope_via_parity_module(
 
 
 def _wire_layer(explicit: Optional[int]) -> Optional[int]:
-    """The wire layer to report: explicit --layer, else telethon's."""
+    """The wire layer to report: the explicit ``--layer``, else ``None``.
+
+    ``None`` is the honest answer, not a missing feature: ``parity``
+    reverse-looks the layer of the minted ``app_version`` out of
+    ``tgmint.layers`` (see :func:`tgmint.parity.describe_envelope`), so
+    passing ``None`` lets that lookup say "unknown" when the version is
+    not in a table.  Reporting telethon's own layer instead — the old
+    fallback — claimed 224 for an iOS identity whose ``app_version``
+    genuinely speaks 232+, i.e. it named a layer the impersonated client
+    never spoke.
+    """
     if explicit is not None:
         return int(explicit)
-    try:
-        from .layers import telethon_layer
-
-        return telethon_layer()
-    except Exception:
-        return None
+    return None
 
 
 def _cmd_parity(args: argparse.Namespace) -> int:
@@ -557,17 +590,42 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     convert = getattr(codec, "convert_session", None)
     if convert is None:
-        return _fail(
+        return _fail_json(
+            args,
             "codec module not available in this build "
-            "(no convert_session entrypoint)"
+            "(no convert_session entrypoint)",
         )
 
+    # The passphrase source is validated whoever will read it: an unset
+    # --passphrase-env is a usage error even when the source format turns
+    # out not to need a passphrase (silently ignoring a flag the user
+    # passed is how a typo'd variable name stays invisible), and a
+    # "profile" source needs it before it can be read at all.
     passphrase = ""
-    if args.from_format == "profile":
+    asked_for_one = bool(
+        getattr(args, "passphrase_env", None)
+        or getattr(args, "passphrase_stdin", False)
+    )
+    if args.from_format == "profile" or asked_for_one:
         try:
             passphrase = _resolve_passphrase(args, purpose="profile") or ""
         except ValueError as exc:
-            return _fail(str(exc))
+            return _fail_json(args, str(exc))
+
+    # A tdata passcode is a secret like a passphrase, so it travels the
+    # same way: through an environment variable, never argv.  Validated
+    # whenever the flag is given (a typo'd variable name must not look
+    # like "no passcode"), and only handed to the codec at all when a
+    # tdata folder is one end of the conversion.
+    passcode = ""
+    if getattr(args, "passcode_env", None) or "tdata" in (
+        args.from_format,
+        args.to_format,
+    ):
+        try:
+            passcode = _resolve_passcode(args) or ""
+        except ValueError as exc:
+            return _fail_json(args, str(exc))
 
     try:
         result = convert(
@@ -576,14 +634,18 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             args.to_path,
             args.to_format,
             passphrase=passphrase,
+            passcode=passcode,
+            variant=args.variant,
+            account_index=args.account_index,
         )
     except Exception as exc:
-        return _fail(f"convert failed: {exc}")
+        return _fail_json(args, f"convert failed: {exc}")
 
     if not isinstance(result, dict):
-        return _fail(
+        return _fail_json(
+            args,
             f"convert failed: codec returned {type(result).__name__}, "
-            "expected a result dict"
+            "expected a result dict",
         )
 
     payload = {
@@ -662,8 +724,17 @@ async def _login_passkey_flow(
                 pass
 
         try:
+            # the identity learned at login travels into the conversion:
+            # without it the codec fills pyrogram/gramjs destinations with
+            # the placeholder user_id 777000 / api_id 2040, which is not
+            # this account's identity even though the login knew it
             converted = codec.convert_session(
-                session_path, "telethon-session", args.to_path, args.to_format
+                session_path,
+                "telethon-session",
+                args.to_path,
+                args.to_format,
+                user_id=user_id,
+                api_id=getattr(api, "api_id", None),
             )
         except FileExistsError as exc:
             raise _LoginPasskeyRefusal(
@@ -754,8 +825,8 @@ def _cmd_login_passkey(args: argparse.Namespace) -> int:
             f"required to sign the assertion: {exc}); install tgmint's "
             "passkeys dependencies",
         )
-    except Exception as exc:  # login/convert failure -> runtime error
-        return _fail_json(args, f"login-passkey failed: {exc}", EXIT_PROBLEMS)
+    except Exception as exc:  # login/convert failure -> runtime error (2)
+        return _fail_json(args, f"login-passkey failed: {exc}", EXIT_ERROR)
 
     converted = result["converted"]
     payload: Dict[str, Any] = {
@@ -804,18 +875,44 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
         )
 
     fmt = args.from_format
+    # The passphrase is resolved BEFORE the read, because a "profile"
+    # source may itself be sealed: reading it needs that passphrase, and
+    # the same one seals the envelope we write back, so re-sealing a
+    # sealed profile works instead of telling the user to pass a
+    # passphrase they just passed.
     try:
-        session = codec.read_session(args.session, fmt)
+        passphrase = _resolve_passphrase(args, purpose="profile seal", confirm=True)
+    except ValueError as exc:
+        return _fail_json(args, str(exc))
+
+    # an envelope source is re-sealed as the format it records, keeping
+    # the identity and the passkey it carries unless the flags override
+    # them: the only way re-sealing a sealed profile can work at all
+    opened = None
+    try:
+        if fmt in codec.PROFILE_FORMATS:
+            opened = profile_module.open_profile(
+                args.session, passphrase=passphrase or None
+            )
+            session = opened.session
+            seal_format = opened.session_format or "telethon-string"
+        else:
+            session = codec.read_session(
+                args.session, fmt, passphrase=passphrase or ""
+            )
+            seal_format = fmt
     except FileNotFoundError as exc:
         return _fail_json(args, f"--session {args.session}: {exc}")
     except Exception as exc:
         return _fail_json(args, f"--session {args.session}: {exc}")
 
-    # the recorded identity: explicit --fingerprint wins, else the session's
-    # own sidecar (sticky identity) when one exists
+    # the recorded identity: explicit --fingerprint wins, then the envelope
+    # being re-sealed, then the session's own sidecar (sticky identity)
+    # when one exists
     fingerprint = None
     fingerprint_path: Optional[str] = args.fingerprint
-    if fingerprint_path is None:
+    fingerprint = opened.fingerprint if opened is not None else None
+    if fingerprint_path is None and fingerprint is None:
         candidate = sidecar_path_for(args.session)
         if os.path.isfile(str(candidate)):
             fingerprint_path = str(candidate)
@@ -829,7 +926,7 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
         except (ValueError, OSError, KeyError, TypeError) as exc:
             return _fail_json(args, f"--fingerprint {fingerprint_path}: {exc}")
 
-    passkey = None
+    passkey = opened.passkey if opened is not None else None
     if args.passkey:
         if not os.path.isfile(args.passkey):
             return _fail_json(args, f"--passkey {args.passkey}: no such file")
@@ -842,14 +939,9 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
             )
 
     try:
-        passphrase = _resolve_passphrase(args, purpose="profile seal", confirm=True)
-    except ValueError as exc:
-        return _fail_json(args, str(exc))
-
-    try:
         container = profile_module.seal(
             session,
-            fmt,
+            seal_format,
             fingerprint=fingerprint,
             passkey=passkey,
             passphrase=passphrase,
@@ -859,6 +951,8 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
     except FileExistsError as exc:
         return _fail_json(args, str(exc))
     except ValueError as exc:  # ProfileError is a CodecError is a ValueError
+        return _fail_json(args, f"profile seal failed: {exc}")
+    except OSError as exc:  # unreadable dir, full disk, permissions
         return _fail_json(args, f"profile seal failed: {exc}")
 
     if passkey is not None and not passphrase:
@@ -875,7 +969,8 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
         "out": out,
         "sealed": bool(passphrase),
         "session": args.session,
-        "session_format": fmt,
+        "source_format": fmt,
+        "session_format": seal_format,
         "dc_id": session.dc_id,
         "user_id": session.user_id,
         "fingerprint": fingerprint_path,
@@ -887,7 +982,7 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
     else:
         state = "sealed with a passphrase" if passphrase else "plaintext"
         print(f"wrote {out} ({state})")
-        print(f"  session_format: {fmt}")
+        print(f"  session_format: {seal_format}")
         print(f"  dc_id: {session.dc_id}")
         print(f"  user_id: {session.user_id}")
         print(f"  fingerprint: {fingerprint_path or 'none'}")
@@ -1031,6 +1126,23 @@ def _cmd_profile_inspect(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _heal_source_format(args: argparse.Namespace) -> str:
+    """The source format heal will read: ``--from-format``, else inferred.
+
+    Inferred with the codec when the build has it, else with the same
+    ``.tgmint`` suffix rule — the passphrase prompt below must not appear
+    for a plain session, so this decision cannot wait for the read.
+    """
+    if args.from_format:
+        return args.from_format
+    try:
+        import tgmint.codec as codec
+
+        return codec.infer_source_format(args.session)
+    except Exception:  # pragma: no cover - codec absent in this build
+        return "profile" if str(args.session).endswith(".tgmint") else "telethon-session"
+
+
 def _cmd_heal(args: argparse.Namespace) -> int:
     """Probe one session and, when its auth key is dead, re-login + rewrite."""
     from .heal import HealError, HealRefusal, heal_session
@@ -1050,8 +1162,16 @@ def _cmd_heal(args: argparse.Namespace) -> int:
             f"not usable: {exc}); install tgmint together with telethon",
         )
 
+    # a passphrase only means something for a sealed .tgmint envelope; a
+    # plain session must not prompt for one (bootstrap gates the same way)
+    source_format = _heal_source_format(args)
     try:
-        passphrase = _resolve_passphrase(args, purpose="profile")
+        if source_format in ("profile",) or getattr(args, "passphrase_env", None) or getattr(
+            args, "passphrase_stdin", False
+        ):
+            passphrase = _resolve_passphrase(args, purpose="profile")
+        else:
+            passphrase = None
     except ValueError as exc:
         return _fail_json(args, str(exc))
 
@@ -1062,6 +1182,7 @@ def _cmd_heal(args: argparse.Namespace) -> int:
                 passkey_path=args.passkey,
                 session_format=args.from_format,
                 to_format=args.to_format,
+                out=args.out,
                 api_preset=args.api_preset,
                 passphrase=passphrase,
                 password=args.password,
@@ -1074,9 +1195,9 @@ def _cmd_heal(args: argparse.Namespace) -> int:
     except HealRefusal as exc:
         return _fail_json(args, str(exc), EXIT_ERROR)
     except HealError as exc:
-        return _fail_json(args, f"heal failed: {exc}", EXIT_PROBLEMS)
+        return _fail_json(args, f"heal failed: {exc}", EXIT_ERROR)
     except Exception as exc:
-        return _fail_json(args, f"heal failed: {exc}", EXIT_PROBLEMS)
+        return _fail_json(args, f"heal failed: {exc}", EXIT_ERROR)
 
     payload: Dict[str, Any] = {
         "ok": True,
@@ -1084,6 +1205,9 @@ def _cmd_heal(args: argparse.Namespace) -> int:
         "session": report["session"],
         "session_format": report["session_format"],
         "to_format": report["to_format"],
+        "output": report.get("output"),
+        "in_place": report.get("in_place"),
+        "filled": report.get("filled", []),
         "action": report["action"],
         "passkey": report["passkey"],
         "probe": report["probe"],
@@ -1091,6 +1215,7 @@ def _cmd_heal(args: argparse.Namespace) -> int:
         "old": report["old"],
         "new": report["new"],
         "auth_key_changed": report["auth_key_changed"],
+        "notes": report.get("notes", []),
     }
     if args.json:
         _print_json(payload)
@@ -1110,7 +1235,9 @@ def _cmd_heal(args: argparse.Namespace) -> int:
                 f"{report['new']['user_id']}, dc_id {report['old']['dc_id']} -> "
                 f"{report['new']['dc_id']})"
             )
-            print(f"  rewrote: {report['to_format']}")
+            print(f"  rewrote: {report['output']} ({report['to_format']})")
+            if not report.get("in_place", True):
+                print(f"  in place: no — the source session was left untouched")
             print(f"  identity: {report['identity']['source']}")
             if probe.get("performed"):
                 print(f"  probe: {probe.get('reason')}")
@@ -1128,7 +1255,7 @@ def _bootstrap_platform(args: argparse.Namespace) -> str:
     """Resolve ``--preset`` (``auto`` included) to a platform key.
 
     An explicit ``--preset android|desktop`` wins.  ``auto`` reads the
-    fingerprint sidecar recorded next to the session (``tgmint emit``'s
+    fingerprint sidecar recorded next to the session (`tgmint mint --save`'s
     sticky identity) and asks :func:`tgmint.bootstrap.platform_for` which
     family it belongs to, so a session that already carries an identity
     does not need the platform spelled out twice.
@@ -1168,16 +1295,116 @@ def _bootstrap_platform(args: argparse.Namespace) -> str:
     return platform_for(fingerprint)
 
 
-def _bootstrap_api(platform: str, api_preset: Optional[str]):
-    """The identity the live replay presents (minted, never recorded here)."""
+#: which ``--api-preset`` values are consistent with each replay platform
+#: (an android replay presenting a desktop identity is exactly the kind of
+#: incoherence tgmint exists to avoid)
+_PLATFORM_API_PRESETS: Dict[str, tuple] = {
+    "android": ("android", "android-x"),
+    "desktop": ("desktop",),
+}
+
+
+def _bootstrap_recorded_fingerprint(session: Optional[str]):
+    """The sidecar identity recorded next to ``session`` -> (fp, path|None).
+
+    ``(None, None)`` when there is no session or no sidecar: only then may
+    a replay mint a fresh identity.
+    """
+    if not session:
+        return None, None
+    from .bootstrap import BootstrapError
+
+    try:
+        from .sidecar import sidecar_path_for
+
+        path = str(sidecar_path_for(session))
+    except Exception:  # pragma: no cover - sidecar is in the package
+        return None, None
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        return Fingerprint.load(path), path
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise BootstrapError(f"{path}: not a usable fingerprint ({exc})") from None
+
+
+def _bootstrap_api(platform: str, api_preset: Optional[str], session: Optional[str] = None):
+    """The identity the live replay presents -> ``(api, identity)``.
+
+    The *recorded* identity (the session's fingerprint sidecar) wins,
+    because Telegram remembers the device a session signed in with and a
+    replay is supposed to look like that same client continuing to use its
+    own account; a fresh identity is minted only when nothing was
+    recorded.  ``identity`` is the report dict (``source``/``path``).
+
+    Raises:
+        BootstrapError: ``--api-preset`` names a family the replay
+            platform cannot be (an android replay is never a desktop
+            client), or the recorded identity belongs to another family.
+        ValueError: an unknown preset (unreachable through argparse).
+    """
     from .api import API
+    from .bootstrap import BootstrapError, platform_for
+
+    allowed = _PLATFORM_API_PRESETS.get(platform, (platform,))
+    if api_preset is not None and api_preset not in allowed:
+        raise BootstrapError(
+            f"--api-preset {api_preset} does not match the {platform} replay "
+            f"(a {platform} client presents one of {list(allowed)}); drop "
+            "--api-preset to use the recorded identity, or change --preset "
+            "to the platform you meant"
+        )
+
+    fingerprint, recorded_path = _bootstrap_recorded_fingerprint(session)
+    if fingerprint is not None:
+        recorded_platform = platform_for(fingerprint)
+        if recorded_platform != platform:
+            raise BootstrapError(
+                f"{recorded_path}: the recorded identity is a "
+                f"{recorded_platform} one, but this replay is {platform}; "
+                "refusing to present an identity from another client family "
+                "(move the sidecar away, or replay the family it records)"
+            )
+        # reused, not copied: heal builds the same APIData for the same
+        # reason (present the identity the session was born with)
+        from .heal import _api_from_fingerprint
+
+        return _api_from_fingerprint(fingerprint), {
+            "source": "recorded",
+            "path": recorded_path,
+        }
 
     name = _PRESETS.get(api_preset or platform)
     if name is None:
         raise ValueError(
             f"unknown api preset {api_preset!r}; expected one of {_PRESET_ORDER}"
         )
-    return getattr(API, name).Generate()
+    return getattr(API, name).Generate(), {"source": "minted", "path": None}
+
+
+def _bootstrap_failure(args: argparse.Namespace, exc: "BootstrapError") -> int:
+    """Report a fatal replay failure *and* what actually got sent.
+
+    The replay attaches its partial report to the error
+    (:func:`tgmint.bootstrap._fatal_error`); a caller that only saw "the
+    replay failed" would have to guess which steps reached Telegram, so
+    the partial report goes out with the error in --json mode.
+    """
+    report = getattr(exc, "report", None)
+    if not report:
+        return _fail_json(args, str(exc), EXIT_ERROR)
+    print(f"tgmint: {exc}", file=sys.stderr)
+    if getattr(args, "json", False):
+        _print_json(
+            {
+                "ok": False,
+                "command": getattr(args, "command", None),
+                "error": str(exc),
+                "stopped_at": getattr(exc, "stopped_at", None),
+                "partial_report": report,
+            }
+        )
+    return EXIT_ERROR
 
 
 async def _bootstrap_replay(client, *, platform: str, include_cosmetic: bool) -> Dict[str, Any]:
@@ -1352,13 +1579,18 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
         return _fail_json(args, f"--session {args.session}: {exc}")
 
     try:
-        api = _bootstrap_api(platform, args.api_preset)
+        api, identity = _bootstrap_api(platform, args.api_preset, args.session)
+    except BootstrapError as exc:
+        return _fail_json(args, str(exc), EXIT_ERROR)
     except (ValueError, NotImplementedError) as exc:
         return _fail_json(args, f"bootstrap failed: {exc}")
 
     from .bootstrap import make_client
 
-    client = make_client(api=api, data=session)
+    try:
+        client = make_client(api=api, data=session)
+    except Exception as exc:
+        return _fail_json(args, f"bootstrap failed: {exc}", EXIT_ERROR)
     try:
         report = asyncio.run(
             _bootstrap_replay(
@@ -1366,9 +1598,9 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
             )
         )
     except BootstrapError as exc:
-        return _fail_json(args, str(exc), EXIT_ERROR)
+        return _bootstrap_failure(args, exc)
     except Exception as exc:
-        return _fail_json(args, f"bootstrap failed: {exc}", EXIT_PROBLEMS)
+        return _fail_json(args, f"bootstrap failed: {exc}", EXIT_ERROR)
 
     payload = {
         "ok": True,
@@ -1378,6 +1610,7 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
         "session": args.session,
         "session_format": source_format,
         "api_preset": args.api_preset or platform,
+        "identity": identity,
         "client_version": info["client_version"],
         "cosmetic_steps": info["cosmetic_steps"],
     }
@@ -1395,6 +1628,8 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
             f"  {report['sent']} sent, {len(skipped)} skipped, "
             f"{len(report['errors'])} failed, {len(report['steps'])} steps"
         )
+        source = "recorded identity" if identity["source"] == "recorded" else "minted identity"
+        print(f"  identity: {source}" + (f" ({identity['path']})" if identity["path"] else ""))
         for entry in report["steps"]:
             if entry["status"] in ("skipped", "error"):
                 print(f"  {entry['status']:7} {entry['method']}: {entry['detail']}")
@@ -1525,8 +1760,9 @@ def _add_mint_options(
         "--layer",
         type=int,
         metavar="N",
-        help="desktop only: claim an app_version that genuinely spoke TL "
-        "layer N (ignored for mobile presets for now)",
+        help="claim an app_version that genuinely spoke TL layer N "
+        "(desktop and the android/ios presets have verified layer tables "
+        "and honour it; macos has none and refuses --layer)",
     )
     parser.add_argument(
         "--unique-id",
@@ -1626,7 +1862,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Convert a session file/string you own between telethon, "
             "pyrogram, gramjs and tdata formats — offline, no login, no "
             "network; the auth_key is the only secret moved. Requires the "
-            "optional codec module; when it is absent this command exits 2."
+            "optional codec module; when it is absent this command exits 2. "
+            "Secrets never come from argv: a sealed profile's passphrase "
+            "arrives via --passphrase-env/--passphrase-stdin and a tdata "
+            "folder's passcode via --passcode-env."
         ),
         epilog=_EXIT_EPILOG,
     )
@@ -1657,6 +1896,27 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=_CONVERT_FORMATS,
         help="destination format",
+    )
+    p.add_argument(
+        "--passcode-env",
+        metavar="VAR",
+        help="tdata only: read the folder's local passcode from environment "
+        "variable VAR (a passcode is a secret, so it never comes from argv)",
+    )
+    p.add_argument(
+        "--account-index",
+        dest="account_index",
+        type=int,
+        metavar="N",
+        help="tdata source only: which account of a multi-account folder to "
+        "read (default: its main account)",
+    )
+    p.add_argument(
+        "--variant",
+        choices=["pyrogram", "kurigram"],
+        default="pyrogram",
+        help="pyrogram-session destinations only: which fork's SQLite schema "
+        "to write (default: pyrogram)",
     )
     _add_passphrase_options(p)
     _add_json(p)
@@ -1834,12 +2094,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "Repair ONE session you own whose auth key the server no longer "
             "accepts: probe it, sign back in with a stored tgmint passkey "
             "on a client minted from the recorded fingerprint, and rewrite "
-            "the session in place with the fresh auth key. Without --live "
-            "nothing is probed and --force is required. There is no batch "
-            "mode and no 'heal everything' switch on purpose: one account, "
-            "one session, invoked by its owner. Needs telethon; the passkey "
-            "ceremony needs the passkeys extra. Exit codes: 0 alive (no "
-            "change) or healed | 1 the login/heal failed | 2 refused."
+            "the session with the fresh auth key. By default it is an "
+            "in-place, same-format rewrite; --out writes the fresh session "
+            "somewhere else, and it becomes REQUIRED as soon as --to-format "
+            "differs from the source format — converting in place would "
+            "destroy the original format while the file name kept claiming "
+            "it. Without --live nothing is "
+            "probed and --force is required. There is no batch mode and no "
+            "'heal everything' switch on purpose: one account, one session, "
+            "invoked by its owner. Needs telethon; the passkey ceremony "
+            "needs the passkeys extra. Exit codes: 0 alive (no change) or "
+            "healed | 1 reserved for audit problems | 2 refused, or the "
+            "login/heal failed."
         ),
         epilog=_EXIT_EPILOG,
     )
@@ -1862,7 +2128,15 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="to_format",
         choices=_HEAL_FORMATS + ["profile"],
         help="format to rewrite the session in (default: same as the "
-        "source; a .tgmint envelope is rewritten as an envelope)",
+        "source; a .tgmint envelope is rewritten as an envelope). Changing "
+        "the format requires --out: in-place rewrite is same-format only",
+    )
+    p.add_argument(
+        "--out",
+        metavar="PATH",
+        help="write the healed session here instead of in place (never "
+        "overwritten); required with a --to-format that differs from the "
+        "source format",
     )
     p.add_argument(
         "--api-preset",
@@ -1903,10 +2177,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "/ auth.* are refused outright, and initConnection is never "
             "touched because it is fixed at connect time. --dry-run prints "
             "the plan without a session and never connects; live mode reads "
-            "ONE session you own, connects with a minted identity, replays, "
-            "and disconnects. No batch mode, no daemon. Exit codes: 0 done "
-            "(per-request failures are reported, not fatal) | 1 the replay "
-            "failed | 2 bad usage or no platform to infer."
+            "ONE session you own, connects with the identity the session "
+            "recorded (its fingerprint sidecar) — minting a fresh one only "
+            "when none exists — replays, and disconnects. No batch mode, no "
+            "daemon. Exit codes: 0 done (per-request failures are reported, "
+            "not fatal) | 1 reserved for audit problems | 2 bad usage, no "
+            "platform to infer, or the replay failed."
         ),
         epilog=_EXIT_EPILOG,
     )
@@ -1933,8 +2209,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-preset",
         dest="api_preset",
         choices=_PRESET_ORDER,
-        help="identity to mint for the replay (default: the family the "
-        "platform preset names — android or desktop)",
+        help="identity to mint when the session has no fingerprint sidecar "
+        "(default: the family the platform preset names — android or "
+        "desktop); a value from another client family is refused",
     )
     p.add_argument(
         "--include-cosmetic",

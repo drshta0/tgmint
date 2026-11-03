@@ -63,7 +63,7 @@ _FAMILY_BY_ORIGIN = {
     "web": "web_z",
 }
 
-# leading dotted version: "7.3.3 x64" -> "7.3.3", "13.1.0 (72291)" ->
+# leading dotted version: "7.3.3 x64" -> "7.3.3", "13.1.0 (7229)" ->
 # "13.1.0", "1.0.1 K" -> "1.0.1". Anything else ("MyClient", "") -> "".
 _BASE_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)")
 
@@ -86,7 +86,7 @@ def base_version(app_version: Any) -> str:
     """Strip the platform suffix from an ``app_version``.
 
     Official versions carry build noise — tdesktop appends `` x64`` /
-    `` arm64``, Android appends `` (72291)`` — so staleness compares the
+    `` arm64``, Android appends `` (7229)`` — so staleness compares the
     bare dotted version. Returns ``""`` when nothing version-shaped
     leads the string.
     """

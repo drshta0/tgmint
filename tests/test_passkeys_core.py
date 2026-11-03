@@ -36,6 +36,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import tgmint.passkeys_core as core
 from tgmint.passkeys_core import (
@@ -1894,6 +1895,243 @@ class FullFlowFakeDriverTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.user_id, 123456789)
         self.assertEqual(calls, ["initPasskeyRegistration", "registerPasskey",
                                  "initPasskeyLogin", "finishPasskeyLogin"])
+
+
+# ---------------------------------------------------------------------------
+# 9. regression tests for the 2026-11 code review findings (core only)
+# ---------------------------------------------------------------------------
+
+class AllowListEncodingRegressionTest(unittest.TestCase):
+    """The allow-list must compare decoded credential ids, not b64url text."""
+
+    def _store(self):
+        cred = SoftwareAuthenticator.create_credential(
+            REGISTRATION_OPTIONS, alg=ALG_ES256)
+        return PasskeyStore.from_credential(cred)
+
+    def test_a_padded_or_re_spelled_server_id_is_accepted(self):
+        store = self._store()
+        canonical = core._b64u_encode(store.credential_id)
+        for spelling in (
+            canonical,
+            canonical + "=",
+            canonical + "==",                                     # over-padded
+            canonical.replace("-", "+").replace("_", "/"),        # std base64
+        ):
+            with self.subTest(spelling=spelling):
+                assertion = store.produce_assertion(
+                    login_options(b"\x21" * 32, spelling))
+                self.assertEqual(assertion["id"], canonical)
+
+    def test_another_credential_is_still_rejected(self):
+        store = self._store()
+        with self.assertRaises(core.PasskeyRejectedError):
+            store.produce_assertion(
+                login_options(b"\x22" * 32, core._b64u_encode(b"\x02" * 32) + "=="))
+
+    def test_unreadable_allow_list_entries_do_not_break_the_ceremony(self):
+        store = self._store()
+        options = json.loads(
+            login_options(b"\x23" * 32, core._b64u_encode(store.credential_id)))
+        options["allowCredentials"].insert(0, {"type": "public-key"})
+        options["allowCredentials"].insert(1, {"type": "public-key", "id": None})
+        assertion = store.produce_assertion(json.dumps(options))
+        self.assertEqual(assertion["id"], core._b64u_encode(store.credential_id))
+
+
+class SignCountRegressionTest(unittest.TestCase):
+    """An out-of-range or corrupt counter is a PasskeyError, never struct.error,
+    and a negative counter is refused instead of silently floored."""
+
+    def _store(self, sign_count):
+        cred = SoftwareAuthenticator.create_credential(
+            REGISTRATION_OPTIONS, alg=ALG_ES256)
+        store = PasskeyStore.from_credential(cred)
+        store.sign_count = sign_count
+        return store
+
+    def _options(self, store):
+        return login_options(b"\x24" * 32, core._b64u_encode(store.credential_id))
+
+    def test_counter_overflow_is_a_passkey_error(self):
+        store = self._store(0xFFFFFFFF)
+        with self.assertRaises(core.PasskeyError) as ctx:
+            store.produce_assertion(self._options(store))
+        self.assertIn("overflow", str(ctx.exception))
+        self.assertEqual(store.sign_count, 0xFFFFFFFF)   # never advanced
+
+    def test_the_last_usable_counter_still_signs(self):
+        store = self._store(0xFFFFFFFE)
+        assertion = store.produce_assertion(self._options(store))
+        _, _, sign_count, _, _ = parse_auth_data(assertion["authenticator_data"])
+        self.assertEqual(sign_count, 0xFFFFFFFF)
+        self.assertEqual(store.sign_count, 0xFFFFFFFF)
+
+    def test_a_negative_counter_is_refused_not_floored(self):
+        for bad in (-1, -1000):
+            with self.subTest(bad=bad):
+                store = self._store(bad)
+                with self.assertRaises(core.PasskeyError) as ctx:
+                    store.produce_assertion(self._options(store))
+                self.assertIn("negative", str(ctx.exception))
+                self.assertEqual(store.sign_count, bad)   # not rewritten
+
+    def test_a_non_integer_counter_is_refused(self):
+        for bad in ("7", None, 1.5, True):
+            with self.subTest(bad=bad):
+                store = self._store(bad)
+                with self.assertRaises(core.PasskeyError):
+                    store.produce_assertion(self._options(store))
+
+    def test_the_auth_data_packer_wraps_struct_errors(self):
+        for bad in (1 << 32, -1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(core.PasskeyError):
+                    core._authenticator_data("web.telegram.org", 0x05, bad)
+
+
+class SavePermissionsRegressionTest(unittest.TestCase):
+    """A save that fails must not chmod a path it never wrote."""
+
+    def _store(self):
+        cred = SoftwareAuthenticator.create_credential(
+            REGISTRATION_OPTIONS, alg=ALG_ES256)
+        return PasskeyStore.from_credential(cred)
+
+    def test_a_failed_save_leaves_the_directory_mode_alone(self):
+        store = self._store()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "store")
+            os.mkdir(target)
+            os.chmod(target, 0o755)
+            before = os.stat(target).st_mode & 0o777
+            with self.assertRaises(OSError):
+                store.save(target)        # os.replace cannot clobber a directory
+            self.assertEqual(os.stat(target).st_mode & 0o777, before)
+            # and the half-written temp file is gone, not left in the parent
+            self.assertEqual(sorted(os.listdir(tmp)), ["store"])
+
+    def test_a_successful_save_still_tightens_a_loose_file(self):
+        store = self._store()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.json")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write("{}")
+            os.chmod(path, 0o644)
+            store.save(path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+
+class _BadUserHandleServer(FakeTelegramServer):
+    """A server whose registration options carry an undecodable user handle."""
+
+    def _handle_initPasskeyRegistration(self, wire):
+        options = core.parse_result(
+            "initPasskeyRegistration", super()._handle_initPasskeyRegistration(wire))
+        payload = json.loads(options)
+        payload["user"]["id"] = core._b64u_encode(b"not-a-dc-user-handle")
+        return (
+            struct.pack("<I", 0xE16B5CE1)
+            + struct.pack("<I", 0x7D748D04)
+            + TLObject.serialize_bytes(json.dumps(payload))
+        )
+
+
+class RegistrationAtomicityRegressionTest(unittest.IsolatedAsyncioTestCase):
+    """Registration checks everything it can locally before the irreversible
+    server call, and compensates when the store write still fails."""
+
+    async def test_missing_store_directory_is_refused_before_any_call(self):
+        server = FakeTelegramServer()
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "does-not-exist", "k.json")
+            with self.assertRaises(core.PasskeyError) as ctx:
+                await core.register_passkey_core(BytesDriver(server), store_path=missing)
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertEqual(server.handled, [])
+
+    async def test_a_directory_store_path_is_refused_before_any_call(self):
+        server = FakeTelegramServer()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(core.PasskeyError) as ctx:
+                await core.register_passkey_core(BytesDriver(server), store_path=tmp)
+        self.assertIn("directory", str(ctx.exception))
+        self.assertEqual(server.handled, [])
+
+    async def test_an_undecodable_user_handle_fails_before_registerpasskey(self):
+        server = _BadUserHandleServer()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(core.PasskeyError):
+                await core.register_passkey_core(
+                    BytesDriver(server), store_path=os.path.join(tmp, "k.json"))
+            self.assertEqual(sorted(os.listdir(tmp)), [])
+        # the options were fetched, the irreversible call never happened
+        self.assertEqual(server.handled, ["initPasskeyRegistration"])
+        self.assertEqual(server.passkeys, {})
+
+    async def test_a_failed_save_deletes_the_server_side_passkey(self):
+        server = FakeTelegramServer()
+        driver = BytesDriver(server)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.json")
+            with mock.patch.object(
+                core.PasskeyStore, "save", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError) as ctx:
+                    await core.register_passkey_core(driver, store_path=path)
+            self.assertEqual(str(ctx.exception), "disk full")
+            self.assertFalse(os.path.exists(path))
+        # the account is not left holding a passkey whose key exists nowhere
+        self.assertEqual(
+            server.handled,
+            ["initPasskeyRegistration", "registerPasskey", "deletePasskey"])
+        self.assertEqual(server.passkeys, {})
+
+    async def test_a_failed_compensating_delete_does_not_mask_the_save_error(self):
+        server = FakeTelegramServer()
+        server.corrupt["deletePasskey"] = struct.pack("<I", 0x12345678)  # not a Bool
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                core.PasskeyStore, "save", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError) as ctx:
+                    await core.register_passkey_core(
+                        BytesDriver(server), store_path=os.path.join(tmp, "k.json"))
+        self.assertEqual(str(ctx.exception), "disk full")
+        self.assertIn("deletePasskey", server.handled)
+
+
+class AlgorithmOverrideRegressionTest(unittest.TestCase):
+    """`alg=` may only pick an algorithm the server actually offered."""
+
+    def test_an_offered_algorithm_is_accepted(self):
+        for alg in (ALG_ES256, ALG_ED25519):
+            with self.subTest(alg=alg):
+                cred = SoftwareAuthenticator.create_credential(
+                    REGISTRATION_OPTIONS, alg=alg)
+                self.assertEqual(cred.alg, alg)
+
+    def test_an_algorithm_the_server_never_offered_is_rejected(self):
+        options = json.loads(REGISTRATION_OPTIONS)
+        options["pubKeyCredParams"] = [{"type": "public-key", "alg": -7}]
+        with self.assertRaises(core.PasskeyError) as ctx:
+            SoftwareAuthenticator.create_credential(
+                json.dumps(options), alg=ALG_ED25519)
+        self.assertIn("never offered", str(ctx.exception))
+
+    def test_a_foreign_or_malformed_algorithm_is_rejected(self):
+        for bad in (-257, "ed25519", True, None):
+            with self.subTest(bad=bad):
+                options = json.loads(REGISTRATION_OPTIONS)
+                if bad is None:
+                    # None means "no override" — pick_algorithm decides
+                    self.assertEqual(
+                        SoftwareAuthenticator.create_credential(
+                            json.dumps(options), alg=None).alg, ALG_ES256)
+                    continue
+                with self.assertRaises(core.PasskeyError):
+                    SoftwareAuthenticator.create_credential(
+                        json.dumps(options), alg=bad)
 
 
 if __name__ == "__main__":

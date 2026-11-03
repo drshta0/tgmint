@@ -31,7 +31,14 @@ Format facts (from telethon's own ``sessions/string.py`` and
   newer ones (TGConvertor's compatibility choice, kept deliberately);
 * ``user_id`` is never stored in the ``sessions`` table (cached entities
   include contacts, so none of them is a reliable owner) — reads return
-  ``user_id=None``.
+  ``user_id=None``;
+* ``dc_id`` is authoritative for the endpoint: Telethon packs a *binary*
+  IP, so an absent address — and one it cannot represent, i.e. a hostname
+  carried over from a GramJS session — resolves to the canonical address of
+  that data center (``test_mode`` decides the test/production table).
+  ``dc2.telegram.org`` therefore converts cleanly to a Telethon string or
+  file; the dc's own address is written.  Writing still fails loudly when
+  the ``dc_id`` itself is not a known data center (nothing to fall back to).
 """
 
 from __future__ import annotations
@@ -76,23 +83,58 @@ CREATE TABLE update_state (id INTEGER PRIMARY KEY, pts INTEGER, qts INTEGER, dat
 """
 
 
-def _resolve_endpoint(data: SessionData) -> typing.Tuple[str, int, int]:
-    """Resolve (address, port, packed-IP length) with Telethon defaults."""
-    if data.server_address is None:
-        address, default_port = data_center(data.dc_id, data.test_mode, ipv6=False)
-    else:
-        address, default_port = data.server_address, 80 if data.test_mode else 443
-    port = default_port if data.port is None else data.port
+def _is_ip(address: typing.Any) -> bool:
+    """True when `address` is a real IPv4/IPv6 address (not a hostname)."""
     try:
-        packed_host = ipaddress.ip_address(address).packed
-    except ValueError:
-        raise CodecError(
-            "Telethon sessions store an IPv4/IPv6 address, not a hostname "
-            f"(got {address!r})"
-        ) from None
+        ipaddress.ip_address(address)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _resolve_endpoint(data: SessionData) -> typing.Tuple[str, int, int]:
+    """Resolve (address, port, packed-IP length) for a Telethon endpoint.
+
+    ``dc_id`` is authoritative: Telethon packs a *binary* IP, so an absent
+    address **and** an unrepresentable one (a hostname — GramJS sessions may
+    carry ``dc2.telegram.org``) both resolve to the canonical address of the
+    data center the auth key belongs to, honouring ``test_mode``.  Only a
+    format that cannot name a dc at all still fails.
+    """
+    if data.server_address is not None and _is_ip(data.server_address):
+        address: str = str(ipaddress.ip_address(data.server_address))
+        default_port = 80 if data.test_mode else 443
+    else:
+        address, default_port = data_center(data.dc_id, data.test_mode, ipv6=False)
+    port = default_port if data.port is None else data.port
+    packed_host = ipaddress.ip_address(address).packed
     if type(port) is not int or not 0 < port <= 65535:
         raise CodecError("port must be an integer between 1 and 65535")
-    return str(ipaddress.ip_address(address)), port, len(packed_host)
+    return address, port, len(packed_host)
+
+
+def _read_endpoint(dc_id: int, address: typing.Any) -> str:
+    """Resolve a *stored* address to a usable IP, or fail clearly.
+
+    A NULL/absent ``server_address`` is a broken row (the authorization was
+    never completed): that is a :class:`CodecError`, not a raw
+    ``ValueError`` out of :mod:`ipaddress`.  A hostname is tolerated — it
+    cannot be packed into a v1 string, so the dc_id's own address stands in.
+    """
+    if address is None:
+        raise CodecError(
+            "Telethon session row has no server_address; the file was never "
+            "authorized (log in with the client once)"
+        )
+    if _is_ip(address):
+        return str(ipaddress.ip_address(address))
+    try:
+        return data_center(dc_id, False, ipv6=False)[0]
+    except CodecError:
+        raise CodecError(
+            f"Telethon session row stores {address!r}, which is not an IP "
+            f"address, and data center {dc_id} has no known address"
+        ) from None
 
 
 def read_string(string: str) -> SessionData:
@@ -151,10 +193,22 @@ def read_sqlite(path: typing.Union[str, Path]) -> SessionData:
     address = row["server_address"]
     port = row["port"]
     auth_key = row["auth_key"]
-    if not isinstance(auth_key, bytes):  # e.g. stored as memoryview/str
-        auth_key = bytes(auth_key)
+    if auth_key is None:
+        # `bytes(None)` would raise TypeError; a NULL key is a broken file
+        raise CodecError(
+            "Telethon session row has no auth_key; the file was never "
+            "authorized (log in with the client once)"
+        )
+    if not isinstance(auth_key, bytes):
+        try:  # e.g. stored as memoryview/str
+            auth_key = bytes(auth_key)
+        except (TypeError, ValueError):
+            raise CodecError(
+                "Telethon session row has an auth_key of the wrong type; "
+                "expected a BLOB of 256 bytes"
+            ) from None
     validate(row["dc_id"], auth_key)
-    host = str(ipaddress.ip_address(address))
+    host = _read_endpoint(row["dc_id"], address)
     return SessionData(
         dc_id=row["dc_id"],
         auth_key=auth_key,

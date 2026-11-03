@@ -22,7 +22,6 @@ class DeviceInfo(object):
 class SystemInfo(BaseObject):
 
     deviceList: List[DeviceInfo] = []
-    device_modesl: List[str] = []
     system_versions: List[str] = []
 
     def __init__(self) -> None:
@@ -53,10 +52,6 @@ class SystemInfo(BaseObject):
         byteid = os.urandom(32) if unique_id == None else unique_id.encode("utf-8")
 
         return int(hashlib.sha1(byteid).hexdigest(), 16) % (10 ** 12)
-
-    @classmethod
-    def _hashtorange(cls, hash_id: int, max, min=0):
-        return hash_id % (max - min) + min
 
     @classmethod
     def _hashtovalue(cls, hash_id: int, values: List[_T]) -> _T:
@@ -1009,6 +1004,13 @@ class LinuxDevice(GeneralDesktopDevice):
             # refreshed 2026-10: same junk-placeholder filter as WindowsDevice
             for version in cls.system_versions:
                 for model in _clean_board_models(cls.device_models):
+                    # same board-string normalization as WindowsDevice: the
+                    # SMBIOS product name tdesktop reports has its
+                    # underscores dropped and repeated spaces collapsed, and
+                    # both desktop pools must agree on the wire string for
+                    # the same board (Linux used to keep "Z97_A" style
+                    # names Windows had already cleaned).
+                    model = cls._CleanAndSimplify(model.replace("_", ""))
                     results.append(DeviceInfo(model, version))
 
             cls.deviceList = results
@@ -6152,7 +6154,11 @@ class AndroidDevice(SystemInfo):
     ]
 
     # refreshed 2026-09: Android 12–16 (current install base; 23–30 kept a
-    # current Telegram install looking like a museum)
+    # current Telegram install looking like a museum).
+    # This list is the SDK ceiling/floor of the pool: __gen__ only emits a
+    # row for an SDK named here, so the per-model _SDK_RANGES windows below
+    # can never widen the pool beyond what this list allows (an SDK missing
+    # here simply produces no rows).
     system_versions = [
         "SDK 31",
         "SDK 32",
@@ -6230,7 +6236,12 @@ class AndroidDevice(SystemInfo):
             # dedupe device_models preserving order (the raw crawl has ~420
             # duplicate strings, some up to x5/x6), then keep only models
             # with a verified SDK window — first matching rule wins,
-            # unknown = excluded
+            # unknown = excluded. The declared system_versions list is the
+            # outer bound: an SDK it does not name is never emitted, so the
+            # per-model ranges can only narrow the pool, never widen it.
+            allowed_sdks = {
+                int(entry.split()[1]) for entry in cls.system_versions
+            }
             seen = set()
             for model in cls.device_models:
                 if model in seen:
@@ -6240,6 +6251,8 @@ class AndroidDevice(SystemInfo):
                 for pattern, min_sdk, max_sdk in cls._SDK_RANGES:
                     if pattern.search(model):
                         for sdk in range(min_sdk, max_sdk + 1):
+                            if sdk not in allowed_sdks:
+                                continue
                             results.append(DeviceInfo(model, f"SDK {sdk}"))
                         break
 

@@ -147,27 +147,6 @@ class extend_class(object):  # nocov
         return decorated_cls
 
     @staticmethod
-    def object_hierarchy_getattr(obj: object, attributeName: str) -> List[str]:
-
-        results = []
-        if type(obj) == object:
-            return results
-
-        if attributeName in obj.__dict__:
-            val = obj.__dict__[attributeName]
-            results.append({"owner": obj, "value": val})
-
-        if attributeName in obj.__class__.__dict__:
-            val = obj.__class__.__dict__[attributeName]
-            results.append({"owner": obj, "value": val})
-
-        for base in obj.__bases__:  # type: ignore
-            results += extend_class.object_hierarchy_getattr(base, attributeName)
-
-        results.reverse()
-        return results
-
-    @staticmethod
     def getattr(obj: object, attributeName: str) -> Optional[dict]:
         try:
             value = getattr(obj, attributeName)
@@ -195,8 +174,8 @@ class sharemethod(type):
         self.__owner__ = obj if obj else cls
         return self
 
-    def __call__(self, *args) -> Any:
-        return self.__fget__.__get__(self.__owner__)(*args)  # type: ignore
+    def __call__(self, *args, **kwargs) -> Any:
+        return self.__fget__.__get__(self.__owner__)(*args, **kwargs)  # type: ignore
 
     def __set_name__(self, owner, name):
         self.__owner__ = owner

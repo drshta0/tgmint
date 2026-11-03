@@ -24,7 +24,6 @@ the per-instance random ``_settingsKey`` survives and the bot-storage
 count cap rejects implausible counts.
 """
 import inspect
-import logging
 import os
 import tempfile
 import unittest
@@ -244,9 +243,16 @@ class TestUnknownKeyTolerance(unittest.TestCase):
         md.read(td.localKey, QByteArray())
         return md
 
-    def test_unknown_keytype_warns_and_continues(self):
-        # our (pre-existing) tolerance for unknown keys is warn-and-continue:
-        # an unknown key with no payload must not abort the map read
+    def test_unknown_keytype_fails_the_map_read(self):
+        # tdesktop has no default-consume path: an unknown key type makes
+        # the whole map read fail (`default: return ReadMapResult::Failed`
+        # in storage_account.cpp) because the payload length is unknowable.
+        # The old fork behaviour (log a warning, keep going) left the stream
+        # 8+ bytes behind the real entry boundary and parsed every
+        # following entry out of the middle of a payload — silent garbage
+        # instead of an error. Wallet keys 0x1F-0x21, which used to hit
+        # that path, are consumed explicitly now (see
+        # TestWalletKeysRoundtrip), so what is left here really is unknown.
         with tempfile.TemporaryDirectory() as tmp:
             td = _build_tdesktop()
             td.SaveTData(tmp)
@@ -257,9 +263,37 @@ class TestUnknownKeyTolerance(unittest.TestCase):
             stream.writeUInt32(lskType.lskUserSettings)
             stream.writeUInt64(0x1234)
 
-            with self.assertLogs(level=logging.WARNING):
-                md = self._run_with_payload(tmp, td, data)
-            self.assertEqual(md._settingsKey, 0x1234)
+            with self.assertRaises(TDataBadConfigData):
+                self._run_with_payload(tmp, td, data)
+
+    def test_implausible_draft_count_rejected(self):
+        # parser-DoS cap: a declared count of ~4G drafts used to spin the
+        # per-entry loop (the stream status is only checked once per key
+        # TYPE, i.e. after the loop) instead of failing fast
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream.writeUInt32(lskType.lskDraft)
+            stream.writeUInt32(0xFFFFFFFF)
+
+            with self.assertRaises(TDataBadConfigData):
+                self._run_with_payload(tmp, td, data)
+
+    def test_implausible_legacy_images_count_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream.writeUInt32(lskType.lskLegacyImages)
+            stream.writeUInt32(0x7FFFFFFF)
+
+            with self.assertRaises(TDataBadConfigData):
+                self._run_with_payload(tmp, td, data)
 
     def test_bot_storages_implausible_count_rejected(self):
         # parser-DoS cap in the spirit of the mtp-authorization key-count
@@ -296,6 +330,159 @@ class TestMaxAccounts(unittest.TestCase):
     def test_kmaxaccounts_is_six(self):
         # real Telegram Desktop (Premium) account cap
         self.assertEqual(TDesktop.kMaxAccounts, 6)
+
+
+class TestLegacyBackgroundKeyOldOld(unittest.TestCase):
+    """lskBackgroundOldOld (0x08) — review finding 'old map key 0x08
+    -> TypeError'.
+
+    tdesktop reads ONE quint64 here (storage_account.cpp: `stream >>
+    (Window::Theme::IsNightMode() ? legacyBackgroundKeyNight :
+    legacyBackgroundKeyDay)`). The fork did `map.stream >>
+    legacyBackgroundKeyDay`, the QByteArray operator, so the int raised
+    TypeError — which is NOT an OpenTeleException and therefore escaped
+    every handler on the tdata load path.
+    """
+
+    def _read_raw(self, tmp, td, payload):
+        _write_raw_map(tmp, td.localKey, payload)
+        md = MapData(_map_dir(tmp))
+        md.read(td.localKey, QByteArray())
+        return md
+
+    def test_single_key_is_consumed_without_typeerror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream.writeUInt32(lskType.lskBackgroundOldOld)
+            stream.writeUInt64(0xABCDEF)
+            stream.writeUInt32(lskType.lskUserSettings)
+            stream.writeUInt64(0x5E77E75)  # written AFTER the 0x08 entry
+
+            md = self._read_raw(tmp, td, data)
+            self.assertEqual(md._legacyBackgroundKeyDay, 0xABCDEF)
+            # the entry after it must still be readable (no desync)
+            self.assertEqual(md._settingsKey, 0x5E77E75)
+
+    def test_background_old_reads_two_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream.writeUInt32(lskType.lskBackgroundOld)
+            stream.writeUInt64(0x1111)
+            stream.writeUInt64(0x2222)
+
+            md = self._read_raw(tmp, td, data)
+            self.assertEqual(md._legacyBackgroundKeyDay, 0x1111)
+            self.assertEqual(md._legacyBackgroundKeyNight, 0x2222)
+
+
+class TestWalletKeysRoundtrip(unittest.TestCase):
+    """lskWalletKey (0x1F), lskWalletEngineKey (0x20) and
+    lskWalletEngineStorages (0x21) — review finding 'unknown map keys
+    (wallet 0x1F/0x20/0x21) not consumed -> whole map desyncs'.
+
+    Payloads per tdesktop storage_account.cpp: 0x1F/0x20 carry one quint64
+    FileKey; 0x21 carries a quint32 count of (FileKey quint64, QString)
+    entries.
+    """
+
+    def test_wallet_keys_are_consumed_and_map_survives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream.writeUInt32(lskType.lskWalletKey)
+            stream.writeUInt64(0x1234)
+            stream.writeUInt32(lskType.lskWalletEngineKey)
+            stream.writeUInt64(0x5678)
+            stream.writeUInt32(lskType.lskWalletEngineStorages)
+            stream.writeUInt32(2)
+            stream.writeUInt64(0xAAA)
+            stream.writeQString("wallet:secrets")
+            stream.writeUInt64(0xBBB)
+            stream.writeQString("wallet:journal")
+            # every entry after the wallet block must still be readable
+            stream.writeUInt32(lskType.lskUserSettings)
+            stream.writeUInt64(0x5E77E75)
+
+            _write_raw_map(tmp, td.localKey, data)
+            md = MapData(_map_dir(tmp))
+            md.read(td.localKey, QByteArray())
+
+            self.assertEqual(md._settingsKey, 0x5E77E75)
+            self.assertEqual(
+                {k: int(v) for k, v in md._walletEngineStoragesMap.items()},
+                {"wallet:secrets": 0xAAA, "wallet:journal": 0xBBB},
+            )
+
+    def test_wallet_engine_storages_survive_save(self):
+        # re-saving must not drop the wallet map (tdesktop writes it just
+        # before lskBotStorages)
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            md = MapData(_map_dir(tmp))
+            md._walletEngineStoragesMap["wallet:secrets"] = FileKey(0xAAA)
+            _rewrite_map(tmp, td.localKey, md)
+
+            got = TDesktop(tmp).mainAccount.MapData
+            self.assertEqual(
+                {k: int(v) for k, v in got._walletEngineStoragesMap.items()},
+                {"wallet:secrets": 0xAAA},
+            )
+
+
+class TestSelfSerializedRoundtrip(unittest.TestCase):
+    """lskSelfSerialized (0x15) — review finding 'lskSelfSerialized
+    parsed and discarded'.
+
+    The own-user record was read into a local, thrown away, and never
+    written back, so load -> save silently dropped it. tdesktop keeps it
+    and writes it as the FIRST map entry.
+    """
+
+    def test_self_record_survives_a_save_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            payload = QByteArray(b"\x00\x00\x00\x02\x08\x01\x00\x00\x07test")
+            md = MapData(_map_dir(tmp))
+            md._selfSerialized = payload
+            _rewrite_map(tmp, td.localKey, md)
+
+            got = TDesktop(tmp).mainAccount.MapData
+            self.assertEqual(bytes(got._selfSerialized), bytes(payload))
+
+    def test_self_record_is_the_first_entry(self):
+        # tdesktop: `if (!self.isEmpty()) mapData.stream <<
+        # quint32(lskSelfSerialized) << self;` comes before every other key
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            td.SaveTData(tmp)
+
+            md = MapData(_map_dir(tmp))
+            md._selfSerialized = QByteArray(b"self-record")
+            md._settingsKey = FileKey(0x99)
+            descriptor = md.prepareToWrite()
+            raw = bytes(descriptor.data)
+            # data layout: [uint32 len][payload]; payload starts after it
+            payload = raw[4:]
+            import struct as _struct
+
+            self.assertEqual(
+                _struct.unpack(">I", payload[:4])[0], lskType.lskSelfSerialized
+            )
 
 
 if __name__ == "__main__":

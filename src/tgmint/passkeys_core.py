@@ -175,6 +175,27 @@ def _b64u_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
+def _allow_list_ids(allow: Any) -> set:
+    """The credential ids of a ``allowCredentials`` list, as raw bytes.
+
+    WebAuthn's ``PublicKeyCredentialDescriptor.id`` is opaque bytes encoded
+    as base64url, and the server is free to pad or spell it differently from
+    us: compare decoded values, not strings. Entries that carry no usable
+    string id (or one that is not valid base64) simply cannot match ours and
+    are skipped instead of failing the whole ceremony.
+    """
+    ids = set()
+    for candidate in allow:
+        raw = candidate.get("id") if isinstance(candidate, dict) else None
+        if not isinstance(raw, str):
+            continue
+        try:
+            ids.add(_b64u_decode(raw))
+        except Exception:  # binascii.Error, ValueError — not a credential id
+            continue
+    return ids
+
+
 def _sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
@@ -297,13 +318,32 @@ def _key_from_pem(pem: str) -> Any:
     return serialization.load_pem_private_key(pem.encode("ascii"), password=None)
 
 
+def _pack_sign_count(sign_count: Any) -> bytes:
+    """The 4-byte big-endian WebAuthn signature counter.
+
+    The WebAuthn spec makes it a uint32 and the server rejects anything
+    else, so an out-of-range value is a :class:`PasskeyError` about the
+    counter — not a bare ``struct.error`` from four frames down.
+    """
+    if isinstance(sign_count, bool) or not isinstance(sign_count, int):
+        raise PasskeyError(
+            f"sign_count must be an int, got {type(sign_count).__name__}"
+        )
+    if not 0 <= sign_count <= 0xFFFFFFFF:
+        raise PasskeyError(
+            f"sign_count {sign_count} does not fit the WebAuthn uint32 "
+            "counter (0..4294967295)"
+        )
+    return struct.pack(">I", sign_count)
+
+
 def _authenticator_data(
     rp_id: str,
     flags: int,
     sign_count: int,
     attested: Optional[Tuple[bytes, bytes]] = None,
 ) -> bytes:
-    data = _sha256(rp_id.encode("ascii")) + bytes([flags]) + struct.pack(">I", sign_count)
+    data = _sha256(rp_id.encode("ascii")) + bytes([flags]) + _pack_sign_count(sign_count)
     if attested is not None:
         credential_id, cose_public = attested
         # aaguid all-zero (unspecified) + credIdLen + credId + COSE key
@@ -345,6 +385,32 @@ class SoftwareAuthenticator:
             f"(offered: {offered}, supported: {list(_SUPPORTED_ALGS)})"
         )
 
+    @staticmethod
+    def validate_override_algorithm(options: Dict[str, Any], alg: Any) -> int:
+        """Check an explicit ``alg`` override against the server's offer.
+
+        The server's ``pubKeyCredParams`` is the set of signature algorithms
+        it will accept for this account; registering with an algorithm it
+        never offered produces an attestation it rejects (or, worse, one it
+        stores and can never verify). So an override is validated exactly
+        like :meth:`pick_algorithm`'s own choice — the override only decides
+        *which* of the offered algorithms to use.
+        """
+        offered = [p.get("alg") for p in options.get("pubKeyCredParams") or []]
+        if isinstance(alg, bool) or not isinstance(alg, int):
+            raise PasskeyError(f"alg must be an int, got {alg!r}")
+        if alg not in _SUPPORTED_ALGS:
+            raise PasskeyError(
+                f"unsupported algorithm {alg}; supported: {list(_SUPPORTED_ALGS)}"
+            )
+        if alg not in offered:
+            raise PasskeyError(
+                f"the server never offered algorithm {alg} for this account "
+                f"(pubKeyCredParams: {offered}); drop the alg= override or "
+                "pick one of those"
+            )
+        return alg
+
     @classmethod
     def create_credential(
         cls,
@@ -372,6 +438,8 @@ class SoftwareAuthenticator:
             user_handle = raw_user_handle
         if alg is None:
             alg = cls.pick_algorithm(options)
+        else:
+            alg = cls.validate_override_algorithm(options, alg)
 
         priv, cose_public = _new_keypair(alg)
         credential_id = os.urandom(32)
@@ -424,14 +492,41 @@ class SoftwareAuthenticator:
             )
         allow = options.get("allowCredentials") or []
         if allow:
-            ids = {c.get("id") for c in allow}
-            if _b64u_encode(store.credential_id) not in ids:
+            # Compare the *decoded* credential ids, never the base64url
+            # spellings: the server may answer a padded or otherwise
+            # non-canonical encoding of the very same id (and WebAuthn
+            # treats ".id" as opaque bytes), so a string comparison would
+            # reject a perfectly valid credential.
+            offered = _allow_list_ids(allow)
+            if store.credential_id not in offered:
                 raise PasskeyRejectedError(
                     "this passkey is not in the server's allow-list "
-                    "(deleted from the account, or a different account)"
+                    f"(ours: {_b64u_encode(store.credential_id)!r}, "
+                    f"server offered {len(offered)} id(es)) — deleted from the "
+                    "account, or a different account"
                 )
 
-        sign_count = max(store.sign_count, 0) + 1
+        stored_count = store.sign_count
+        if isinstance(stored_count, bool) or not isinstance(stored_count, int):
+            raise PasskeyError(
+                f"the stored signature counter is not an int "
+                f"({stored_count!r}); the passkey file is corrupt"
+            )
+        if stored_count < 0:
+            # max(counter, 0) + 1 used to silently roll a corrupt counter
+            # back to 1, which hides a corrupted/replayed store file.
+            raise PasskeyError(
+                f"the stored signature counter is negative ({stored_count}); "
+                "the passkey file is corrupt — restore it from a backup "
+                "instead of logging in with a rolled-back counter"
+            )
+        sign_count = stored_count + 1
+        if sign_count > 0xFFFFFFFF:
+            raise PasskeyError(
+                f"the signature counter would overflow the WebAuthn uint32 "
+                f"counter ({stored_count} + 1); the passkey has been used "
+                "4294967295 times, so start over with a fresh registration"
+            )
         client_data_json = _dump_json({
             "type": "webauthn.get",
             "challenge": options["challenge"],
@@ -590,8 +685,13 @@ class PasskeyStore:
                     os.unlink(tmp)
                 except OSError:
                     pass
-            # covers pre-existing files that may have looser permissions
-            os.chmod(path, 0o600)
+        # Only a *successful* save touches the destination: the chmod used to
+        # sit in the `finally`, so a save that never wrote anything (bad
+        # path, a directory that is not writable) still chmod'ed whatever the
+        # path happened to be — a caller's directory became 0600.
+        # The temp file was created 0600, so os.replace already installed a
+        # 0600 inode; this only covers a pre-existing looser file.
+        os.chmod(path, 0o600)
         return path
 
     @classmethod
@@ -1786,6 +1886,41 @@ async def fetch_login_challenge(invoker: PasskeyInvoker, *, api_id: int, api_has
     )
 
 
+def _preflight_store_path(store_path: Any) -> str:
+    """Fail a registration *before* any network call when the store is unusable.
+
+    ``PasskeyStore.save`` writes a temp file next to the destination and then
+    ``os.replace``s it, so the destination directory must exist, be a
+    directory and be writable, and the destination itself must not be a
+    directory. Checking that up front means the server is never asked to
+    register a credential whose private key could not be stored — which would
+    leave an orphaned passkey on the account and make a retry register a
+    second one.
+    """
+    if not isinstance(store_path, str) or not store_path:
+        raise PasskeyError("store_path is required (where the passkey file is written)")
+    path = os.path.abspath(store_path)
+    directory = os.path.dirname(path)
+    if os.path.isdir(path):
+        raise PasskeyError(
+            f"the passkey store path {store_path!r} is a directory; pass a "
+            "file path, not a folder"
+        )
+    if not os.path.isdir(directory):
+        raise PasskeyError(
+            f"the passkey store directory {directory!r} does not exist; "
+            "create it first — registering now would leave a passkey on the "
+            "account whose private key is stored nowhere"
+        )
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise PasskeyError(
+            f"the passkey store directory {directory!r} is not writable; "
+            "registering now would leave a passkey on the account whose "
+            "private key is stored nowhere"
+        )
+    return store_path
+
+
 async def register_passkey_core(
     invoker: PasskeyInvoker,
     *,
@@ -1806,19 +1941,45 @@ async def register_passkey_core(
     atomic-and-0600 writer as everywhere else in this module. The file is
     interchangeable with :class:`tgmint.passkeys.PasskeyStore`.
 
+    Registration is not atomic on the server — ``registerPasskey`` itself is
+    irreversible — so everything that *can* be checked locally is checked
+    first: the store directory (before any network call) and the credential's
+    user handle (before ``registerPasskey``). If the store write still fails
+    after the server accepted the credential, the server copy is deleted again
+    with a compensating ``deletePasskey`` (best effort) so a retry registers a
+    fresh passkey instead of leaving an orphan behind; the original save error
+    is what the caller sees.
+
     Returns ``(server_passkey_info, store)``.
     """
-    if not isinstance(store_path, str) or not store_path:
-        raise PasskeyError("store_path is required (where the passkey file is written)")
+    _preflight_store_path(store_path)
     options_json = await fetch_registration_options(invoker)
     cred = SoftwareAuthenticator.create_credential(options_json, origin=origin, alg=alg)
-    info = await _invoke(invoker, "registerPasskey", registration_fields(cred))
-    if not isinstance(info, PasskeyInfo):  # defensive: _adopt_result guarantees it
-        raise PasskeyError(f"registerPasskey returned {type(info).__name__}, not PasskeyInfo")
+    # Build the store *before* the irreversible call: PasskeyStore rejects an
+    # undecodable user handle (a store we could never save meaningfully), and
+    # that rejection must not arrive after the account already holds the key.
     store = PasskeyStore.from_credential(cred, path=store_path)
     store.name = name
-    store.telegram_passkey_id = info.id
-    store.save()
+
+    info = await _invoke(invoker, "registerPasskey", registration_fields(cred))
+    try:
+        if not isinstance(info, PasskeyInfo):  # defensive: _adopt_result guarantees it
+            raise PasskeyError(
+                f"registerPasskey returned {type(info).__name__}, not PasskeyInfo"
+            )
+        store.telegram_passkey_id = info.id
+        store.save()
+    except BaseException:
+        # The account now holds a passkey whose private key exists nowhere:
+        # take the server copy back out (best effort) and surface the original
+        # error — a failed save must not be masked by a failed cleanup.
+        passkey_id = getattr(info, "id", None)
+        if isinstance(passkey_id, str) and passkey_id:
+            try:
+                await delete_passkey_core(invoker, passkey_id)
+            except Exception:
+                pass
+        raise
     return info, store
 
 

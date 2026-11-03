@@ -14,9 +14,12 @@ that and nothing else:
 4. if it does not: sign in with the passkey on a client minted from the
    *recorded* fingerprint (the session's sidecar, or the envelope's
    fingerprint; a fresh minted identity when neither exists),
-5. rewrite the session **in place, atomically**, in the same format with
-   the fresh auth key,
-6. report old -> new ``user_id`` and ``dc_id``.
+5. rewrite the session **atomically** with the fresh auth key — in
+   place when the format stays the same, into ``out`` when it does not
+   (converting in place would destroy the original format while the file
+   name kept claiming it),
+6. report old -> new ``user_id`` and ``dc_id``, the placeholders the
+   destination format had to fill (777000 / 2040) and any notes.
 
 Guardrails (deliberate, not configurable)
 -----------------------------------------
@@ -24,6 +27,13 @@ Guardrails (deliberate, not configurable)
 * **one account, one session per invocation** — there is no batch mode,
   no ``--all``, no glob and no daemon loop.  "Heal every session in this
   folder" is exactly the dangerous feature this design refuses.
+* **no in-place format change** — ``to_format`` different from the
+  source format requires ``out``: the original session must survive a
+  conversion, and its extension must keep telling the truth.
+* **no overwriting a session that moved under us** — the file is
+  snapshotted before the read and re-checked before the write; anything
+  else writing that session in the read->login->write window makes the
+  heal refuse instead of silently discarding that change.
 * **no blind re-login** — without ``live=True`` the probe never runs, and
   the caller must say ``force=True`` explicitly to re-login anyway.  A
   probe that fails for a *network* reason (not an auth rejection) also
@@ -60,9 +70,11 @@ Verification status
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import os
 import shutil
+import stat
 import tempfile
 import typing
 from pathlib import Path
@@ -353,16 +365,97 @@ def _passkey_store_user(passkey_path: str) -> typing.Optional[int]:
     return store.user_id
 
 
+def _refuse_symlink(path: typing.Union[str, "os.PathLike[str]"], what: str) -> None:
+    """Refuse a symlinked session path, like ``profile.write_profile`` does.
+
+    ``os.replace`` onto a symlink replaces the *link*, leaving the file it
+    points at untouched — a heal through one would report success while
+    the real session kept its dead auth key.  Refusing (rather than
+    silently resolving) is the safer half of the choice: the operator
+    named a path, and a link is not the file.
+    """
+    target = Path(path)
+    if target.is_symlink():
+        raise HealRefusal(
+            f"{what} {target} is a symlink — rewriting it would replace the "
+            "link, not the session it points at, so nothing would really be "
+            "healed; point at the real file (or move the link away) and re-run"
+        )
+
+
+def _file_snapshot(path: str) -> typing.Optional[typing.Tuple[int, int, str]]:
+    """``(size, mtime_ns, sha256)`` of a regular file, else ``None``."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    try:
+        with open(path, "rb") as fp:
+            digest = hashlib.sha256(fp.read()).hexdigest()
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns, digest)
+
+
+def _require_unchanged(
+    path: str, snapshot: typing.Optional[typing.Tuple[int, int, str]]
+) -> None:
+    """Refuse to overwrite a session that changed during the read→write window.
+
+    Between reading the session, probing it and signing in again, seconds
+    (or minutes) pass.  If something rewrote the file meanwhile — a live
+    client saving it, the operator, another tool — overwriting it would
+    throw that change away, so the heal refuses instead.
+    """
+    if snapshot is None:
+        return
+    current = _file_snapshot(path)
+    if current is None:
+        raise HealRefusal(
+            f"{path}: the session changed while heal was working (it is no "
+            "longer a readable regular file with the bytes that were read); "
+            "refusing to overwrite it — re-run"
+        )
+    if current != snapshot:
+        raise HealRefusal(
+            f"{path}: the session changed while heal was working "
+            f"(read {snapshot[0]} bytes with sha256 {snapshot[2][:12]}…, it "
+            f"now has {current[0]} bytes with sha256 {current[2][:12]}…); "
+            "refusing to overwrite a file that was touched in the meantime — "
+            "re-run when nothing else is writing that session"
+        )
+
+
 def write_session_atomically(
     data: SessionData, path: str, destination_format: str
 ) -> str:
     """Write ``data`` over ``path`` atomically, keeping mode 0600.
 
+    Returns the path written.  The full write result (what the codec
+    reported, including the ``filled`` placeholders and their ``notes``)
+    comes from :func:`_write_session_atomically`; this public wrapper
+    keeps the path-only return the tests and earlier callers used.
+    """
+    return _write_session_atomically(data, path, destination_format)["output"]
+
+
+def _write_session_atomically(
+    data: SessionData, path: str, destination_format: str
+) -> typing.Dict[str, typing.Any]:
+    """Like :func:`write_session_atomically`, returning the write result.
+
     The codec writers never overwrite (that is right for ``convert``), so
     this writes a private temp file *next to the target* and then
     ``os.replace``s it into place — the target is therefore either the old
     session or the new one, never a half-written file.  The temp file is
-    removed on failure.
+    removed on failure.  A symlinked target is refused outright.
+
+    The result is the codec's own dict with ``output`` pointing at the
+    real target: it carries ``filled`` / ``notes`` when the destination
+    format needed a placeholder (777000/2040), so callers can report the
+    placeholder honestly instead of guessing.
     """
     if destination_format == "tdata":
         raise HealRefusal(
@@ -375,6 +468,7 @@ def write_session_atomically(
             f"cannot heal into {destination_format!r}; expected one of "
             f"{list(_HEAL_TARGETS)}"
         )
+    _refuse_symlink(path, "the session path")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(
@@ -384,7 +478,7 @@ def write_session_atomically(
     temporary = Path(name)
     temporary.unlink()  # reserve the name, let the codec writer create it
     try:
-        codec.write_session(
+        result = codec.write_session(
             data,
             str(temporary),
             destination_format,
@@ -395,7 +489,8 @@ def write_session_atomically(
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-    return str(target)
+    result["output"] = str(target)
+    return result
 
 
 def _write_profile_atomically(
@@ -411,10 +506,12 @@ def _write_profile_atomically(
     the recorded session format could not represent the fresh
     authorization (a Pyrogram string needs a ``user_id`` the login could
     not report) and the payload was written as its Telethon string
-    instead.
+    instead.  A symlinked target is refused, exactly like
+    :func:`write_session_atomically` and ``profile.write_profile``.
     """
     from .profile import ProfileError, seal, write_profile
 
+    _refuse_symlink(path, "the profile path")
     recorded = opened_profile.session_format or "telethon-string"
     downgraded: typing.Optional[str] = None
     try:
@@ -497,6 +594,7 @@ async def heal_session(
     passkey_path: str,
     session_format: typing.Optional[str] = None,
     to_format: typing.Optional[str] = None,
+    out: typing.Optional[str] = None,
     api_preset: str = "desktop",
     passphrase: typing.Optional[str] = None,
     password: typing.Optional[str] = None,
@@ -518,6 +616,11 @@ async def heal_session(
         to_format: format to rewrite in; defaults to ``session_format``
             (a ``profile`` source is rewritten as a profile, so the
             envelope keeps its fingerprint and passkey).
+        out: where to write the healed session.  ``None`` means "in place,
+            same format" — the only in-place rewrite this module does.
+            Required as soon as ``to_format`` differs from the source
+            format: converting in place would destroy the original while
+            the file name kept claiming the old format.
         api_preset: identity to mint when neither an envelope nor a
             sidecar recorded one.
         passphrase: passphrase of a sealed envelope (read and rewrite).
@@ -532,16 +635,19 @@ async def heal_session(
     Returns:
         a JSON-friendly report: ``action`` (``"noop"`` or ``"healed"``),
         ``probe``, ``old`` / ``new`` (``user_id`` + ``dc_id``),
-        ``auth_key_changed``, the format pair, the identity source and any
-        ``notes``.
+        ``auth_key_changed``, the format pair, ``output`` / ``in_place``,
+        the identity source, ``filled`` (placeholders the destination
+        format needed) and any ``notes``.
 
     Raises:
         FileNotFoundError: the session or the passkey file does not exist.
         CodecError: the session cannot be read (including profile
             cross-validation failures).
         HealError: a refusal (no live probe and no force, another account's
-            passkey, an unclassifiable probe result without force) or a
-            runtime failure (login failed, unwritable target).
+            passkey, an unclassifiable probe result without force, a
+            symlinked session, a format change without ``out``, a session
+            that changed under us) or a runtime failure (login failed,
+            unwritable target).
     """
     path = str(session_path)
     fmt = session_format or codec.infer_source_format(path)
@@ -557,6 +663,31 @@ async def heal_session(
         raise FileNotFoundError(f"Session does not exist: {path}")
     if not os.path.exists(passkey_path):
         raise FileNotFoundError(f"--passkey {passkey_path}: no such file")
+
+    # --- where the result lands (and the refusals about it)
+    _refuse_symlink(path, "the session")
+    target_path = str(out) if out else path
+    in_place = os.path.abspath(target_path) == os.path.abspath(path)
+    if in_place:
+        if target_format != fmt:
+            raise HealRefusal(
+                f"--to-format {target_format} differs from the source format "
+                f"{fmt}: rewriting it in place would destroy the original "
+                f"{fmt} session while the file kept its name; pass --out PATH "
+                "so the converted session lands in a new file (in-place heal "
+                "is same-format only)"
+            )
+    else:
+        _refuse_symlink(target_path, "--out")
+        if os.path.exists(target_path) or os.path.islink(target_path):
+            raise HealRefusal(
+                f"--out {target_path}: already exists — refusing to overwrite "
+                "it; pick a new path or move the old one away"
+            )
+
+    # the read→login→write window is long: remember what the file looked
+    # like so the final write can refuse if someone changed it meanwhile
+    baseline = _file_snapshot(path) if in_place else None
 
     session, opened_profile, load_notes = _load_source(path, fmt, passphrase)
     notes.extend(load_notes)
@@ -609,6 +740,9 @@ async def heal_session(
                 "session": path,
                 "session_format": fmt,
                 "to_format": target_format,
+                "output": None,
+                "in_place": in_place,
+                "filled": [],
                 "probe": probe_report,
                 "passkey": str(passkey_path),
                 "identity": {
@@ -664,7 +798,12 @@ async def heal_session(
     fresh = fresh._replace(api_id=getattr(api, "api_id", None))
     auth_key_changed = fresh.auth_key != session.auth_key
 
+    # --- the write: refuse if the file moved under us, then rewrite it
+    if in_place:
+        _require_unchanged(path, baseline)
+
     note = f"healed {old['user_id']} on {old['dc_id']} at {_now_iso()}"
+    filled: typing.List[str] = []
     if target_format == "profile":
         if opened_profile is None:
             raise HealRefusal(
@@ -672,8 +811,9 @@ async def heal_session(
                 "one; run `tgmint profile seal` to create the envelope"
             )
         written, downgraded = _write_profile_atomically(
-            fresh, path, opened_profile, passphrase, note
+            fresh, target_path, opened_profile, passphrase, note
         )
+        written_user_id = fresh.user_id
         if downgraded:
             notes.append(
                 f"the recorded {downgraded} session format could not carry "
@@ -681,7 +821,19 @@ async def heal_session(
                 "telethon string"
             )
     else:
-        written = write_session_atomically(fresh, path, target_format)
+        written_result = _write_session_atomically(fresh, target_path, target_format)
+        written = written_result["output"]
+        # the codec's own placeholders (777000 / 2040) are reported here
+        # instead of being silently dropped: the file holds what it says
+        filled = list(written_result.get("filled") or ())
+        notes.extend(written_result.get("notes") or ())
+        written_user_id = written_result.get("user_id")
+        if written_user_id is None:
+            written_user_id = fresh.user_id
+
+    new = {"user_id": written_user_id, "dc_id": fresh.dc_id}
+    if "user_id" in filled:
+        new["user_id_is_placeholder"] = True
 
     return {
         "ok": True,
@@ -691,6 +843,8 @@ async def heal_session(
         "session_format": fmt,
         "to_format": target_format,
         "output": written,
+        "in_place": in_place,
+        "filled": filled,
         "probe": probe_report,
         "passkey": str(passkey_path),
         "identity": {
@@ -698,7 +852,7 @@ async def heal_session(
             "path": identity_source,
         },
         "old": old,
-        "new": {"user_id": fresh.user_id, "dc_id": fresh.dc_id},
+        "new": new,
         "auth_key_changed": auth_key_changed,
         "notes": notes,
     }

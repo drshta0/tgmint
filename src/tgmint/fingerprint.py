@@ -13,7 +13,7 @@ metaclass machinery.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, asdict, fields
+from dataclasses import MISSING, dataclass, asdict, fields
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -27,7 +27,13 @@ _LANG_PACK_ORIGINS = {
     "android": "android",
     "ios": "ios",
     "macos": "macos",
-    "": "web",
+    # An empty lang_pack means "no official app claimed" — the legacy
+    # upstream default. It used to map to "web", but the web presets were
+    # removed outright, so nothing in this package can mint a
+    # web identity any more and labelling one "web" was a lie. Stored
+    # fingerprints that already carry origin="web" still load; validate()
+    # stays lenient about both labels.
+    "": "unofficial",
 }
 
 
@@ -42,7 +48,9 @@ class Fingerprint:
         tz_zone: optional IANA zone name; when set, clients send
             `params.tz_offset` in initConnection like official apps do.
         origin: platform family the identity belongs to
-            ("tdesktop", "android", "ios", "macos", "web").
+            ("tdesktop", "android", "ios", "macos", or "unofficial" when no
+            official app claimed the lang_pack). Legacy sidecars may still
+            carry the retired "web" label — it loads and validates fine.
         schema_version: sidecar/JSON schema version (forward compat).
     """
 
@@ -84,7 +92,13 @@ class Fingerprint:
             return None
 
         if at is None:
-            wall = datetime.now().replace(tzinfo=zone)
+            # "right now" is an INSTANT, not a wall-clock reading: labelling
+            # the host's naive now() with the fingerprint's zone
+            # (`now().replace(tzinfo=zone)`) reports the zone's offset at the
+            # host's *clock digits*, which is one hour wrong for the length
+            # of the host/zone DST mismatch window. Converting the same
+            # instant is what a device reporting its own offset means.
+            wall = datetime.now().astimezone(zone)
         elif isinstance(at, datetime):
             wall = (
                 at.astimezone(zone)
@@ -120,10 +134,21 @@ class Fingerprint:
                 f"(expected {SCHEMA_VERSION})"
             )
         names = {f.name for f in fields(cls)}
-        missing = names - set(data)
+        # Only fields WITHOUT a dataclass default are required. tz_zone and
+        # origin are defaulted, so hand-written or older sidecars that omit
+        # them must load (they were previously rejected as "missing keys",
+        # which made those defaults unreachable through the JSON path).
+        required = {
+            f.name
+            for f in fields(cls)
+            if f.default is MISSING and f.default_factory is MISSING
+        }
+        missing = required - set(data)
         if missing:
             raise ValueError(f"fingerprint data is missing keys: {sorted(missing)}")
-        return cls(**{name: data[name] for name in names})
+        # unknown keys are ignored (forward compat), defaulted absent ones
+        # fall back to their dataclass defaults
+        return cls(**{name: data[name] for name in names if name in data})
 
     # -- sidecar persistence (sticky identity) -------------
 
@@ -178,7 +203,11 @@ class Fingerprint:
             except Exception:
                 problems.append(f"tz_zone {self.tz_zone!r} is not a known IANA zone")
 
-        # platform soft checks — the OS string must match the origin family
+        # platform soft checks — the OS string must match the origin family.
+        # Deliberately LENIENT: origin labels written by older versions stay
+        # on disk ("web" from the removed web presets, "unknown" from custom
+        # lang_packs), so a legacy label is never itself a problem — only a
+        # *plainly contradictory* (origin, system_version) pair is.
         if self.origin == "tdesktop" and self.system_version and not (
             self.system_version.startswith("Windows")
             or self.system_version.startswith("macOS")
@@ -196,6 +225,17 @@ class Fingerprint:
             problems.append(
                 f"{self.origin} origin but system_version {self.system_version!r} "
                 "looks like a desktop OS string"
+            )
+        # Telegram-Swift (macOS) reports "macOS <version>" — tdesktop's lib_base
+        # form. Anything else is a cross-platform mismatch: a desktop OS other
+        # than macOS ("Windows 11 x64"), an Android SDK level ("SDK 35"), or a
+        # bare Apple-looking version number with no prefix ("15.5", "18.5").
+        if self.origin == "macos" and self.system_version and not (
+            self.system_version.startswith("macOS")
+        ):
+            problems.append(
+                f"macos origin but system_version {self.system_version!r} does "
+                "not look like a macOS release (expected 'macOS <version>')"
             )
 
         return problems

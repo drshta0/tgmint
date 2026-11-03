@@ -1,6 +1,224 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [1.18.1] - 2026-11-03
+
+The code-review fix release. A 6-way parallel review of all 26.7k lines
+of `src/`
+produced 72 findings; this wave fixes every high-impact item, nearly
+every medium and most lows, and adds ~3.5k lines of regression tests.
+No new features. Suite: 767 passed / 74 skipped / 226 subtests in a pristine
+venv, offline (one extra cadence test runs where the vendored kurigram
+checkout it reads is present, giving 768/73 on that machine).
+
+### Fixed
+- **tdata destinations no longer clobber a live folder** (finding 1,
+  `codec/__init__.py`): `_write_tdata` refuses an existing folder or
+  symlink with `FileExistsError`, exactly like every file writer in the
+  matrix — `SaveTData` would otherwise overwrite `key_datas` inside a
+  real Telegram Desktop data directory.
+- **`DcOptions.Serialize` writes `port` again** (finding 2, `td/mtp.py`):
+  the endpoint record is `id, flags, port, ip…` on the wire (tdesktop
+  `mtproto_dc_options.cpp`); omitting `port` shifted every following
+  field by 4 bytes, so every config blob written was unreadable even by
+  our own reader. Round-trip test added.
+- **Telethon passkey login rolls back a failed DC switch** (finding 3,
+  `passkeys.py`): `client._switch_dc` permanently moves the caller's
+  persistent session and erases its auth key; every failure path after
+  the switch (expired challenge, bad signature, 2FA without a password)
+  now restores the DC / address / port / auth key first, mirroring the
+  rollback the Pyrogram-family driver already had.
+- **`heal` refuses symlinked session paths** (finding 4, `heal.py`):
+  `os.replace` onto a symlink replaces the *link*, so a heal through one
+  reported success while the real session kept its dead auth key.
+- **`login-passkey` converts with the real identity** (finding 5,
+  `cli.py`): the flow knows the account's `user_id` and the preset's
+  `api_id` at login time and passes both to `convert_session`, instead
+  of letting destinations store the placeholders 777000 / 2040.
+- **passkey registration is as atomic as the server allows** (finding 6,
+  `passkeys_core.py`): the store path is preflighted (directory exists
+  and is writable) before any network call, and a store save that fails
+  after the server accepted the credential triggers a best-effort
+  compensating `deletePasskey` — a retry registers a fresh passkey
+  instead of orphaning one whose private key exists nowhere.
+- **`heal` reports the placeholders it wrote** (finding 7, `heal.py`):
+  the atomic rewrite keeps the codec's write result, so `filled`
+  (777000 / 2040) and `notes` reach the report instead of it claiming
+  `user_id: None`.
+- Legacy tdata passcode KDF is tdesktop's, not an invention
+  (`td/storage.py`): `CreateLegacyLocalKey` runs PBKDF2-HMAC-**SHA1**
+  with 4000/4 iterations (config.h) — it was SHA-512/100k, a key no
+  tdesktop build ever derived, so legacy passcode-protected map files
+  could never decrypt.
+- The encrypted-map reader is round-trip faithful and hostile-input
+  safe (`td/account.py`, `td/configs.py`): `lskSelfSerialized` (the
+  own-user record) is kept and written back first like tdesktop;
+  wallet keys `0x1F`–`0x21` are consumed (`0x21` re-emitted) instead of
+  desynchronizing the stream; an *unknown* key type now fails the map
+  read (its payload length is unknowable — tdesktop fails too) instead
+  of logging and parsing every later entry from the middle of a
+  payload; the legacy `0x08` background key is read as the uint64 it is
+  (was a `QByteArray` shift into an int → `TypeError` aborting the
+  whole load); counted lists are bounded and length-checked before
+  their loops (`kMaxMapListCount` + bytes-available).
+- `readMtpData` loops over blocks like tdesktop (`td/account.py`): the
+  single-block `blockId == 75` assumption discarded everything after
+  the first block of a multi-block file and accepted a truncated stream
+  without a status check.
+- The wrapped local key is actually validated (`td/tdesktop.py`):
+  exactly 256 bytes and a healthy stream, else a `TData*` error — a
+  truncated key blob used to yield a short garbage `AuthKey`. The
+  accounts `count` from the (craftable) key file is capped at
+  `kMaxAccounts` (6), not an effective hang at ~4G iterations.
+- `EncryptedDescriptor(0)` initialises (`td/storage.py`): `size is not
+  None` replaces `if size:` — a legitimately empty record no longer
+  produces a stream whose every write is a silent no-op. Also here:
+  a truncated file raises a `TData*` error instead of `OverflowError`,
+  `ReadFile`'s candidate order matches tdesktop's (modern `s` file,
+  else the newer legacy `0`/`1` by mtime — it used to read a stale
+  backup ahead of the live file), `ComposeDataString` actually strips
+  `#` (the old `.replace` result was discarded), and four error
+  messages lost their unf-stringed `{...}` placeholders.
+- NULL rows are typed errors, not escapes (`codec/pyrogram.py`,
+  `codec/telethon.py`, `codec/data.py`): a session row whose
+  `auth_key`/`server_address` is NULL raises the codec's `CodecError`
+  naming the column, instead of a bare `TypeError`/`ValueError`.
+- The convert report is variant-aware and honest about defaults
+  (`codec/__init__.py`): a kurigram SQLite write (storage v7 keeps
+  `server_address`/`port`) no longer reports the endpoint as dropped,
+  and `dropped` only lists values that genuinely differ from the
+  destination's own default (an `is_bot=False` into a bot-columnless
+  format loses nothing).
+- `convert` grew the source options the matrix already supported
+  (`cli.py`, `codec/__init__.py`): `--passcode-env VAR` (a tdata
+  passcode is a secret — environment, never argv), `--account-index`
+  (multi-account tdata folders), `--variant {pyrogram,kurigram}`.
+  A passed-but-unusable `--passphrase-env`/`--passcode-env` (typo'd
+  variable name) is now an explicit error instead of being silently
+  ignored, and `convert --json` prints a JSON error object on failure
+  (stdout used to be empty).
+- `parity` no longer fabricates a wire layer (`cli.py`): without an
+  explicit `--layer` it reports the layer the minted `app_version`
+  genuinely speaks — the old fallback named Telethon's own layer (224)
+  for iOS identities that speak 232+.
+- `profile seal` round-trips sealed envelopes (`cli.py`): the
+  passphrase is resolved before the read (re-sealing a sealed profile
+  works, keeping its format, fingerprint and passkey), and an `OSError`
+  is a JSON error, not a traceback.
+- `heal` got the guardrails its report promised (`heal.py`, `cli.py`):
+  `--out` for format changes (an in-place `--to-format` rewrite
+  destroyed the original format while the filename kept claiming it),
+  a staleness guard that refuses to overwrite a session that changed
+  during the read→login→write window, a passphrase prompt only for
+  sealed envelopes (plain sessions never asked), and exit codes where
+  1 stays reserved for `audit` findings.
+- `bootstrap` replays with the recorded identity (`bootstrap.py`,
+  `cli.py`): the session's fingerprint sidecar wins over minting a
+  fresh one (Telegram remembers the device a session signed in with),
+  `--api-preset` is refused when it contradicts the replay platform,
+  each replay step has a timeout, and a fatal step emits its partial
+  report with the `--json` error instead of discarding it.
+- Passkey ceremony edge cases (`passkeys_core.py`, `passkeys.py`,
+  `passkeys_pyrogram.py`): the allow-list comparison decodes
+  base64url ids (a padded server spelling of the same id was rejected);
+  the signature counter is validated as the WebAuthn uint32 it is (a
+  corrupt negative counter is refused, not silently rolled back to 1);
+  an `alg=` override is checked against the algorithms the server
+  actually offered; the Telethon driver translates `PASSKEY_*`/
+  `SESSION_*` RPC errors into `PasskeyError` like the Pyrogram driver,
+  lets `TwoFactorRequired` propagate unwrapped (it was re-wrapped as a
+  `PasskeyError`, mixing "corrupt store" with "needs a password"), and
+  accepts unsigned 64-bit auth-key ids (half of all key ids are ≥ 2⁶³);
+  the store file is chmod'ed only after a successful save (the old
+  chmod-in-`finally` touched paths it never wrote).
+- `client_kwargs` accepts an explicit `init_connection_params=`
+  override (it raised `TypeError` for the very key `tz_params=True`
+  injects) (`adapters/pyrogram.py`).
+- The last four open review findings (#42, #47, #53, #61), plus covering tests for the ten fixes that had none:
+  - **#61 account-mixup guard** (`passkeys_core.check_finish_identity`,
+    wired into both login drivers): the passkey's `user_handle`
+    (`"<dc>:<user_id>"`) is the account the assertion was signed for,
+    but nothing compared it to the account `auth.finishPasskeyLogin`
+    answered with — a swapped credential or a store file copied from
+    another account wrote one account's session from another's passkey.
+    The guard runs before the store save / session write, on the finish
+    result and again on the framework's own `user.id` (authoritative for
+    layers whose `User` constructor the neutral parser does not know),
+    and on the 2FA `sign_in`/`check_password` path too. An id that was
+    never parsed (unknown constructor) is skipped rather than refused.
+  - **#47** `SystemInfo.system_versions` base default deleted: every
+    concrete pool declares its own list, so the inherited-but-never-read
+    empty list only made a pool that forgot one generate nothing.
+  - **#53** macOS version ceilings follow one rule: major 26 exactly for
+    the models on Apple's macOS 26 compatibility list
+    (https://support.apple.com/en-us/122867), i.e. every Apple-Silicon
+    Mac and the four Intel holdovers — the 2020 M1 Air / 13" Pro /
+    mini / 24" iMac were capped at 15 while their 2021-2022 siblings
+    claimed 26.
+  - **#42** `td.Serialize.stringSize` now returns what `writeQString`
+    writes (`4 + len(utf-16-be)`, so an astral character counts twice)
+    instead of `4 + len + 2`, and the dead five-line `size` prefetch in
+    `MTP.Config.Serialize` — its only caller, whose sum was never read —
+    is deleted with its now-unused import.
+  - **Ten FIXED-but-untested rows now have tests** (#13, #31 bootstrap
+    side, #33, #37, #41, #44, #45, #57, #58, #66), including crafted
+    `key_datas` bodies for the short-wrapped-key and accounts-count
+    guards and a two-block `mtp_data` file for the block loop.
+- `tests/pytest.ini` no longer declares `asyncio_mode`: pytest-asyncio is
+  not a dependency, so the line only produced an
+  "Unknown config option: asyncio_mode" warning on every run (the suite
+  drives coroutines through `IsolatedAsyncioTestCase`/`asyncio.run`).
+- `Fingerprint.tz_offset()` converts the instant, not the clock digits
+  (`fingerprint.py`): `datetime.now().astimezone(zone)` — the old
+  naive-now-relabeled-as-zone was an hour wrong for the DST mismatch
+  window. `from_dict` accepts defaulted fields (`tz_zone`, `origin`)
+  and lenient legacy origins (a stored sidecar missing them used to be
+  rejected as corrupt), and `macos` origins get a real
+  `system_version` coherence check.
+- Android version pin is the wire string (`versions.py`): `13.1.0
+  (7229)` — DrKLO's own `TLRPC.java` `APP_VERSION_CODE` (the APK's
+  ABI-split `versionCode` 72291 carries one extra digit; fetched
+  5-digit codes are truncated by that split digit). The old pin could
+  never resolve to a layer, so `parity` reported `layer: None` for
+  every Android identity.
+- Dead upstream code removed (`devices.py`, `utils.py`, `locales.py`):
+  the crashing `object_hierarchy_getattr` helper, the dead `_hashtorange`
+  and the typo'd `device_modesl` field, plus the `locales` docstring
+  moved where Python requires it. (A later audit caught this entry
+  overclaiming: the dead `system_versions` list was still there at
+  v1.18.1 — it is gone now, see the review-findings entry below;
+  `extend_class` stays on purpose, it is the Telethon-layer decorator.)
+
+### Security
+- tdata output is hardened to 0700/0600 (`codec/__init__.py`): the
+  written folder (raw auth-key material in `key_datas` and the MTP data
+  file) used to land umask-default — 0775 directories, 0664 files,
+  world-readable; every file and directory of a fresh output is now
+  0600/0700, matching the rest of the package.
+- Passkey store saves chmod only the file they published
+  (`passkeys_core.py`): the chmod moved out of the `finally` block, so
+  a failed save (bad path, unwritable directory) no longer tightens the
+  permissions of whatever happened to live at the destination path.
+
+### Tests
+- ~3.5k lines across 17 files, one or more per fix above: passkey
+  DC-rollback/2FA/registration-compensation/sign-counter/allow-list/
+  `alg` validation (`test_passkeys*.py`), heal symlink-refusal/
+  staleness/`--out`/placeholder reporting (`test_heal.py`), DcOptions
+  round-trip, truncated-input typed errors and the wallet map keys
+  (`test_tdata_roundtrip.py`, `test_lsktype_tolerance.py`; the
+  multi-block `readMtpData` loop is fixed in code but has no covering
+  test — review finding #45), codec variant/NULL-row/
+  `--account-index`/neutral-`dropped` behaviour
+  (`test_codec_matrix.py`), bootstrap recorded identity / partial
+  report / step timeout (`test_bootstrap.py`), fingerprint
+  `from_dict`/DST `tz_offset`/origin lenience
+  (`test_core_fingerprint.py`), the Android ABI-split versionCode
+  truncation (`test_versions_sidecar.py`, `test_api_generate.py`),
+  and CLI JSON error objects / `--passcode-env` semantics
+  (`test_cli*.py`). Suite: 767 passed / 74 skipped / 226 subtests in a pristine venv,
+  offline and deterministic.
+
 ## [1.18.0] - 2026-11-01
 
 The "one file that is an account" release, part one. A session, the

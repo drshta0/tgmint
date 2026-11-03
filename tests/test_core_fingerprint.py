@@ -189,10 +189,15 @@ class LayersTest(unittest.TestCase):
 
     def test_telethon_layer(self):
         try:
-            import telethon  # noqa: F401
+            from telethon.tl.alltlobjects import LAYER as installed_layer
         except ImportError:
             self.skipTest("telethon not installed")
-        self.assertEqual(telethon_layer(), 224)
+        # telethon_layer() must report the layer the INSTALLED telethon
+        # speaks. This assertion used to hardcode 224, which only held for
+        # telethon 1.43.2 — the test box moved to 1.45.0 (layer 229), so the
+        # hardcoded number failed a dependency bump that was not a bug.
+        self.assertEqual(telethon_layer(), installed_layer)
+        self.assertGreaterEqual(installed_layer, 200)
 
     def test_every_version_wellformed(self):
         import re
@@ -271,6 +276,139 @@ class GenerateIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(api.tz_zone)
         problems = Fingerprint.from_apidata(api).validate()
         self.assertEqual(problems, [])
+
+
+class TzOffsetNowTest(unittest.TestCase):
+    """`tz_offset()` with no `at` must describe the fingerprint's ZONE.
+
+    The old implementation labelled the host's naive `now()` with the
+    fingerprint's zone (`now().replace(tzinfo=zone)`), so a minted
+    identity claimed the zone's offset *at the host's clock digits* —
+    an hour wrong for the length of the host/zone DST mismatch window.
+    """
+
+    def _expected(self, zone_name: str) -> int:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return int(
+            datetime.now(ZoneInfo(zone_name)).utcoffset().total_seconds()
+        )
+
+    def test_now_uses_the_fingerprints_zone_not_the_host_wall_clock(self):
+        # zones spread across the DST-vs-UTC spectrum; a host east of UTC
+        # (or in a different DST phase) makes the buggy form differ
+        for zone_name in (
+            "America/New_York",
+            "Asia/Kolkata",
+            "Pacific/Chatham",
+            "Europe/Berlin",
+            "Australia/Sydney",
+        ):
+            fp = _td_fingerprint(tz_zone=zone_name)
+            self.assertEqual(
+                fp.tz_offset(), self._expected(zone_name), zone_name
+            )
+
+    def test_now_matches_an_aware_datetime_of_the_same_instant(self):
+        from datetime import datetime, timezone
+
+        fp = _td_fingerprint(tz_zone="Pacific/Chatham")
+        now_aware = datetime.now(timezone.utc)
+        self.assertEqual(fp.tz_offset(), fp.tz_offset(now_aware))
+
+    def test_no_zone_means_no_params(self):
+        self.assertIsNone(_td_fingerprint(tz_zone=None).tz_offset())
+
+
+class FromDictDefaultsTest(unittest.TestCase):
+    """`from_dict` only requires fields that have no default."""
+
+    def test_omitted_defaulted_fields_are_accepted(self):
+        data = _td_fingerprint().to_dict()
+        del data["tz_zone"]
+        del data["origin"]
+        fp = Fingerprint.from_dict(data)
+        self.assertIsNone(fp.tz_zone)
+        self.assertEqual(fp.origin, "")
+        self.assertEqual(fp.schema_version, data["schema_version"])
+
+    def test_legacy_sidecar_shape_loads(self):
+        # hand-written/older sidecar: only the 8 identity fields
+        fp = Fingerprint.from_dict(
+            {
+                "schema_version": 1,
+                "api_id": 2040,
+                "api_hash": "b18441a1ff607e10a989891a5462e627",
+                "device_model": "HP Pavilion 15",
+                "system_version": "Windows 11 x64",
+                "app_version": "7.3.3 x64",
+                "lang_code": "en",
+                "system_lang_code": "en-US",
+                "lang_pack": "tdesktop",
+            }
+        )
+        self.assertIsNone(fp.tz_zone)
+        self.assertEqual(fp.validate(), [])
+
+    def test_missing_required_field_still_raises(self):
+        data = _td_fingerprint().to_dict()
+        del data["device_model"]
+        with self.assertRaises(ValueError):
+            Fingerprint.from_dict(data)
+        with self.assertRaises(ValueError):
+            Fingerprint.from_dict({"schema_version": 1})
+
+
+class OriginLabelTest(unittest.TestCase):
+    """`""` lang_pack is honestly "unofficial", and validate() cross-checks."""
+
+    def test_empty_lang_pack_is_not_web(self):
+        # the web presets were removed (F9) — nothing in the package can
+        # mint a web identity, so an unclaimed lang_pack must not claim to
+        # be one. (APIData coerces a falsy lang_pack to its class default,
+        # so this needs a class whose own default is "".)
+        from tgmint.api import APIData
+
+        class Unclaimed(APIData):
+            api_id = 999001
+            api_hash = "0123456789abcdef0123456789abcdef"
+            device_model = "PC 64bit"
+            system_version = "Windows 10"
+            app_version = "1.0"
+            lang_code = "en"
+            system_lang_code = "en-US"
+            lang_pack = ""
+
+        fp = Fingerprint.from_apidata(Unclaimed)
+        self.assertEqual(fp.lang_pack, "")
+        self.assertEqual(fp.origin, "unofficial")
+        self.assertNotEqual(fp.origin, "web")
+
+    def test_validate_flags_macos_with_a_foreign_system_version(self):
+        for bad in ("Windows 11 x64", "SDK 35", "15.5", "18.5"):
+            problems = _td_fingerprint(
+                origin="macos", system_version=bad, lang_pack="macos"
+            ).validate()
+            self.assertTrue(
+                any("macOS" in p for p in problems), (bad, problems)
+            )
+
+    def test_validate_accepts_macos_with_its_own_shape(self):
+        fp = _td_fingerprint(
+            origin="macos",
+            system_version="macOS 15.5",
+            lang_pack="macos",
+            app_version="11.14.1",
+        )
+        self.assertEqual(fp.validate(), [])
+
+    def test_validate_stays_lenient_for_legacy_labels(self):
+        # stored fingerprints may still say "web" (removed presets) or
+        # "unknown" (custom lang_pack) — neither is a coherence problem
+        for legacy in ("web", "unknown", ""):
+            problems = _td_fingerprint(origin=legacy).validate()
+            self.assertEqual(problems, [], legacy)
 
 
 if __name__ == "__main__":

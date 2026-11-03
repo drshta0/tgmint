@@ -24,16 +24,26 @@ All seeds are ``os.urandom(256)``; every test is offline.
 """
 
 import base64
+import errno
 import os
 import sqlite3
 import struct
 import tempfile
 import unittest
 from contextlib import closing
+from unittest import mock
 
 from tgmint.codec import SessionData, CodecError
-from tgmint.codec import gramjs, pyrogram, telethon
-from tgmint.codec.dcs import PROD_DC, data_center
+from tgmint.codec import (
+    convert_session,
+    gramjs,
+    pyrogram,
+    read_session,
+    telethon,
+    write_session,
+)
+from tgmint.codec.data import write_text_file
+from tgmint.codec.dcs import PROD_DC, TEST_DC, data_center
 
 try:
     from telethon.crypto import AuthKey
@@ -200,9 +210,24 @@ class TestTelethonString(unittest.TestCase):
                 with self.assertRaises(CodecError):
                     telethon.read_string(bad)
 
-    def test_rejects_hostnames(self):
+    def test_hostname_falls_back_to_datacenter(self):
+        # dc_id is authoritative: a Telethon endpoint packs a *binary* IP, so
+        # a hostname (which only the GramJS format can carry) is replaced by
+        # the canonical address of the data center the auth key belongs to.
+        data = canonical(server_address="dc2.telegram.org")
+        restored = telethon.read_string(telethon.write_string(data))
+        self.assertEqual((restored.dc_id, restored.server_address, restored.port), (DC_ID, ADDRESS, 443))
+
+    def test_hostname_fallback_respects_test_mode(self):
+        data = canonical(server_address="dc2.telegram.org", port=None, test_mode=True)
+        restored = telethon.read_string(telethon.write_string(data))
+        self.assertEqual((restored.server_address, restored.port), (TEST_DC[DC_ID], 80))
+        self.assertTrue(restored.test_mode)
+
+    def test_hostname_fallback_needs_a_known_dc(self):
+        # nothing to fall back to: the dc_id has no published address
         with self.assertRaises(CodecError):
-            telethon.write_string(canonical(server_address="dc2.example.com"))
+            telethon.write_string(canonical(dc_id=7, server_address="dc2.telegram.org"))
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +296,45 @@ class TestTelethonSqlite(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 telethon.read_sqlite(path)
             self.assertFalse(os.path.exists(path))
+
+    def test_null_server_address_is_codec_error(self):
+        # a NULL endpoint would escape as a raw ValueError from ipaddress
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.session")
+            telethon.write_sqlite(data, path)
+            with closing(sqlite3.connect(path)) as db:
+                db.execute("UPDATE sessions SET server_address = NULL")
+                db.commit()
+            with self.assertRaises(CodecError) as caught:
+                telethon.read_sqlite(path)
+            self.assertIn("server_address", str(caught.exception))
+
+    def test_null_auth_key_is_codec_error(self):
+        # `bytes(None)` would escape as a TypeError
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.session")
+            telethon.write_sqlite(data, path)
+            with closing(sqlite3.connect(path)) as db:
+                db.execute("UPDATE sessions SET auth_key = NULL")
+                db.commit()
+            with self.assertRaises(CodecError) as caught:
+                telethon.read_sqlite(path)
+            self.assertIn("auth_key", str(caught.exception))
+
+    def test_hostname_row_falls_back_to_datacenter(self):
+        # dc_id is authoritative even for a row written by a laxer client
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.session")
+            telethon.write_sqlite(data, path)
+            with closing(sqlite3.connect(path)) as db:
+                db.execute("UPDATE sessions SET server_address = 'dc2.telegram.org'")
+                db.commit()
+            restored = telethon.read_sqlite(path)
+            self.assertEqual((restored.server_address, restored.port), (ADDRESS, 443))
+            self.assertFalse(restored.test_mode)
 
     @unittest.skipUnless(HAVE_TELETHON, "telethon not installed — oracle skipped")
     def test_oracle_real_telethon_reads_our_file(self):
@@ -421,6 +485,21 @@ class TestPyrogramSqlite(unittest.TestCase):
             restored = pyrogram.read_sqlite(path)
             self.assertEqual((restored.server_address, restored.port), (ADDRESS, 443))
 
+    def test_null_auth_key_is_codec_error(self):
+        # `bytes(None)` would escape as a TypeError
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            for variant in ("pyrogram", "kurigram"):
+                with self.subTest(variant=variant):
+                    path = os.path.join(tmp, f"{variant}.session")
+                    pyrogram.write_sqlite(data, path, variant=variant)
+                    with closing(sqlite3.connect(path)) as db:
+                        db.execute("UPDATE sessions SET auth_key = NULL")
+                        db.commit()
+                    with self.assertRaises(CodecError) as caught:
+                        pyrogram.read_sqlite(path)
+                    self.assertIn("auth_key", str(caught.exception))
+
     def test_tolerates_additive_columns(self):
         data = canonical()
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +582,275 @@ class TestGramJSString(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(CodecError):
                     gramjs.read_string(bad)
+
+
+    def test_hostname_converts_to_telethon(self):
+        # the GramJS -> Telethon cells the CLI advertises: dc_id decides the
+        # endpoint because a Telethon string/sqlite can only hold a packed IP
+        data = canonical(server_address="dc2.telegram.org")
+        loaded = gramjs.read_string(gramjs.write_string(data))
+        self.assertEqual(loaded.server_address, "dc2.telegram.org")
+        restored = telethon.read_string(telethon.write_string(loaded))
+        self.assertEqual(
+            (restored.dc_id, restored.server_address, restored.port), (DC_ID, ADDRESS, 443)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "from-gramjs.session")
+            result = convert_session(
+                gramjs.write_string(data), "gramjs-string", path, "telethon-session"
+            )
+            self.assertEqual(result["output_kind"], "sqlite-session")
+            self.assertEqual(telethon.read_sqlite(path).server_address, ADDRESS)
+
+
+# ---------------------------------------------------------------------------
+# tdata destination guard + private modes
+# ---------------------------------------------------------------------------
+
+
+class TestTdataDestinationGuard(unittest.TestCase):
+    """A tdata destination must never clobber a live Telegram Desktop folder."""
+
+    def test_refuses_existing_folder(self):
+        # the guard runs *before* the tgmint.td import, so it holds even on a
+        # build without PyQt5/tgcrypto
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "key_datas"), "wb") as fp:
+                fp.write(b"live login")
+            with self.assertRaises(FileExistsError):
+                write_session(canonical(), folder, "tdata")
+            with open(os.path.join(folder, "key_datas"), "rb") as fp:
+                self.assertEqual(fp.read(), b"live login")
+
+    def test_refuses_symlinked_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real-tdata")
+            os.makedirs(real)
+            link = os.path.join(tmp, "tdata")
+            os.symlink(real, link)
+            with self.assertRaises(FileExistsError):
+                write_session(canonical(), link, "tdata")
+            self.assertEqual(os.listdir(real), [])
+
+    def test_refuses_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            with open(folder, "wb") as fp:
+                fp.write(b"keep me")
+            with self.assertRaises(FileExistsError):
+                write_session(canonical(), folder, "tdata")
+            with open(folder, "rb") as fp:
+                self.assertEqual(fp.read(), b"keep me")
+
+    def test_harden_tdata_tightens_a_loose_tree(self):
+        # the chmod pass itself, independent of the Qt-based SaveTData
+        from tgmint.codec import _harden_tdata
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            loose = [
+                os.path.join(folder, "key_datas"),
+                os.path.join(folder, "D877F783D5D3EF8C", "map0"),
+                os.path.join(folder, "user_data", "key_datas_cache", "0"),
+            ]
+            for path in loose:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fp:
+                    fp.write(b"auth key material")
+                os.chmod(path, 0o664)  # what a 0002 umask leaves behind
+                os.chmod(os.path.dirname(path), 0o775)
+            os.chmod(folder, 0o775)
+            _harden_tdata(folder)
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+            for path in loose:
+                with self.subTest(path=os.path.relpath(path, folder)):
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            for root, _dirs, _names in os.walk(folder):
+                self.assertEqual(os.stat(root).st_mode & 0o777, 0o700)
+
+    @unittest.skipUnless(HAVE_QT, "PyQt5 not installed — tdata write skipped")
+    def test_written_folder_is_private(self):
+        key = auth_key()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            result = write_session(canonical(auth_key=key), folder, "tdata")
+            self.assertEqual(result["output_kind"], "tdata-directory")
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+            written = [
+                os.path.join(root, name)
+                for root, _dirs, names in os.walk(folder)
+                for name in names
+            ]
+            self.assertTrue(written)
+            for path in written:
+                with self.subTest(path=os.path.relpath(path, folder)):
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            # the folder it just wrote still reads back through the codec
+            from tgmint.codec import tdata as tdata_codec
+
+            self.assertEqual(tdata_codec.read(folder).auth_key, key)
+
+
+# ---------------------------------------------------------------------------
+# variant-aware PRESERVES reporting
+# ---------------------------------------------------------------------------
+
+
+class TestPreservesVariant(unittest.TestCase):
+    """`preserved`/`dropped` must follow the schema actually written."""
+
+    def test_kurigram_keeps_the_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.session")
+            result = write_session(canonical(), path, "pyrogram-session", variant="kurigram")
+            for field in ("server_address", "port"):
+                self.assertIn(field, result["preserved"])
+                self.assertNotIn(field, result["dropped"])
+
+    def test_vanilla_pyrogram_drops_the_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.session")
+            result = write_session(canonical(), path, "pyrogram-session", variant="pyrogram")
+            for field in ("server_address", "port"):
+                self.assertNotIn(field, result["preserved"])
+                self.assertIn(field, result["dropped"])
+
+    def test_variant_only_follows_the_schema_written(self):
+        # the string format carries no endpoint whichever variant names it
+        result = convert_session(
+            pyrogram.write_string(canonical()),
+            "pyrogram-string",
+            os.path.join(tempfile.mkdtemp(), "out.string"),
+            "pyrogram-string",
+            variant="kurigram",
+        )
+        self.assertNotIn("server_address", result["preserved"])
+
+    def test_bad_variant_is_codec_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(CodecError):
+                write_session(
+                    canonical(), os.path.join(tmp, "x.session"), "pyrogram-session", variant="bad"
+                )
+
+
+# ---------------------------------------------------------------------------
+# dropped-field reporting
+# ---------------------------------------------------------------------------
+
+
+class TestDroppedReporting(unittest.TestCase):
+    """Only information the destination genuinely loses is reported."""
+
+    def test_false_defaults_are_not_losses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_session(
+                canonical(is_bot=False, test_mode=False),
+                os.path.join(tmp, "t.session"),
+                "telethon-session",
+            )
+            self.assertNotIn("is_bot", result["dropped"])
+            self.assertNotIn("test_mode", result["dropped"])
+            # genuinely lost data still is reported
+            self.assertIn("user_id", result["dropped"])
+            self.assertIn("api_id", result["dropped"])
+
+    def test_true_flag_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_session(
+                canonical(is_bot=True), os.path.join(tmp, "t.session"), "telethon-session"
+            )
+            self.assertIn("is_bot", result["dropped"])
+
+    def test_unset_fields_are_not_losses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_session(
+                canonical(user_id=None, api_id=None, server_address=None, port=None),
+                os.path.join(tmp, "g.string"),
+                "gramjs-string",
+            )
+            self.assertEqual(result["dropped"], [])
+
+
+# ---------------------------------------------------------------------------
+# publishing without hard links
+# ---------------------------------------------------------------------------
+
+
+class TestPublishWithoutHardlinks(unittest.TestCase):
+    """`os.link` is unavailable on FAT/exFAT/SMB — the publish must still work."""
+
+    @staticmethod
+    def _no_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def test_sqlite_and_string_outputs(self):
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            session = os.path.join(tmp, "t.session")
+            text = os.path.join(tmp, "t.string")
+            with mock.patch("os.link", side_effect=self._no_link):
+                telethon.write_sqlite(data, session)
+                write_text_file(text, "1AAAA")
+            # both outputs exist, are private, and read back correctly
+            self.assertEqual(telethon.read_sqlite(session).auth_key, data.auth_key)
+            self.assertEqual(os.stat(session).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(text).st_mode & 0o777, 0o600)
+            with open(text, encoding="ascii") as fp:
+                self.assertEqual(fp.read(), "1AAAA")
+            # the O_EXCL fallback still refuses to overwrite
+            with mock.patch("os.link", side_effect=self._no_link):
+                with self.assertRaises(FileExistsError):
+                    telethon.write_sqlite(data, session)
+                with self.assertRaises(FileExistsError):
+                    write_text_file(text, "1BBBB")
+            with open(text, encoding="ascii") as fp:
+                self.assertEqual(fp.read(), "1AAAA")
+            # no temporary files leaked next to the outputs
+            self.assertEqual(sorted(os.listdir(tmp)), ["t.session", "t.string"])
+
+    def test_unrelated_link_errors_still_surface(self):
+        data = canonical()
+        with tempfile.TemporaryDirectory() as tmp:
+            session = os.path.join(tmp, "t.session")
+            with mock.patch("os.link", side_effect=OSError(errno.EACCES, "denied")):
+                with self.assertRaises(OSError) as caught:
+                    telethon.write_sqlite(data, session)
+            self.assertEqual(caught.exception.errno, errno.EACCES)
+            self.assertEqual(os.listdir(tmp), [])
+
+
+# ---------------------------------------------------------------------------
+# tdata account_index forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestAccountIndexForwarding(unittest.TestCase):
+    def test_forwarded_by_read_session(self):
+        from tgmint import codec
+
+        with mock.patch.object(codec.tdata, "read", return_value=canonical()) as reader:
+            read_session("/tmp/whatever", "tdata", passcode="pw", account_index=1)
+            reader.assert_called_once_with("/tmp/whatever", passcode="pw", account_index=1)
+
+    def test_forwarded_by_convert_session(self):
+        from tgmint import codec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.string")
+            with mock.patch.object(codec.tdata, "read", return_value=canonical()) as reader:
+                convert_session("/tmp/whatever", "tdata", out, "telethon-string", account_index=2)
+                reader.assert_called_once_with("/tmp/whatever", passcode="", account_index=2)
+            self.assertTrue(os.path.isfile(out))
+
+    def test_default_is_none(self):
+        from tgmint import codec
+
+        with mock.patch.object(codec.tdata, "read", return_value=canonical()) as reader:
+            read_session("/tmp/whatever", "tdata")
+            reader.assert_called_once_with("/tmp/whatever", passcode="", account_index=None)
 
 
 # ---------------------------------------------------------------------------

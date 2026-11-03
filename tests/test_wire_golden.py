@@ -78,7 +78,7 @@ class WireGoldenTest(unittest.TestCase):
         request = client._init_request
         self.assertEqual(request.api_id, 2040)
         self.assertEqual(request.lang_pack, "tdesktop")
-        self.assertEqual(request.device_model, "Desktop")
+        self.assertEqual(request.device_model, API.TelegramDesktop.device_model)
 
     def test_tz_offset_params_blob(self):
         """A fingerprint with tz_zone puts tz_offset into params on the wire."""

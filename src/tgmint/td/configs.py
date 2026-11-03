@@ -365,6 +365,15 @@ class lskType(int):  # nocov
     lskMediaLastPlaybackPositions = 0x1C  # no data
     lskBotStorages = 0x1D  # data: PeerId botId (map: count + pairs)
     lskPrefs = 0x1E  # no data
+    # fork note: 0x1F-0x21 are the wallet record keys current tdesktop
+    # writes (storage/storage_account.cpp, the local storage key enum).
+    # Their payloads differ in shape, which is exactly why a bare
+    # "log a warning and keep going" swallowed the rest of the map: the
+    # reader stayed 8 (or more) bytes behind and every following key was
+    # parsed from the middle of a payload.
+    lskWalletKey = 0x1F  # no data, legacy wallet record: quint64 FileKey
+    lskWalletEngineKey = 0x20  # no data, legacy single-file storage: quint64 FileKey
+    lskWalletEngineStorages = 0x21  # data: count + (FileKey quint64, QString key) per entry
 
 
 class BotTrustFlag(int):  # nocov

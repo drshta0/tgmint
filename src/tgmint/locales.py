@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Weighted, internally-coherent locale triples.
 
 Every official client sends `lang_code` / `system_lang_code` on the wire as a
@@ -22,6 +20,11 @@ The weights below are INDICATIVE: they approximate Telegram's public userbase
 distribution (en ~30%, ru ~12%, then the big regional pools) and are NOT
 precise measurements. Do not treat them as census data.
 """
+
+# fork note: the docstring must come FIRST — a `from __future__` import
+# ahead of it made it a no-op expression statement, so this module had
+# __doc__ == None (and `help(tgmint.locales)` was empty).
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple

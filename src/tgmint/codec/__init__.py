@@ -58,6 +58,7 @@ docstring for the exact upstream file and the adaptations made.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional
 
 from .data import CodecError, SessionData, write_text_file
@@ -161,6 +162,7 @@ def read_session(
     *,
     passcode: str = "",
     passphrase: str = "",
+    account_index: Optional[int] = None,
 ) -> SessionData:
     """Read one authorization from any source format (public entrypoint).
 
@@ -177,16 +179,23 @@ def read_session(
         passcode: the local passcode of a ``tdata`` folder.
         passphrase: the passphrase of a sealed ``.tgmint`` envelope
             (ignored by every other format).
+        account_index: which account of a multi-account ``tdata`` folder to
+            read; ``None`` selects its main account.  Ignored by every
+            other format.
     """
     if source_format in (None, "", "auto"):
         source_format = infer_source_format(source)
     if source_format in PROFILE_FORMATS:
         return _read_profile_source(source, passphrase)
-    return _read_source(source, source_format, passcode)
+    return _read_source(source, source_format, passcode, account_index=account_index)
 
 
 def _read_source(
-    source: str, source_format: str, passcode: str, passphrase: str = ""
+    source: str,
+    source_format: str,
+    passcode: str,
+    passphrase: str = "",
+    account_index: Optional[int] = None,
 ) -> SessionData:
     """Dispatch on `source_format` and read one authorization."""
     if source_format in PROFILE_FORMATS:
@@ -194,7 +203,7 @@ def _read_source(
     if source_format == "tdata":
         if tdata is None:  # pragma: no cover - defensive import guard
             raise CodecError("tdata reader unavailable in this build")
-        return tdata.read(source, passcode=passcode)
+        return tdata.read(source, passcode=passcode, account_index=account_index)
     reader = _READERS.get(source_format)
     if reader is None:
         raise CodecError(
@@ -209,13 +218,46 @@ def _read_source(
     return reader(source)
 
 
+#: modes for a written ``tdata`` folder: it carries the raw auth key in
+#: ``tdata/key_datas`` (and in the MTP data file), so it is a credential
+#: directory like every session file in this package (0600 / 0700).
+_TDATA_FILE_MODE = 0o600
+_TDATA_DIR_MODE = 0o700
+
+
+def _harden_tdata(folder: str) -> None:
+    """chmod a freshly written ``tdata`` folder to 0700/0600.
+
+    ``SaveTData`` (like tdesktop itself) honours the process umask, which
+    routinely lands 0664 files inside a 0775 directory — world-readable
+    auth-key material.  Walk the tree it just wrote and tighten every file
+    and directory; symlinks are skipped (chmod would follow them).
+    """
+    for root, _directories, filenames in os.walk(folder):
+        os.chmod(root, _TDATA_DIR_MODE)
+        for name in filenames:
+            path = os.path.join(root, name)
+            if not os.path.islink(path):
+                os.chmod(path, _TDATA_FILE_MODE)
+
+
 def _write_tdata(data: SessionData, folder: str, passcode: str) -> None:
     """Write one authorization as a ``tdata`` folder.
 
     The codec itself is deliberately read-only for tdata; writing goes
     through :mod:`tgmint.td`'s own ``SaveTData`` (imported lazily — it
     needs the base package's tgcrypto, unlike the rest of the codec).
+
+    An existing folder (or a symlink pointing anywhere) is refused with
+    :class:`FileExistsError`, exactly like every file writer in this
+    package: ``SaveTData`` would otherwise overwrite ``key_datas`` inside a
+    live Telegram Desktop data directory and destroy that login.  The
+    folder it creates is hardened to 0700/0600 afterwards.
     """
+    target = Path(folder)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"Output already exists: {target}")
+
     try:
         from ..api import API
         from ..td import TDesktop
@@ -238,6 +280,7 @@ def _write_tdata(data: SessionData, folder: str, passcode: str) -> None:
     desktop._addSingleAccount(account)
     if not desktop.SaveTData(str(folder), passcode=passcode or None):
         raise CodecError(f"SaveTData failed for {folder}")
+    _harden_tdata(str(folder))
 
 
 def _write_destination(
@@ -274,17 +317,50 @@ def _write_destination(
     )
 
 
-def _preserves(destination_format: str) -> FrozenSet[str]:
-    """Fields the destination format genuinely keeps (module PRESERVES)."""
+def _preserves(
+    destination_format: str, variant: str = pyrogram.VARIANT_PYROGRAM
+) -> FrozenSet[str]:
+    """Fields the destination format genuinely keeps (module PRESERVES).
+
+    ``variant`` matters for the Pyrogram family: the kurigram SQLite schema
+    (storage v7) stores ``server_address``/``port`` while vanilla Pyrogram
+    derives the endpoint from ``dc_id`` at connect time, so a kurigram write
+    must not report the endpoint as dropped.
+    """
     if destination_format.startswith("telethon-"):
         return telethon.PRESERVES
-    if destination_format.startswith("pyrogram-"):
+    if destination_format == "pyrogram-session":
+        if variant == pyrogram.VARIANT_KURIGRAM:
+            return pyrogram.PRESERVES_SQLITE_KURIGRAM
+        if variant != pyrogram.VARIANT_PYROGRAM:
+            raise CodecError("variant must be 'pyrogram' or 'kurigram'")
+        return pyrogram.PRESERVES
+    if destination_format == "pyrogram-string":
+        # session strings never carry an endpoint, whichever variant wrote them
         return pyrogram.PRESERVES
     if destination_format == "gramjs-string":
         return gramjs.PRESERVES
     if destination_format == "tdata":
         return getattr(tdata, "PRESERVES", frozenset({"dc_id", "auth_key", "user_id"}))
     raise CodecError(f"unknown destination format {destination_format!r}")
+
+
+#: values that carry no information a destination could lose — the implicit
+#: default of the field.  ``is_bot=False`` stored into a format with no bot
+#: column loses nothing (every client treats the account as a user), while
+#: ``is_bot=True`` is genuine data that *is* lost.  A value equal to its
+#: default therefore counts as effectively preserved, and a real ``False`` /
+#: ``0`` is still never mistaken for "absent" (``None`` is the only "unset").
+_NEUTRAL_VALUES: Dict[str, Any] = {"is_bot": False, "test_mode": False, "port": 0}
+_NO_DEFAULT = object()
+
+
+def _loses(field: str, value: Any) -> bool:
+    """True when `value` is information the destination genuinely drops."""
+    if value is None:
+        return False
+    neutral = _NEUTRAL_VALUES.get(field, _NO_DEFAULT)
+    return neutral is _NO_DEFAULT or value != neutral
 
 
 def _fill_note(field: str, source_format: str, value: int) -> str:
@@ -339,17 +415,21 @@ def write_session(
     policy, without a source format in the way.
 
     Existing outputs are refused (:class:`FileExistsError`) and every
-    file is published with mode 0600, like the rest of the matrix.
+    file is published with mode 0600, like the rest of the matrix
+    (``tdata`` folders are hardened to 0700/0600).
 
     Returns:
         ``{"output", "output_kind", "dc_id", "user_id", "filled",
-        "notes", "preserved", "dropped"}``.
+        "notes", "preserved", "dropped"}``.  ``dropped`` lists only fields
+        the destination genuinely cannot reproduce *and* whose value differs
+        from that destination's own default, so an unset field (``None``) or
+        a ``False``/``0`` default is not reported as a loss.
     """
     data, filled = _fill_for_destination(data, destination_format, user_id, api_id)
     output_kind = _write_destination(
         data, destination, destination_format, passcode, variant
     )
-    keeps = _preserves(destination_format)
+    keeps = _preserves(destination_format, variant)
     result: Dict[str, Any] = {
         "destination_format": destination_format,
         "dc_id": data.dc_id,
@@ -362,7 +442,7 @@ def write_session(
             for field in SessionData._fields
             if field not in keeps
             and field not in ("dc_id", "auth_key")
-            and getattr(data, field) is not None
+            and _loses(field, getattr(data, field))
         ),
     }
     if filled:
@@ -384,6 +464,7 @@ def convert_session(
     passcode: str = "",
     passphrase: str = "",
     variant: str = "pyrogram",
+    account_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Convert one session between any two formats of the matrix above.
 
@@ -419,6 +500,9 @@ def convert_session(
             other source format ignores it.
         variant: pyrogram SQLite variant for ``pyrogram-session``
             destinations (``"pyrogram"`` or ``"kurigram"``).
+        account_index: which account of a multi-account ``tdata`` *source*
+            folder to read; ``None`` selects its main account.  Ignored by
+            every other source format.
 
     Returns:
         a JSON-friendly dict describing what was written: ``dc_id``,
@@ -438,7 +522,9 @@ def convert_session(
         data = _read_profile_source(source, passphrase)
         source_format = "profile"
     else:
-        data = _read_source(source, source_format, passcode)
+        data = _read_source(
+            source, source_format, passcode, account_index=account_index
+        )
 
     written = write_session(
         data,

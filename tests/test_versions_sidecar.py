@@ -313,7 +313,9 @@ class TestFetchersOffline(unittest.TestCase):
         )
         urlopen = fake_urlopen(b"<html>" + blob + b"</html>")
         with mock.patch("urllib.request.urlopen", urlopen):
-            self.assertEqual(versions._fetch_android(2.0), "13.1.0 (72291)")
+            # APKPure serves the ABI-split versionCode (72291); DrKLO's own
+            # app_version prints 7229 — the pinned/verified wire string.
+            self.assertEqual(versions._fetch_android(2.0), "13.1.0 (7229)")
         self.assertEqual(urlopen.call_args[0][0].full_url, versions.SOURCES["android"])
 
     def test_android_x_strips_abi_split(self):
@@ -387,6 +389,44 @@ class TestFetchersOffline(unittest.TestCase):
                 versions._save_cache({"versions": {"ios": "1.0"}}, target)  # no raise
             finally:
                 target.parent.chmod(0o700)
+
+
+# ---------------------------------------------------------------------------
+# APKPure normalization (ABI-split versionCode -> the printed app_version code)
+# ---------------------------------------------------------------------------
+
+class TestAndroidVersionNormalization(unittest.TestCase):
+    def test_split_code_is_truncated_to_the_printed_code(self):
+        # 72291 is the ABI-split APK versionCode; the app prints 7229
+        # (DrKLO TLRPC.java at the 13.1.0 commit) — this is the exact value
+        # layers.ANDROID_LAYERS[232] and versions.PINNED["android"] carry.
+        self.assertEqual(
+            versions._android_version_from("13.1.0", 72291), "13.1.0 (7229)"
+        )
+        self.assertEqual(
+            versions._android_version_from("12.3.0", 63771), "12.3.0 (6377)"
+        )
+
+    def test_plain_code_is_kept(self):
+        self.assertEqual(
+            versions._android_version_from("13.1.0", 7229), "13.1.0 (7229)"
+        )
+
+    def test_zero_code_is_not_treated_as_absent(self):
+        # 0 is a real reported value: it must not be mistaken for "the page
+        # exposed no versionCode at all" (that case is None)
+        self.assertEqual(versions._android_version_from("13.1.0", 0), "13.1.0 (0)")
+        self.assertEqual(versions._android_version_from("13.1.0", None), "13.1.0")
+
+    def test_fourth_component_wins_over_code_field(self):
+        self.assertEqual(
+            versions._android_version_from("0.29.1.1817-arm64-v8a", 1817302),
+            "0.29.1 (1817)",
+        )
+
+    def test_junk_names_still_none(self):
+        self.assertIsNone(versions._android_version_from("Varies with device", 1))
+        self.assertIsNone(versions._android_version_from("", 1))
 
 
 # ---------------------------------------------------------------------------

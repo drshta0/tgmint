@@ -56,7 +56,12 @@ The credential data layer (CBOR/COSE, :class:`SoftwareAuthenticator`,
 :class:`PasskeyStore`, :class:`PasskeyInfo`, the error classes) is
 *re-exported* from the core rather than copied, so both dialects share one
 implementation — and one exception class, which matters for callers that
-``except tgmint.passkeys.PasskeyError``.
+``except tgmint.passkeys.PasskeyError``: :class:`TelethonInvoker` translates
+the server's ``PASSKEY_*``/``SESSION_*`` answers into that same
+:class:`PasskeyError` (as the Pyrogram-family driver does), so one ``except``
+clause covers both frameworks. The 2FA answer is the exception to that rule:
+it becomes :class:`TwoFactorRequired` (also re-exported here), never a
+:class:`PasskeyError`.
 
 Typical use (while logged in)::
 
@@ -92,10 +97,12 @@ VERIFICATION LABELS
 """
 from __future__ import annotations
 
+import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 
-from telethon.errors import SessionPasswordNeededError
+from telethon import utils as tl_utils
+from telethon.errors import RPCError, SessionPasswordNeededError
 from telethon.extensions import BinaryReader
 from telethon.tl.tlobject import TLObject, TLRequest
 
@@ -108,6 +115,7 @@ __all__ = [
     "PasskeyInfo",
     "PasskeyStore",
     "PasskeyRejectedError",
+    "TwoFactorRequired",
     "SoftwareAuthenticator",
     "CreatedCredential",
     "InitPasskeyRegistrationRequest",
@@ -148,6 +156,8 @@ ALG_ED25519 = _core.ALG_ED25519  # Ed25519, raw 64-byte signature
 
 PasskeyError = _core.PasskeyError
 PasskeyRejectedError = _core.PasskeyRejectedError
+# the neutral 2FA signal login_with_passkey raises when no password was given
+TwoFactorRequired = _core.TwoFactorRequired
 PasskeyInfo = _core.PasskeyInfo
 CreatedCredential = _core.CreatedCredential
 SoftwareAuthenticator = _core.SoftwareAuthenticator
@@ -495,7 +505,7 @@ def _class_by_name(name: str, what: str):
 def _build_value(type_name: str, value: Any, *, what: str) -> Any:
     """Build the TL value for one spec field (object, union or scalar)."""
     if type_name in _SCALAR_TL_TYPES:
-        return value
+        return _scalar_value(type_name, value, what=what)
     unions = _SPEC["unions"]
     if type_name in unions:
         candidates = list(unions[type_name]["constructors"])
@@ -514,6 +524,22 @@ def _build_value(type_name: str, value: Any, *, what: str) -> Any:
             )
         return _construct_object(constructor, value, what=constructor)
     return _construct_object(type_name, value, what=what)
+
+
+def _scalar_value(type_name: str, value: Any, *, what: str) -> Any:
+    """Normalize one scalar spec field before it reaches a hand-written class.
+
+    TL's ``long`` is **signed** while frameworks expose the auth key id as an
+    unsigned 64-bit integer (``sha1(auth_key)[-8:]``). Half of all key ids are
+    ``>= 2**63``, and ``struct.pack("<q", ...)`` in
+    :meth:`FinishPasskeyLoginRequest._bytes` raises ``struct.error`` for those
+    — while the neutral writer (:func:`tgmint.passkeys_core.encode_request`)
+    and the pyrogram driver both accept them. Normalizing here keeps this
+    driver's bytes identical to the core's for the same field dict.
+    """
+    if type_name == "long" and isinstance(value, int) and not isinstance(value, bool):
+        return _core.to_signed_int64(value, what=what)
+    return value
 
 
 def _construct_object(object_key: str, values: Any, *, what: str):
@@ -602,6 +628,54 @@ def _response_bytes(response: Any, *, what: str) -> bytes:
         ) from None
 
 
+# A server error that belongs to the passkey flow. Errors outside these
+# prefixes keep Telethon's own semantics — including SESSION_PASSWORD_NEEDED,
+# which is the 2FA signal and is mapped to TwoFactorRequired before this runs.
+_SERVER_ERROR_RE = re.compile(r"\b((?:PASSKEY|SESSION)_[A-Z0-9_]+)\b")
+
+_SERVER_ERROR_HINTS = {
+    "PASSKEY_ORIGIN_MISMATCH": (
+        " — Telegram rejected the WebAuthn origin in clientDataJSON; "
+        f"tgmint defaults to {_core.DEFAULT_ORIGIN}, and re-registering with "
+        "an origin the server accepts is the fix"
+    ),
+    "PASSKEY_CHALLENGE_EXPIRED": (
+        " — the challenge is bound to the connection named in "
+        "from_dc_id/from_auth_key_id; re-run the flow without pausing "
+        "between challenge and finish"
+    ),
+    "PASSKEY_CREDENTIAL_NOT_FOUND": " — this credential id is not registered on the account",
+    "PASSKEY_SIGNATURE_INVALID": (
+        " — the stored credential did not verify; the passkey file may be corrupt"
+    ),
+}
+
+
+def _server_error(key: str, exc: RPCError) -> Optional[PasskeyError]:
+    """Translate a passkey-flow Telethon RPCError, or ``None`` to leave it alone.
+
+    ``tgmint.passkeys_core.PasskeyError`` is the one error type both drivers
+    promise (see the module docstring and
+    :func:`tgmint.passkeys_pyrogram._server_error`), so a caller can write
+    ``except tgmint.passkeys.PasskeyError`` and get the same behaviour on
+    Telethon and on the Pyrogram family. Only PASSKEY_*/SESSION_* server
+    answers are translated; a network failure, a flood wait or a phone-number
+    error keeps its framework type, and the 2FA signal never reaches here
+    (``SessionPasswordNeededError`` is caught first, and is also deliberately
+    excluded by the marker check).
+    """
+    message = getattr(exc, "message", None)
+    text = message if isinstance(message, str) else str(exc)
+    match = _SERVER_ERROR_RE.search(text)
+    if match is None:
+        return None
+    marker = match.group(1)
+    if marker == "SESSION_PASSWORD_NEEDED":  # the 2FA signal, not an error
+        return None
+    hint = _SERVER_ERROR_HINTS.get(marker, "")
+    return PasskeyError(f"{key}: Telegram rejected the request: {text}{hint}")
+
+
 class TelethonInvoker:
     """Drive the neutral passkey ceremony through a Telethon client.
 
@@ -636,13 +710,84 @@ class TelethonInvoker:
         try:
             response = await self.client(request)
         except SessionPasswordNeededError as exc:
+            # the 2FA signal: the *driver* decides which password call to
+            # make, so this is deliberately not a PasskeyError
             if spec["result"]["kind"] == "authorization":
                 raise _core.TwoFactorRequired() from exc
             raise
+        except RPCError as exc:
+            translated = _server_error(key, exc)
+            if translated is None:
+                raise
+            raise translated from exc
         self.last_response = response
         if spec["result"]["kind"] == "authorization":
             return _core.parse_result(key, _response_bytes(response, what=key))
         return response
+
+
+# ---------------------------------------------------------------------------
+# Datacenter handoff rollback (Telethon's _switch_dc has no undo)
+# ---------------------------------------------------------------------------
+
+def _session_snapshot(client) -> Dict[str, Any]:
+    """Everything ``client._switch_dc`` overwrites, captured before it runs.
+
+    ``_switch_dc`` (telethon/client/telegrambaseclient.py:770-784) rewrites
+    ``session.set_dc(...)``, sets ``session.auth_key`` **and** the sender's
+    key to ``None``, saves the session, then reconnects — i.e. it permanently
+    moves the caller's persistent session and erases its auth key. A failed
+    ``finishPasskeyLogin`` after that point would leave the caller's session
+    file pointing at another DC with no key at all, so the pre-switch state
+    is captured here and put back by :func:`_restore_session`.
+    """
+    session = getattr(client, "session", None)
+    return {
+        "session": session,
+        "dc_id": getattr(session, "dc_id", None),
+        "server_address": getattr(session, "server_address", None),
+        "port": getattr(session, "port", None),
+        "auth_key": getattr(session, "auth_key", None),
+    }
+
+
+async def _restore_session(client, snapshot: Optional[Dict[str, Any]]) -> None:
+    """Best-effort rollback of :meth:`TelethonClient._switch_dc`.
+
+    Best effort by design: the login error is what the caller needs to see,
+    so a rollback that also fails is swallowed (the client keeps the
+    switched-to session — the same state a failed passkey login leaves in any
+    client). The session file is written back and the connection re-opened on
+    the restored DC, because ``_switch_dc`` reconnected to the new one.
+    """
+    if not snapshot:
+        return
+    session = snapshot["session"]
+    try:
+        if session is not None and snapshot["dc_id"] is not None:
+            await tl_utils.maybe_async(
+                session.set_dc(
+                    snapshot["dc_id"], snapshot["server_address"], snapshot["port"]
+                )
+            )
+            session.auth_key = snapshot["auth_key"]
+            # the sender holds its own copy of the key; put it back before
+            # reconnecting so connect() does not mint a brand new one
+            sender_key = getattr(getattr(client, "_sender", None), "auth_key", None)
+            old_key = snapshot["auth_key"]
+            if sender_key is not None and old_key is not None:
+                try:
+                    sender_key.key = getattr(old_key, "key", old_key)
+                except Exception:  # nocov - a sender that does not allow it
+                    pass
+            await tl_utils.maybe_async(session.save())
+        disconnect = getattr(client, "_disconnect", None)
+        connect = getattr(client, "connect", None)
+        if callable(disconnect) and callable(connect):
+            await disconnect()
+            await connect()
+    except Exception:  # nocov - a rollback that cannot complete
+        pass
 
 
 def _auth_user(invoker: TelethonInvoker, result: "_core.AuthorizationResult"):
@@ -682,13 +827,15 @@ async def register_passkey(
     path: str,
     origin: str = DEFAULT_ORIGIN,
     name: str = "tgmint software passkey",
+    alg: Optional[int] = None,
 ) -> Tuple[PasskeyInfo, PasskeyStore]:
     """Register a new passkey on the account this client is logged into.
 
     The credential is generated locally (ES256 or Ed25519, whatever the
-    server prefers) and saved to ``path`` — chmod 600. Keep that file: it
-    is the only thing needed to log in later besides a possible 2FA
-    cloud password.
+    server prefers — ``alg`` overrides that preference, and is validated
+    against the algorithms the server actually offered) and saved to ``path``
+    — chmod 600. Keep that file: it is the only thing needed to log in later
+    besides a possible 2FA cloud password.
 
     Returns ``(server_passkey_info, store)``.
     """
@@ -697,6 +844,7 @@ async def register_passkey(
         store_path=path,
         origin=origin,
         name=name,
+        alg=alg,
     )
 
 
@@ -712,14 +860,21 @@ async def login_with_passkey(
     Mirrors the official client: fetch the login challenge, sign it, and
     finish on the account's home datacenter (switching DCs if needed,
     passing from_dc_id/from_auth_key_id exactly like the Android app).
-    If the account has a 2FA cloud password, pass it as ``password``
-    (or handle ``SessionPasswordNeededError`` yourself and call
-    ``client.sign_in(password=...)``).
+
+    If the account has a 2FA cloud password, pass it as ``password``. Without
+    a password the neutral :class:`tgmint.passkeys_core.TwoFactorRequired`
+    signal propagates (it is deliberately *not* a :class:`PasskeyError`), so a
+    caller that guards against a corrupt store does not swallow a password
+    prompt along with it; call again with ``password=`` to finish.
+
+    A failed login after the DC switch restores the previous session state
+    (DC, server address, port and auth key) best-effort — ``client._switch_dc``
+    rewrites the caller's persistent session and erases its auth key, so
+    without the rollback one expired challenge would permanently move the
+    session file and lose the key.
 
     Returns the logged-in ``me`` user.
     """
-    from telethon import utils as tl_utils
-
     session = client.session
     store = PasskeyStore.load(path)
     invoker = TelethonInvoker(client)
@@ -749,21 +904,37 @@ async def login_with_passkey(
 
     # 3. If the account's home DC differs, switch now and pass
     #    from_dc_id/from_auth_key_id of the connection that got the
-    #    challenge — exactly like the official client does.
+    #    challenge — exactly like the official client does. The switch is
+    #    destructive (new DC, auth key erased), so snapshot first and restore
+    #    on every failure path below.
+    snapshot = None
     if plan["switch_to_dc"] is not None:
-        await client._switch_dc(plan["switch_to_dc"])
+        snapshot = _session_snapshot(client)
+        try:
+            await client._switch_dc(plan["switch_to_dc"])
+        except BaseException:
+            await _restore_session(client, snapshot)
+            raise
 
     # 4. Finish on the home DC.
     try:
         result = await _core.finish_login(invoker, plan["finish_fields"])
     except _core.TwoFactorRequired:
         if password is None:
-            raise PasskeyError(
-                "the account has a 2FA cloud password; call again with password=..."
-            ) from None
+            # nothing can be finished without the password, so put the
+            # caller's session back before asking for one (the retry starts
+            # from the DC it originally connected to)
+            await _restore_session(client, snapshot)
+            raise
+        # The password step completes the login on the home-DC session, so the
+        # switch is intentionally kept: a wrong password stays retryable with
+        # ``client.sign_in(password=...)`` on that DC.
         me = await client.sign_in(password=password)
         store.save()
         return me
+    except BaseException:
+        await _restore_session(client, snapshot)
+        raise
 
     store.save()
     me = await client._on_login(_auth_user(invoker, result))

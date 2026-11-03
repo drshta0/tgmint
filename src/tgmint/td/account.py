@@ -71,6 +71,50 @@ class MapData(BaseObject):  # nocov
         self._botStoragesMap: Dict[PeerId, FileKey] = {}
         self._botStoragesNotReadMap: Dict[PeerId, bool] = {}
         self._prefsKey = FileKey(0)
+        # fork note: the serialized own-user record (lskSelfSerialized,
+        # 0x15) used to be parsed into a local and dropped, so a
+        # load -> save round-trip silently lost the account's own peer.
+        # It is carried on the instance and written back FIRST, which is
+        # the position tdesktop uses (storage_account.cpp, writeMap).
+        self._selfSerialized = QByteArray()
+        # fork note: lskWalletEngineStorages (0x21) is a QString -> FileKey
+        # map; read it so the map never desyncs, and keep it so a re-save
+        # does not drop it (tdesktop writes it just before lskBotStorages).
+        self._walletEngineStoragesMap: Dict[str, FileKey] = {}
+        # tdesktop reads the two legacy wallet keys only to ClearKey() the
+        # files they point at, and never writes those entries again; we
+        # keep the values for inspection but deliberately do not re-emit
+        # (and never delete files out of the folder we are reading).
+        self._walletLegacyKey = FileKey(0)
+        self._walletEngineLegacyKey = FileKey(0)
+
+    kMaxMapListCount = 1 << 20
+    """Ceiling for a counted map list (drafts, legacy images, ...).
+
+    tdesktop does not cap these, it just trusts the stream: every entry it
+    reads is 16-28 bytes, so a truncated/hostile file runs into
+    ReadPastEnd quickly. Our reader cannot rely on that alone — the
+    per-entry loops only check the stream status once per key TYPE, so a
+    declared count of ~4G entries would spin the loop before the check
+    ever runs. 1M entries is far beyond any real account yet bounded.
+    """
+
+    @staticmethod
+    def _checkCount(stream: QDataStream, count: int, itemSize: int, what: str):
+        """Reject an implausible list count before looping on it."""
+        if count < 0 or count > MapData.kMaxMapListCount:
+            raise TDataBadConfigData(
+                f"implausible {what} count {count} in map data"
+            )
+        # a count can never need more bytes than the map has left; this
+        # also turns a truncated map into a proper TData* error instead of
+        # a long loop over zero-filled reads
+        available = stream.bytesAvailable()
+        if itemSize > 0 and (count * itemSize > available):
+            raise TDataBadConfigData(
+                f"truncated map data: {what} declares {count} entries "
+                f"but only {available} bytes are left"
+            )
 
     def read(self, localKey: td.AuthKey, legacyPasscode: QByteArray) -> None:
 
@@ -155,6 +199,9 @@ class MapData(BaseObject):  # nocov
         botStoragesMap: typing.Dict[PeerId, FileKey] = {}
         botStoragesNotReadMap: typing.Dict[PeerId, bool] = {}
         prefsKey = 0
+        # the two legacy wallet records (0x1F/0x20) are consumed straight
+        # into the instance (see __init__); 0x21 is a map, accumulated here
+        walletEngineStoragesMap: typing.Dict[str, FileKey] = {}
 
         is_finished = False
 
@@ -163,6 +210,7 @@ class MapData(BaseObject):  # nocov
 
             if keyType == lskType.lskDraft:
                 count = map.stream.readUInt32()
+                MapData._checkCount(map.stream, count, 16, "drafts")
                 for i in range(count):
                     key = FileKey(map.stream.readUInt64())
                     peerIdSerialized = map.stream.readUInt64()
@@ -175,6 +223,7 @@ class MapData(BaseObject):  # nocov
 
             elif keyType == lskType.lskDraftPosition:
                 count = map.stream.readUInt32()
+                MapData._checkCount(map.stream, count, 16, "draft cursors")
                 for i in range(count):
                     key = FileKey(map.stream.readUInt64())
                     peerIdSerialized = map.stream.readUInt64()
@@ -187,6 +236,8 @@ class MapData(BaseObject):  # nocov
                 or (keyType == lskType.lskLegacyAudios)
             ):
                 count = map.stream.readUInt32()
+                # key + first + second (uint64 each) + size (int32)
+                MapData._checkCount(map.stream, count, 28, "legacy images")
                 for i in range(count):
                     filekey = map.stream.readUInt64()
                     first = map.stream.readUInt64()
@@ -207,11 +258,14 @@ class MapData(BaseObject):  # nocov
                 recentStickersKeyOld = map.stream.readUInt64()
 
             elif keyType == lskType.lskBackgroundOldOld:
-                # TO BE ADDED
-                # map.stream >> (Window::Theme::IsNightMode()
-                #     ? legacyBackgroundKeyNight
-                #     : legacyBackgroundKeyDay);
-                map.stream >> legacyBackgroundKeyDay
+                # tdesktop reads a single quint64 here (and hands it to the
+                # night/day slot depending on the theme). fork note: this
+                # used to do `map.stream >> legacyBackgroundKeyDay`, which
+                # is the QByteArray operator — it raised TypeError (an int
+                # is not a QByteArray), and TypeError is not an
+                # OpenTeleException, so one legacy 0x08 entry aborted the
+                # whole tdata load past every handler.
+                legacyBackgroundKeyDay = map.stream.readUInt64()
 
             elif keyType == lskType.lskBackgroundOld:
                 legacyBackgroundKeyDay = map.stream.readUInt64()
@@ -301,8 +355,43 @@ class MapData(BaseObject):  # nocov
             elif keyType == lskType.lskPrefs:
                 prefsKey = map.stream.readUInt64()
 
+            # wallet keys (tdesktop storage_account.cpp) — 0x1F/0x20 are
+            # legacy single-file keys whose payload is just the FileKey;
+            # 0x21 is a counted QString -> FileKey map.
+            elif keyType == lskType.lskWalletKey:
+                # tdesktop then ClearKey()s the referenced file. We only
+                # consume the payload: a converter must not delete files
+                # out of the folder it is reading.
+                self._walletLegacyKey = FileKey(map.stream.readUInt64())
+
+            elif keyType == lskType.lskWalletEngineKey:
+                self._walletEngineLegacyKey = FileKey(map.stream.readUInt64())
+
+            elif keyType == lskType.lskWalletEngineStorages:
+                # uint32 count + count x (FileKey uint64, QString key)
+                count = map.stream.readUInt32()
+                MapData._checkCount(
+                    map.stream, count, 8 + 4, "wallet engine storages"
+                )
+                for i in range(count):
+                    we_key = FileKey(map.stream.readUInt64())
+                    we_entryKey = map.stream.readQString()
+                    ExpectStreamStatus(
+                        map.stream, "Could not read wallet engine storage entry"
+                    )
+                    walletEngineStoragesMap[we_entryKey] = we_key
+
             else:
-                logging.warning(f"Unknown key type in encrypted map: {keyType}")
+                # tdesktop's reader has no default-consume path: an
+                # unknown key type makes it fail the whole map read
+                # (`default: return ReadMapResult::Failed`), because the
+                # payload length is unknowable. fork note: we used to log
+                # a warning and keep going, which left the stream 8+ bytes
+                # behind the real entry boundary and parsed every
+                # following map entry out of the middle of a payload.
+                raise TDataBadConfigData(
+                    f"Unknown key type {keyType} in encrypted map data"
+                )
 
             ExpectStreamStatus(map.stream, "Could not stream data from mapData ")
 
@@ -342,6 +431,13 @@ class MapData(BaseObject):  # nocov
         self._botStoragesMap = botStoragesMap
         self._botStoragesNotReadMap = botStoragesNotReadMap
         self._prefsKey = prefsKey
+        # fork note: keep the own-user record instead of dropping it, so a
+        # load -> save round-trip does not lose it (prepareToWrite writes
+        # it back). The two legacy wallet keys are dropped on purpose —
+        # tdesktop reads them only to ClearKey() the referenced file and
+        # never writes those entries again.
+        self._selfSerialized = selfSerialized
+        self._walletEngineStoragesMap = walletEngineStoragesMap
         self._oldMapVersion = mapData.version
 
     def prepareToWrite(self) -> td.Storage.EncryptedDescriptor:
@@ -349,8 +445,10 @@ class MapData(BaseObject):  # nocov
 
         mapSize = 0
 
-        # TO BE ADDED
-        # if (!self.isEmpty()) mapSize += sizeof(uint32) + Serialize::bytearraySize(self);
+        # The serialized own-user record is the FIRST entry tdesktop writes
+        # (storage_account.cpp, writeMap: `<< quint32(lskSelfSerialized) << self`).
+        if not self._selfSerialized.isEmpty():
+            mapSize += sizeof(uint32) + td.Serialize.bytearraySize(self._selfSerialized)
         if len(self._draftsMap) > 0:
             mapSize += sizeof(uint32) * 2 + len(self._draftsMap) * sizeof(uint64) * 2
         if len(self._draftCursorsMap) > 0:
@@ -407,6 +505,11 @@ class MapData(BaseObject):  # nocov
             mapSize += sizeof(uint32) + sizeof(uint64)
         if self._mediaLastPlaybackPositions:
             mapSize += sizeof(uint32) + sizeof(uint64)
+        if len(self._walletEngineStoragesMap) > 0:
+            mapSize += sizeof(uint32) * 2
+            for we_entry_key in self._walletEngineStoragesMap:
+                # uint64 FileKey + QString (uint32 byte-length + UTF-16)
+                mapSize += sizeof(uint64) + sizeof(uint32) + 2 * len(we_entry_key)
         if len(self._botStoragesMap) > 0:
             mapSize += (
                 sizeof(uint32) * 2 + len(self._botStoragesMap) * sizeof(uint64) * 2
@@ -416,6 +519,12 @@ class MapData(BaseObject):  # nocov
 
         mapData = td.Storage.EncryptedDescriptor(mapSize)
         stream = mapData.stream
+
+        # tdesktop writes the own-user record first; keep that position so
+        # the byte layout matches (MapData::writeMap).
+        if not self._selfSerialized.isEmpty():
+            stream.writeUInt32(lskType.lskSelfSerialized)
+            stream << self._selfSerialized
 
         if len(self._draftsMap) > 0:
             stream.writeUInt32(lskType.lskDraft)
@@ -508,6 +617,12 @@ class MapData(BaseObject):  # nocov
         if self._mediaLastPlaybackPositions:
             stream.writeUInt32(lskType.lskMediaLastPlaybackPositions)
             stream.writeUInt64(self._mediaLastPlaybackPositions)
+        if len(self._walletEngineStoragesMap) > 0:
+            stream.writeUInt32(lskType.lskWalletEngineStorages)
+            stream.writeUInt32(len(self._walletEngineStoragesMap))
+            for we_entry_key, we_file_key in self._walletEngineStoragesMap.items():
+                stream.writeUInt64(we_file_key)
+                stream.writeQString(we_entry_key)
         if len(self._botStoragesMap) > 0:
             stream.writeUInt32(lskType.lskBotStorages)
             stream.writeUInt32(len(self._botStoragesMap))
@@ -622,13 +737,37 @@ class StorageAccount(BaseObject):  # nocov
         # mtp = ReadEncryptedFile(ToFilePart(self.__dataNameKey), self.__basePath, self.localKey)
         mtp = td.Storage.ReadEncryptedFile(td.Storage.ToFilePart(self.__dataNameKey), self.__baseGlobalPath, self.localKey)  # type: ignore
 
-        blockId = mtp.stream.readInt32()
+        # tdesktop (storage_account.cpp, Account::readMtpData) is a LOOP
+        # over blocks: `while (!mtp.stream.atEnd())` reads a blockId, fails
+        # the whole read on a bad stream status, and hands the block to
+        # ReadSetting. fork note: this used to read exactly ONE block and
+        # assume it had to be dbi.MtpAuthorization — any file carrying more
+        # than one block (every legacy tgmint/tdesktop file does) lost
+        # everything after the first, and a truncated stream was accepted
+        # without ever checking the status.
+        context = td.Storage.ReadSettingsContext()
 
-        Expects(blockId == 75, TDataInvalidMagic("Not supported file version"))
+        while not mtp.stream.atEnd():
+            blockId = mtp.stream.readUInt32()
+            ExpectStreamStatus(
+                mtp.stream, "Could not read a block id from the mtp data"
+            )
 
-        serialized = QByteArray()
-        mtp.stream >> serialized
-        self.owner._setMtpAuthorization(serialized)
+            Expects(
+                td.Storage.ReadSetting(
+                    blockId, mtp.stream, mtp.version, context
+                ),
+                TDataBadConfigData(
+                    f"Could not read block {blockId} from the mtp data"
+                ),
+            )
+
+        Expects(
+            not context.mtpAuthorization.isEmpty(),
+            TDataBadConfigData("No mtp authorization found in the mtp data"),
+        )
+
+        self.owner._setMtpAuthorization(context.mtpAuthorization)
 
     def readMtpConfig(self) -> td.MTP.Config:
         # Intended for internal usage only

@@ -102,7 +102,19 @@ class Storage(BaseObject):
             self.__buffer = QBuffer()
             self.__stream = QDataStream()
 
-            if size:
+            # fork note: this used to be `if size:` — a size of 0 (an empty
+            # map, a record with no fields) left the descriptor completely
+            # uninitialised, so its stream had no device and every write
+            # silently became a WriteFailed no-op: PrepareEncrypted then
+            # produced a bogus record for a legitimately empty payload.
+            # tdesktop has two constructors — the default one (used by
+            # DecryptLocal, which installs the buffer itself) and the
+            # sized one, which always initialises — so `size is not None`
+            # is the faithful split. Note the sized form ALWAYS leaves the
+            # 4-byte length prefix in the data (resize(4)), which is what
+            # makes a size-0 payload a valid, decryptable record.
+            if size is not None:
+                size = max(0, int(size))
                 fullSize = 4 + size
                 if fullSize & 0x0F:
                     fullSize += 0x10 - (fullSize & 0x0F)
@@ -254,13 +266,44 @@ class Storage(BaseObject):
     @staticmethod
     def ReadFile(fileName: str, basePath: str) -> FileReadDescriptor:
 
-        to_try = ["s", "1", "0"]
+        # Candidate order is tdesktop's (storage/details/
+        # storage_file_utilities.cpp, ReadFile): the modern "<base>s" wins
+        # outright when it exists; otherwise fall back to the legacy pair
+        # "<base>0"/"<base>1" and try the NEWER one (by mtime) first. When
+        # only one of the legacy files exists, only that one is tried.
+        # fork note: this used to try "s", "1", "0" unconditionally, which
+        # read a stale backup ahead of the live file and tried files that
+        # were never candidates in tdesktop.
+        base = Storage.PathJoin(basePath, fileName)
+        to_try: typing.List[str] = []
+        modern = base + "s"
+        if os.path.exists(modern):
+            to_try = [modern]
+        else:
+            legacy0 = base + "0"
+            legacy1 = base + "1"
+            if os.path.exists(legacy0):
+                if os.path.exists(legacy1):
+                    try:
+                        newer_first = os.path.getmtime(legacy0) < os.path.getmtime(
+                            legacy1
+                        )
+                    except OSError:
+                        newer_first = False
+                    to_try = (
+                        [legacy1, legacy0] if newer_first else [legacy0, legacy1]
+                    )
+                else:
+                    to_try = [legacy0]
+            else:
+                to_try = [legacy1]
+
         tries_exception = None
-        for chr in to_try:
+        for path in to_try:
             # fork note: no try/except IOError here — QFile.open() signals
             # failure through its return value, it never raises Python
             # IOError; a real OSError (disk failure etc.) should propagate.
-            file = QFile(Storage.PathJoin(basePath, fileName + chr))
+            file = QFile(path)
             if not file.open(QIODevice.OpenModeFlag.ReadOnly):
                 tries_exception = TFileNotFound(f"Could not open {fileName}")
                 continue
@@ -269,7 +312,7 @@ class Storage(BaseObject):
 
             if magic != TDF_MAGIC:
                 tries_exception = TDataInvalidMagic(
-                    "Invalid magic {magic} in file {fileName}"
+                    f"Invalid magic {magic} in file {fileName}"
                 )
                 file.close()
                 continue
@@ -279,6 +322,19 @@ class Storage(BaseObject):
             bytesdata = QByteArray(file.read(file.size()))
 
             dataSize = bytesdata.size() - 16
+
+            # fork note: tdesktop skips a file whose payload is too short to
+            # even carry the 16-byte md5 trailer ("could not read sign
+            # part"). Without this guard a truncated file made the
+            # int.to_bytes()/slice arithmetic below blow up with a bare
+            # OverflowError instead of a TData exception.
+            if dataSize < 0:
+                tries_exception = TDataInvalidCheckSum(
+                    f"File {fileName} is too short to carry a signature "
+                    f"({bytesdata.size()} bytes)"
+                )
+                file.close()
+                continue
 
             check_md5 = bytesdata.data()[:dataSize]
             check_md5 += int(dataSize).to_bytes(4, "little")
@@ -290,7 +346,7 @@ class Storage(BaseObject):
 
             if check_md5.hexdigest() != md5.hex():
                 tries_exception = TDataInvalidCheckSum(
-                    "Invalid checksum {check_md5.hexdigest()} in file {fileName}"
+                    f"Invalid checksum {check_md5.hexdigest()} in file {fileName}"
                 )
                 file.close()
                 continue
@@ -472,11 +528,26 @@ class Storage(BaseObject):
     def CreateLegacyLocalKey(
         salt: QByteArray, passcode: QByteArray = QByteArray()
     ) -> td.AuthKey:
+        # tdesktop's CreateLegacyLocalKey (storage/details/
+        # storage_file_utilities.cpp):
+        #
+        #   PKCS5_PBKDF2_HMAC_SHA1(passcode, salt,
+        #       passcode.isEmpty() ? LocalEncryptNoPwdIterCount
+        #                          : LocalEncryptIterCount, 256, key)
+        #
+        # with LocalEncryptIterCount = 4000 and LocalEncryptNoPwdIterCount
+        # = 4 (config.h). The legacy map key is SHA-1 based, NOT the
+        # SHA-512/100k of CreateLocalKey -- a different KDF family, so the
+        # two are not interchangeable. fork note: this used to run
+        # SHA-512 with 100000 iterations, i.e. a key no tdesktop build ever
+        # derived, so legacy (passcode-only) map files could never be
+        # opened. The argument order is (salt, passcode) here to match the
+        # call sites; PBKDF2 gets password=passcode, salt=salt, as in C++.
 
-        iterationsCount = 1 if passcode.isEmpty() else 100000
+        iterationsCount = 4 if passcode.isEmpty() else 4000
         return td.AuthKey(
             hashlib.pbkdf2_hmac(
-                "sha512", passcode.data(), salt.data(), iterationsCount, 256
+                "sha1", passcode.data(), salt.data(), iterationsCount, 256
             )
         )
 
@@ -501,7 +572,7 @@ class Storage(BaseObject):
 
         encryptedSize = encrypted.size()
         if (encryptedSize <= 16) or (encryptedSize & 0x0F):
-            raise TDataBadEncryptedDataSize("Bad encrypted part size: {encryptedSize}")
+            raise TDataBadEncryptedDataSize(f"Bad encrypted part size: {encryptedSize}")
 
         fullLen = encryptedSize - 16
         encryptedKey = encrypted[:16]
@@ -519,7 +590,7 @@ class Storage(BaseObject):
         )  # *(const uint32*)decrypted.constData();
         if (dataLen > decrypted.size()) or (dataLen <= fullLen - 16) or (dataLen < 4):
             raise TDataBadDecryptedDataSize(
-                "Bad decrypted part size: {encryptedSize}, fullLen: {fullLen}, decrypted size: {decrypted.__len__()}"
+                f"Bad decrypted part size: {encryptedSize}, fullLen: {fullLen}, decrypted size: {len(decrypted)}"
             )
 
         decrypted.resize(dataLen)
@@ -538,8 +609,13 @@ class Storage(BaseObject):
 
     @staticmethod
     def ComposeDataString(dataName: str, index: int):
-        result = dataName
-        result.replace("#", "")
+        # tdesktop (main/main_account.cpp, ComposeDataString): strip every
+        # '#' from the base name, then append '#<index + 1>' for accounts
+        # after the first. fork note: `result.replace(...)` on a str is a
+        # no-op -- the stripped result was thrown away, so a keyFile that
+        # already contained '#' produced "data#1#2" style names that do not
+        # match what tdesktop/opentele would compute.
+        result = dataName.replace("#", "")
         if index > 0:
             result += f"#{index + 1}"
         return result

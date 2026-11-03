@@ -131,6 +131,41 @@ def passkey_store(user_id=USER_ID, dc_id=DC_ID, **overrides):
     return data
 
 
+#: session-format label -> the codec writer whose string that label stores
+_WRITERS = {
+    "telethon-string": telethon.write_string,
+    "telethon-session": telethon.write_string,
+    "pyrogram-string": pyrogram.write_string,
+    "pyrogram-session": pyrogram.write_string,
+    "gramjs-string": gramjs.write_string,
+}
+
+
+def broken_container(session_data, session_format, *, fingerprint=None, passkey=None):
+    """Assemble a container by hand, exactly in the shape ``seal()`` writes.
+
+    The negative cross-validation cases need parts that disagree with each
+    other; ``seal()`` refuses those (it must never publish an envelope
+    ``open_profile`` rejects), so the broken container is built here
+    instead — same JSON tree, no validation.
+    """
+    return {
+        "format": FORMAT,
+        "session": {
+            "format": session_format,
+            "encoding": "utf8",
+            "data": _WRITERS[session_format](session_data),
+        },
+        "fingerprint": fingerprint,
+        "passkey": passkey,
+        "meta": {
+            "created": "2026-11-01T00:00:00+00:00",
+            "tgmint": "test",
+            "note": "",
+        },
+    }
+
+
 class PlainRoundTrip(unittest.TestCase):
     def test_round_trip_keeps_every_part(self):
         tmp = tempfile.mkdtemp()
@@ -279,12 +314,58 @@ class SessionPayloads(unittest.TestCase):
 
 
 class Correlation(unittest.TestCase):
-    """Cross-validation: the envelope's parts must describe one account."""
+    """Cross-validation: the envelope's parts must describe one account.
+
+    ``seal()`` refuses a mismatched set of parts (it must never publish an
+    envelope ``open_profile`` would reject), so a deliberately broken
+    container for the read-side cases is assembled by hand with
+    :func:`broken_container` — the shape ``seal()`` writes, minus the
+    validation.
+    """
+
+    def test_seal_refuses_a_fingerprint_user_id_mismatch(self):
+        with self.assertRaises(ProfileError) as ctx:
+            seal(
+                session(user_id=111),
+                "pyrogram-string",
+                fingerprint=fingerprint_data(user_id=222),
+            )
+        message = str(ctx.exception)
+        self.assertIn("111", message)
+        self.assertIn("222", message)
+        self.assertIn("user_id", message)
+
+    def test_seal_refuses_a_fingerprint_dc_mismatch(self):
+        with self.assertRaises(ProfileError) as ctx:
+            seal(
+                session(dc_id=2),
+                "telethon-string",
+                fingerprint=fingerprint_data(dc_id=4),
+            )
+        self.assertIn("dc_id", str(ctx.exception))
+
+    def test_seal_refuses_another_accounts_passkey(self):
+        with self.assertRaises(ProfileError) as ctx:
+            seal(
+                session(user_id=111),
+                "pyrogram-string",
+                passkey=passkey_store(user_id=999),
+            )
+        message = str(ctx.exception)
+        self.assertIn("passkey", message)
+        self.assertIn("999", message)
+
+    def test_seal_refuses_an_unloadable_fingerprint_dict(self):
+        # an identity open_profile could not load back is refused at seal
+        # time instead of published as an unopenable envelope
+        with self.assertRaises(ProfileError) as ctx:
+            seal(session(), "telethon-string", fingerprint={"api_id": 1})
+        self.assertIn("fingerprint", str(ctx.exception))
 
     def test_fingerprint_user_id_mismatch(self):
         # pyrogram-string is the codec string that keeps user_id, so the
         # cross-check has something to compare against
-        container = seal(
+        container = broken_container(
             session(user_id=111),
             "pyrogram-string",
             fingerprint=fingerprint_data(user_id=222),
@@ -297,7 +378,7 @@ class Correlation(unittest.TestCase):
         self.assertIn("user_id", message)
 
     def test_fingerprint_dc_mismatch(self):
-        container = seal(
+        container = broken_container(
             session(dc_id=2),
             "telethon-string",
             fingerprint=fingerprint_data(dc_id=4),
@@ -310,7 +391,7 @@ class Correlation(unittest.TestCase):
         self.assertIn("4", message)
 
     def test_passkey_of_another_account(self):
-        container = seal(
+        container = broken_container(
             session(user_id=111),
             "pyrogram-string",
             passkey=passkey_store(user_id=999),
@@ -321,6 +402,24 @@ class Correlation(unittest.TestCase):
         self.assertIn("passkey", message)
         self.assertIn("111", message)
         self.assertIn("999", message)
+
+    def test_crafted_non_integer_ids_raise_profile_error(self):
+        # a crafted container must never escape as a bare TypeError from
+        # int(): one exception type covers every read-side failure
+        for fingerprint in (
+            fingerprint_data(user_id=[1, 2]),
+            fingerprint_data(user_id={"id": 1}),
+            fingerprint_data(dc_id=object()),
+            fingerprint_data(dc_id=[4]),
+            fingerprint_data(user_id=1.5),
+        ):
+            with self.subTest(fingerprint=fingerprint):
+                with self.assertRaises(ProfileError):
+                    open_profile(
+                        broken_container(
+                            session(), "pyrogram-string", fingerprint=fingerprint
+                        )
+                    )
 
     def test_matching_parts_are_accepted(self):
         container = seal(

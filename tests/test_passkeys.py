@@ -5,6 +5,7 @@ receives a registration and a login assertion: parse the attestation
 object, rebuild the public key from the COSE blob, and verify the
 Ed25519/ES256 signature over clientDataJSON hash || authenticatorData.
 """
+import asyncio
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ from tgmint.passkeys import (
     _b64u_decode,
     _b64u_encode,
     _cbor_encode,
+    login_with_passkey,
 )
 from telethon.extensions import BinaryReader
 from telethon.tl.tlobject import TLObject
@@ -536,6 +538,308 @@ class TestTlWire(unittest.TestCase):
             self.assertIsInstance(bytes(req), bytes)
             self.assertIsInstance(req.to_dict(), dict)
             str(req)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 2026-11 code review regressions (Telethon driver only)
+# ---------------------------------------------------------------------------
+
+def _raw_finish_fields(**extra):
+    """A finishPasskeyLogin field dict, written by hand (no core builder)."""
+    fields = {
+        "credential": {
+            "id": "BBB",
+            "raw_id": "BBB",
+            "response": {
+                "_": "inputPasskeyResponseLogin",
+                "client_data": '{"type":"webauthn.get"}',
+                "authenticator_data": b"\x00" * 37,
+                "signature": b"\x09" * 64,
+                "user_handle": "2:123456789",
+            },
+        },
+    }
+    fields.update(extra)
+    return fields
+
+
+class TestUnsignedLongFields(unittest.TestCase):
+    """The driver accepts the *unsigned* auth key ids every framework hands out.
+
+    ``_construct`` used to feed the value straight into
+    ``FinishPasskeyLoginRequest``, whose ``struct.pack("<q", ...)`` raises
+    ``struct.error`` for ids >= 2**63 — half of them — although the neutral
+    writer and the pyrogram driver both accept them.
+    """
+
+    def _build(self, fields):
+        from tgmint import passkeys as drv
+
+        key, spec = drv._message_spec("finishPasskeyLogin")
+        return drv._build_request(key, spec, fields)
+
+    def test_unsigned_id_is_normalized_like_the_core(self):
+        from tgmint import passkeys_core as core
+
+        for key_id in ((1 << 63) + 0x0BADF00D, (1 << 64) - 1, 0, 0x1122334455667788):
+            with self.subTest(key_id=key_id):
+                fields = _raw_finish_fields(from_dc_id=2, from_auth_key_id=key_id)
+                request = self._build(fields)
+                self.assertEqual(
+                    bytes(request), core.encode_request("finishPasskeyLogin", fields))
+                self.assertLess(request.from_auth_key_id, 1 << 63)
+
+    def test_negative_ids_stay_negative(self):
+        request = self._build(_raw_finish_fields(from_dc_id=2, from_auth_key_id=-5))
+        self.assertEqual(request.from_auth_key_id, -5)
+
+    def test_out_of_range_ids_are_still_rejected(self):
+        for bad in (1 << 64, -(1 << 63) - 1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PasskeyError):
+                    self._build(_raw_finish_fields(from_dc_id=2, from_auth_key_id=bad))
+
+
+class _RaisingClient:
+    """A Telethon-shaped client whose every request raises ``exc``."""
+
+    api_id = 2040
+    api_hash = "b18441a1ff607e10a989891a5462e627"
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.requests = []
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        raise self.exc
+
+
+class TestServerErrorTranslation(unittest.TestCase):
+    """A passkey server error is a PasskeyError on both drivers."""
+
+    def _invoker(self, exc):
+        from tgmint.passkeys import TelethonInvoker
+
+        return TelethonInvoker(_RaisingClient(exc))
+
+    def test_passkey_server_errors_become_passkey_errors(self):
+        from telethon.errors import BadRequestError
+
+        for message, hint in (
+            ("PASSKEY_ORIGIN_MISMATCH", "origin"),
+            ("PASSKEY_CHALLENGE_EXPIRED", "challenge"),
+            ("PASSKEY_CREDENTIAL_NOT_FOUND", "credential"),
+            ("PASSKEY_SIGNATURE_INVALID", "corrupt"),
+        ):
+            with self.subTest(message=message):
+                invoker = self._invoker(BadRequestError(object(), message, 400))
+                with self.assertRaises(PasskeyError) as ctx:
+                    asyncio.run(invoker.native("initPasskeyRegistration", {}))
+                self.assertIn(message, str(ctx.exception))
+                self.assertIn(hint, str(ctx.exception))
+
+    def test_the_2fa_signal_is_not_a_passkey_error(self):
+        from telethon.errors import SessionPasswordNeededError
+        from tgmint import passkeys_core as core
+
+        invoker = self._invoker(SessionPasswordNeededError(object()))
+        with tempfile.TemporaryDirectory() as tmp:
+            fields = _finish_fields_for(tmp)
+            with self.assertRaises(core.TwoFactorRequired) as ctx:
+                asyncio.run(invoker.native("finishPasskeyLogin", fields))
+        self.assertNotIsInstance(ctx.exception, PasskeyError)
+
+    def test_other_rpc_errors_keep_their_own_type(self):
+        from telethon.errors import BadRequestError
+
+        exc = BadRequestError(object(), "PHONE_NUMBER_INVALID", 400)
+        invoker = self._invoker(exc)
+        with self.assertRaises(BadRequestError):
+            asyncio.run(invoker.native(
+                "initPasskeyLogin", {"api_id": 2040, "api_hash": "hash"}))
+
+
+def _finish_fields_for(tmpdir, home_dc=2):
+    """The core's finishPasskeyLogin field dict for a fresh credential."""
+    from tgmint import passkeys_core as core
+
+    options = json.loads(REG_OPTIONS)
+    options["user"]["id"] = _b64u_encode(f"{home_dc}:123456789".encode())
+    cred = SoftwareAuthenticator.create_credential(json.dumps(options), alg=ALG_ES256)
+    store = PasskeyStore.from_credential(cred, path=os.path.join(tmpdir, "k.json"))
+    assertion = store.produce_assertion(
+        login_options(os.urandom(32), _b64u_encode(cred.credential_id)))
+    return core.finish_login_fields(assertion)
+
+
+class _FakeAuthKey:
+    def __init__(self, key, key_id):
+        self.key = key
+        self.key_id = key_id
+
+
+class _FakeSession:
+    """The slice of a Telethon ``Session`` that ``_switch_dc`` rewrites."""
+
+    def __init__(self, dc_id, server_address, port, auth_key):
+        self.dc_id = dc_id
+        self.server_address = server_address
+        self.port = port
+        self.auth_key = auth_key
+        self.saves = 0
+
+    def set_dc(self, dc_id, server_address, port):
+        self.dc_id = dc_id
+        self.server_address = server_address
+        self.port = port
+
+    def save(self):
+        self.saves += 1
+
+
+class _SwitchableClient:
+    """Just enough of a Telethon client for :func:`login_with_passkey`."""
+
+    api_id = 2040
+    api_hash = "b18441a1ff607e10a989891a5462e627"
+
+    def __init__(self, session, login_options_json, finish_error):
+        self.session = session
+        self.login_options_json = login_options_json
+        self.finish_error = finish_error
+        self.switched_to = []
+        self.connects = 0
+        self.disconnects = 0
+        self.signed_in = []
+
+    async def __call__(self, request):
+        from tgmint.passkeys import FinishPasskeyLoginRequest, InitPasskeyLoginRequest
+
+        if isinstance(request, InitPasskeyLoginRequest):
+            return (
+                struct.pack("<I", 0xE2037789)
+                + struct.pack("<I", 0x7D748D04)
+                + TLObject.serialize_bytes(self.login_options_json)
+            )
+        assert isinstance(request, FinishPasskeyLoginRequest), request
+        raise self.finish_error
+
+    async def _switch_dc(self, dc_id):
+        # what Telethon's _switch_dc does to the caller's session
+        self.switched_to.append(dc_id)
+        self.session.set_dc(dc_id, "91.108.4.1", 443)
+        self.session.auth_key = None
+        self.session.save()
+
+    async def _disconnect(self):
+        self.disconnects += 1
+
+    async def connect(self):
+        self.connects += 1
+
+    async def sign_in(self, password=None):
+        self.signed_in.append(password)
+        return "me"
+
+    async def _on_login(self, user):
+        return user
+
+
+class TestDatacenterRollback(unittest.TestCase):
+    """A failed finish must not leave the caller's session on another DC.
+
+    ``client._switch_dc`` rewrites the persistent session (new DC, auth key
+    erased); without the rollback one expired challenge permanently moved the
+    session file and lost its key.
+    """
+
+    def _store(self, tmpdir, home_dc=4):
+        options = json.loads(REG_OPTIONS)
+        options["user"]["id"] = _b64u_encode(f"{home_dc}:123456789".encode())
+        cred = SoftwareAuthenticator.create_credential(json.dumps(options), alg=ALG_ES256)
+        store = PasskeyStore.from_credential(cred, path=os.path.join(tmpdir, "k.json"))
+        store.save()
+        return store
+
+    def _client(self, store, finish_error):
+        session = _FakeSession(2, "149.154.167.51", 443, _FakeAuthKey(b"\x7f" * 256, 0x0123456789))
+        return _SwitchableClient(
+            session,
+            login_options(os.urandom(32), _b64u_encode(store.credential_id)),
+            finish_error,
+        )
+
+    def test_a_failed_finish_restores_the_session(self):
+        from telethon.errors import BadRequestError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            client = self._client(
+                store, BadRequestError(object(), "PASSKEY_CHALLENGE_EXPIRED", 400))
+            original_key = client.session.auth_key
+            with self.assertRaises(PasskeyError) as ctx:
+                asyncio.run(login_with_passkey(client, path=store.path))
+            self.assertIn("PASSKEY_CHALLENGE_EXPIRED", str(ctx.exception))
+            self.assertEqual(client.switched_to, [4])
+            self.assertEqual(client.session.dc_id, 2)
+            self.assertEqual(client.session.server_address, "149.154.167.51")
+            self.assertEqual(client.session.port, 443)
+            self.assertIs(client.session.auth_key, original_key)
+            self.assertEqual(client.session.auth_key.key, b"\x7f" * 256)
+            # ... and the connection was re-opened on the restored DC
+            self.assertEqual((client.disconnects, client.connects), (1, 1))
+
+    def test_two_factor_without_a_password_propagates_and_restores(self):
+        from telethon.errors import SessionPasswordNeededError
+        from tgmint import passkeys_core as core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            client = self._client(store, SessionPasswordNeededError(object()))
+            with self.assertRaises(core.TwoFactorRequired) as ctx:
+                asyncio.run(login_with_passkey(client, path=store.path))
+            self.assertNotIsInstance(ctx.exception, PasskeyError)
+            self.assertEqual(client.signed_in, [])
+            self.assertEqual(client.session.dc_id, 2)
+            self.assertIsInstance(client.session.auth_key, _FakeAuthKey)
+
+    def test_a_same_dc_login_needs_no_rollback(self):
+        from telethon.errors import BadRequestError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, home_dc=2)
+            client = self._client(
+                store, BadRequestError(object(), "PASSKEY_SIGNATURE_INVALID", 400))
+            with self.assertRaises(PasskeyError):
+                asyncio.run(login_with_passkey(client, path=store.path))
+            # nothing was switched, so nothing is torn down either
+            self.assertEqual(client.switched_to, [])
+            self.assertEqual((client.disconnects, client.connects), (0, 0))
+            self.assertEqual(client.session.dc_id, 2)
+
+
+class TestRegisterPasskeyApiDrift(unittest.TestCase):
+    """register_passkey mirrors the pyrogram driver's signature (alg=)."""
+
+    def test_two_factor_required_is_reexported(self):
+        from tgmint import passkeys as telethon_driver
+        from tgmint import passkeys_core as core
+
+        self.assertIs(telethon_driver.TwoFactorRequired, core.TwoFactorRequired)
+        self.assertIn("TwoFactorRequired", telethon_driver.__all__)
+
+    def test_the_alg_parameter_exists_on_both_drivers(self):
+        import inspect
+
+        from tgmint import passkeys as telethon_driver
+        from tgmint import passkeys_pyrogram as pyrogram_driver
+
+        for module in (telethon_driver, pyrogram_driver):
+            with self.subTest(module=module.__name__):
+                parameters = inspect.signature(module.register_passkey).parameters
+                self.assertIn("alg", parameters)
+                self.assertIsNone(parameters["alg"].default)
 
 
 if __name__ == "__main__":

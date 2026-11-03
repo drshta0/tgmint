@@ -417,7 +417,25 @@ class TDesktop(BaseObject):
 
         keyInnerData = td.Storage.DecryptLocal(keyEncrypted, self.passcodeKey)  # type: ignore
 
-        self.__localKey = td.AuthKey(keyInnerData.stream.readRawData(256))
+        # fork note: tdesktop reads the wrapped local key as
+        # `Serialize::read<MTP::AuthKey::Data>(keyInnerData.stream)` and
+        # then requires `status() == Ok && atEnd()` — i.e. exactly one
+        # 256-byte key and nothing else. The old code called
+        # readRawData(256) and trusted the result: a truncated or corrupt
+        # key blob silently produced a short/garbage AuthKey instead of a
+        # proper TData* error.
+        localKeyBytes = keyInnerData.stream.readRawData(td.AuthKey.kSize)  # type: ignore
+        Expects(
+            keyInnerData.stream.status() == QDataStream.Status.Ok,
+            QDataStreamFailed("Could not read the local key from key data"),
+        )
+        Expects(
+            len(localKeyBytes) == td.AuthKey.kSize,
+            QDataStreamFailed(
+                f"Bad local key size in key data: {len(localKeyBytes)}"
+            ),
+        )
+        self.__localKey = td.AuthKey(localKeyBytes)
         self.__passcodeKeyEncrypted = keyEncrypted
         self.__passcodeKeySalt = salt
 
@@ -425,6 +443,22 @@ class TDesktop(BaseObject):
         count = info.stream.readInt32()
 
         Expects(count > 0, "accountsCount is zero, the data might has been corrupted")
+
+        # tdesktop (storage/storage_domain.cpp, Domain::startFromStorage):
+        #   if (count <= 0 || count > Main::Domain::kPremiumMaxAccounts)
+        #       return StartModernResult::Failed;
+        # kPremiumMaxAccounts is 6, the same cap we enforce per index below.
+        # fork note: the count was previously unbounded, so a craftable key
+        # file could declare ~4G accounts and the loop below (each iteration
+        # constructing an Account and running a full prepareToStart) turned
+        # into an effective hang.
+        Expects(
+            count <= TDesktop.kMaxAccounts,
+            TDataBadConfigData(
+                f"implausible accounts count {count} in key data "
+                f"(max {TDesktop.kMaxAccounts})"
+            ),
+        )
 
         for i in range(count):
             index = info.stream.readInt32()

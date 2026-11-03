@@ -524,23 +524,62 @@ class TestReplay(unittest.TestCase):
         # the replay did not stop: every step was attempted
         self.assertEqual(client.calls, len(statuses))
 
-    def test_connection_failure_is_reraised(self):
+    def test_connection_failure_stops_the_replay_with_a_partial_report(self):
+        # a fatal stop raises BootstrapError (not the raw exception) and
+        # carries what had already been sent, so a caller is never left
+        # guessing which steps reached Telegram
         client = FakeClient(fatal_at=2, fatal=ConnectionResetError("wifi is down"))
-        with self.assertRaises(ConnectionResetError):
+        with self.assertRaises(BootstrapError) as ctx:
             asyncio.run(
                 replay_startup(client, platform="android", request=lambda s: s.name)
             )
+        error = ctx.exception
+        self.assertIn("step 2", str(error))
+        self.assertIsInstance(error.__cause__, ConnectionResetError)
+        self.assertEqual(error.stopped_at, 2)
+        self.assertEqual(error.sent, 1)
+        self.assertEqual(error.report["sent"], 1)
+        self.assertEqual(
+            [entry["status"] for entry in error.report["steps"]], ["sent", "error"]
+        )
+        self.assertEqual(len(error.report["errors"]), 1)
         self.assertEqual(client.calls, 2)
 
-    def test_auth_named_failure_is_reraised(self):
+    def test_auth_named_failure_stops_the_replay_with_a_partial_report(self):
         class AuthKeyUnregisteredError(Exception):
             pass
 
         client = FakeClient(fatal_at=1, fatal=AuthKeyUnregisteredError("dead key"))
-        with self.assertRaises(AuthKeyUnregisteredError):
+        with self.assertRaises(BootstrapError) as ctx:
             asyncio.run(
                 replay_startup(client, platform="android", request=lambda s: s.name)
             )
+        self.assertEqual(ctx.exception.stopped_at, 1)
+        self.assertIsInstance(ctx.exception.__cause__, AuthKeyUnregisteredError)
+        self.assertEqual(ctx.exception.sent, 0)
+
+    def test_a_hung_step_times_out_instead_of_stalling(self):
+        class SleepingClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def __call__(self, request):
+                self.calls += 1
+                await asyncio.sleep(5)
+
+        client = SleepingClient()
+        with self.assertRaises(BootstrapError) as ctx:
+            asyncio.run(
+                replay_startup(
+                    client,
+                    platform="android",
+                    request=lambda s: s.name,
+                    step_timeout=0.01,
+                )
+            )
+        self.assertIn("step 1", str(ctx.exception))
+        self.assertEqual(ctx.exception.sent, 0)
+        self.assertEqual(client.calls, 1)
 
     def test_dry_run_makes_zero_calls(self):
         client = FakeClient()
@@ -949,8 +988,70 @@ class BootstrapCliTest(unittest.TestCase):
         self.assertEqual(payload["errors"], [])
         self.assertEqual(client.connects, 1)
         self.assertEqual(client.disconnects, 1)
+        # nothing was recorded, so this replay minted its identity
+        self.assertEqual(payload["identity"]["source"], "minted")
+        self.assertIsNone(payload["identity"]["path"])
 
-    def test_live_replay_reports_a_dead_auth_key_as_exit_1(self):
+    def test_live_replay_presents_the_recorded_identity(self):
+        # Telegram remembers the device a session signed in with, so a
+        # replay must present the sidecar's identity, not a fresh one
+        sidecar = self._sidecar(API.TelegramDesktop.Generate(unique_id="recorded"))
+        recorded = Fingerprint.load(sidecar)
+        client = FakeClient()
+        with mock.patch.object(
+            bootstrap, "make_client", return_value=client
+        ) as factory:
+            code, out, err = run_cli(
+                [
+                    "bootstrap", "--preset", "desktop",
+                    "--session", self.session, "--json",
+                ]
+            )
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["identity"]["source"], "recorded")
+        self.assertEqual(payload["identity"]["path"], sidecar)
+        presented = factory.call_args.kwargs["api"]
+        self.assertEqual(presented.api_id, recorded.api_id)
+        self.assertEqual(presented.device_model, recorded.device_model)
+        self.assertEqual(presented.app_version, recorded.app_version)
+
+    def test_api_preset_from_another_family_is_refused(self):
+        client = FakeClient()
+        with mock.patch.object(bootstrap, "make_client", return_value=client) as factory:
+            code, out, err = run_cli(
+                [
+                    "bootstrap", "--preset", "android", "--api-preset", "desktop",
+                    "--session", self.session, "--json",
+                ]
+            )
+        self.assertEqual(code, 2, err)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertIn("does not match the android replay", payload["error"])
+        factory.assert_not_called()
+
+    def test_a_recorded_identity_from_another_family_is_refused(self):
+        # a desktop sidecar cannot be presented to an android replay
+        self._sidecar(API.TelegramDesktop.Generate(unique_id="mismatch"))
+        client = FakeClient()
+        with mock.patch.object(bootstrap, "make_client", return_value=client) as factory:
+            code, out, err = run_cli(
+                [
+                    "bootstrap", "--preset", "android",
+                    "--session", self.session, "--json",
+                ]
+            )
+        self.assertEqual(code, 2, err)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertIn("desktop", payload["error"])
+        self.assertIn("android", payload["error"])
+        factory.assert_not_called()
+
+    def test_live_replay_reports_a_dead_auth_key_as_exit_2(self):
+        # exit 1 is reserved for "audit found problems"; a failed replay is
+        # an error, like every other runtime failure in this CLI
         class AuthKeyUnregisteredError(Exception):
             pass
 
@@ -964,10 +1065,13 @@ class BootstrapCliTest(unittest.TestCase):
                     "--session", self.session, "--json",
                 ]
             )
-        self.assertEqual(code, 1, err)
+        self.assertEqual(code, 2, err)
         payload = json.loads(out)
         self.assertFalse(payload["ok"])
-        self.assertIn("bootstrap failed", payload["error"])
+        self.assertIn("the key is not registered", payload["error"])
+        # the partial report is attached, so a caller sees what was sent
+        self.assertEqual(payload["stopped_at"], 1)
+        self.assertEqual(payload["partial_report"]["sent"], 0)
         self.assertEqual(client.disconnects, 1)
 
     def test_live_replay_survives_a_per_request_error(self):
@@ -992,7 +1096,9 @@ class BootstrapCliTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 cli.main(["bootstrap", "--help"])
         self.assertEqual(ctx.exception.code, 0, err.getvalue())
-        text = out.getvalue().lower()
+        # argparse wraps the description, so a phrase can straddle a line
+        # break: compare on normalized whitespace
+        text = " ".join(out.getvalue().lower().split())
         for phrase in ("read-only", "initconnection", "refused", "no batch mode"):
             self.assertIn(phrase, text)
         self.assertIn("--dry-run", text)

@@ -50,7 +50,7 @@ try:
 
     __version__ = _dist_version("tgmint")
 except Exception:
-    __version__ = "1.18.0"
+    __version__ = "1.18.1"
 
 
 def __getattr__(name: str):

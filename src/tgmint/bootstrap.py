@@ -71,6 +71,8 @@ builder, so ``import tgmint.bootstrap`` works without Telethon installed
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import typing
 from dataclasses import dataclass
 
@@ -84,6 +86,7 @@ __all__ = [
     "PHASES",
     "PLATFORMS",
     "SAFE_METHODS",
+    "STEP_TIMEOUT_SECONDS",
     "Step",
     "describe",
     "is_forbidden",
@@ -94,7 +97,30 @@ __all__ = [
 
 
 class BootstrapError(Exception):
-    """The replay cannot be built or run as asked."""
+    """The replay cannot be built or run as asked.
+
+    When the replay *starts* and then dies (a connection or auth failure,
+    or a step that hit :data:`STEP_TIMEOUT_SECONDS`), the error carries
+    the partial report the run had built so far, so the caller can still
+    see what was sent: ``report`` (the usual ``{"platform", "steps",
+    "sent", "errors", ...}`` dict, with every step up to the failure),
+    ``stopped_at`` (the 1-based step that died) and ``sent`` (how many
+    requests had gone out before it).  All three are ``None`` for the
+    errors raised before a replay starts.
+    """
+
+    #: the partial replay report, when the error came out of a live run
+    report: typing.Optional[typing.Dict[str, typing.Any]] = None
+    #: the 1-based step the replay stopped at, when known
+    stopped_at: typing.Optional[int] = None
+    #: how many requests were sent before the failure, when known
+    sent: typing.Optional[int] = None
+
+
+#: Generous per-step ceiling for the live replay: a startup request that
+#: has not answered in a minute is a dead session, not a slow one, and
+#: without a bound one hung request stalls the whole replay forever.
+STEP_TIMEOUT_SECONDS: float = 60.0
 
 
 #: The four phases a step can belong to.  ``session`` is the transport and
@@ -853,6 +879,46 @@ def _notify_peer_class(step: Step) -> typing.Optional[str]:
     return _NOTIFY_PEERS.get(suffix)
 
 
+#: the neutral value the replay can honestly give an argument a newer
+#: Telethon layer made mandatory (``hash=0`` is TL's "I have no cached
+#: copy, send everything" idiom).  Anything else is not invented: the step
+#: is skipped instead.
+_NEUTRAL_ARGS: typing.Dict[str, typing.Any] = {"hash": 0}
+
+
+def _complete_required_args(
+    cls: typing.Any, provided: typing.Dict[str, typing.Any]
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """``provided`` plus the required constructor args the replay may fill.
+
+    Returns ``None`` when a required argument is one this module has no
+    honest value for — the caller then skips the step (which is how the
+    replay reports "this layer wants an argument I cannot invent").
+    """
+    try:
+        signature = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):  # pragma: no cover - C-level classes
+        return None
+    required: typing.List[str] = []
+    for parameter in signature.parameters.values():
+        if parameter.name in ("self",) or parameter.name in provided:
+            continue
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if parameter.default is inspect.Parameter.empty:
+            required.append(parameter.name)
+    unknown = [name for name in required if name not in _NEUTRAL_ARGS]
+    if unknown:
+        return None
+    completion = dict(provided)
+    for name in required:
+        completion[name] = _NEUTRAL_ARGS[name]
+    return completion
+
+
 def _build_request(step: Step, platform: str) -> typing.Optional[typing.Any]:
     """The TLObject for `step`, or ``None`` when it cannot be built here.
 
@@ -872,7 +938,22 @@ def _build_request(step: Step, platform: str) -> typing.Optional[typing.Any]:
         cls = getattr(namespace, name + "Request", None)
         if cls is None:
             return None
-        return cls(**kwargs)
+        try:
+            return cls(**kwargs)
+        except TypeError:
+            # the installed Telethon layer changed the signature: 1.45
+            # gave account.getWebBrowserSettings a required ``hash``, so a
+            # call that was right for 1.43 raises here.  Fill the required
+            # arguments this replay can answer honestly (``hash=0`` = "give
+            # me the current state") and skip the step otherwise, instead
+            # of failing the whole batch on a layer difference.
+            completion = _complete_required_args(cls, kwargs)
+            if completion is None:
+                return None
+            try:
+                return cls(**completion)
+            except TypeError:
+                return None
 
     method = step.method
     if method == "help.getConfig":
@@ -1007,6 +1088,29 @@ def _is_fatal(exc: BaseException) -> bool:
     return False
 
 
+def _fatal_error(
+    report: typing.Dict[str, typing.Any],
+    index: int,
+    step: "Step",
+    exc: BaseException,
+) -> "BootstrapError":
+    """The BootstrapError a fatal stop raises, with the partial report.
+
+    The exception class is not enough on its own: when a replay dies at
+    step 7, what the caller needs is which steps were actually sent, so
+    the report built so far travels with the error.
+    """
+    error = BootstrapError(
+        f"the replay stopped at step {index} ({step.method}): "
+        f"{type(exc).__name__}: {exc} — {report['sent']} step(s) had been "
+        f"sent; the partial report is attached"
+    )
+    error.report = report
+    error.stopped_at = index
+    error.sent = report["sent"]
+    return error
+
+
 async def replay_startup(
     client: typing.Any,
     *,
@@ -1014,6 +1118,7 @@ async def replay_startup(
     include_cosmetic: bool = False,
     dry_run: bool = False,
     request: typing.Optional[typing.Callable[[Step], typing.Any]] = None,
+    step_timeout: typing.Optional[float] = STEP_TIMEOUT_SECONDS,
 ) -> typing.Dict[str, typing.Any]:
     """Send the startup batch of `platform` through an authorized client.
 
@@ -1033,6 +1138,10 @@ async def replay_startup(
             step", which is also how the default builder reports a method
             this Telethon layer cannot send and the sticker-set steps whose
             argument the replay cannot invent.
+        step_timeout: per-step ceiling in seconds
+            (:data:`STEP_TIMEOUT_SECONDS`, 60 s, by default); ``None`` waits
+            forever.  A request that hangs must not stall the whole replay:
+            the timeout stops it like any other fatal failure.
 
     Returns:
         ``{"platform", "include_cosmetic", "dry_run", "steps", "sent",
@@ -1044,12 +1153,15 @@ async def replay_startup(
 
     Raises:
         BootstrapError: the platform is unknown/unsupported, the sequence
-            fails the allowlist check, or ``dry_run`` was not requested and
-            no client was given.
-        Exception: connection- and auth-level failures are re-raised
-            (:func:`_is_fatal`); every other exception is recorded against
-            its step and the replay continues, because one failing optional
-            request must not abort the session.
+            fails the allowlist check, ``dry_run`` was not requested and no
+            client was given, or a *fatal* failure stopped the replay
+            (:func:`_is_fatal`: a connection/auth error or a step that hit
+            ``step_timeout``).  A fatal stop carries the partial report the
+            run had built (``error.report``) plus ``error.stopped_at`` and
+            ``error.sent``; the original exception is ``__cause__``.
+            Every other exception is recorded against its step and the
+            replay continues, because one failing optional request must not
+            abort the session.
     """
     steps = sequence(platform, include_cosmetic=include_cosmetic)
     platform_key = _normalize_platform(platform)
@@ -1118,10 +1230,27 @@ async def replay_startup(
             report["steps"].append(entry)
             continue
         try:
-            await client(build)
+            if step_timeout is None:
+                await client(build)
+            else:
+                await asyncio.wait_for(client(build), timeout=step_timeout)
         except Exception as exc:  # noqa: BLE001 - classified right below
             if _is_fatal(exc):
-                raise
+                entry["status"] = "error"
+                entry["detail"] = f"{type(exc).__name__}: {exc}"
+                report["errors"].append(
+                    {
+                        "step": index,
+                        "name": step.name,
+                        "method": step.method,
+                        "type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                report["steps"].append(entry)
+                report["stopped_at"] = index
+                report["stopped_method"] = step.method
+                raise _fatal_error(report, index, step, exc) from exc
             entry["status"] = "error"
             entry["detail"] = f"{type(exc).__name__}: {exc}"
             report["errors"].append(

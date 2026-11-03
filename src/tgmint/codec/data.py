@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import os
+import shutil
 import sqlite3
 import tempfile
 import typing
@@ -154,17 +156,64 @@ def read_sqlite_row(path: typing.Union[str, Path], required: typing.Set[str]) ->
         ) from None
 
 
+#: ``link(2)`` errors that mean "this filesystem has no hard links" rather
+#: than "you may not publish here": FAT/exFAT and SMB mounts answer EXDEV,
+#: some overlays/sandboxes answer EOPNOTSUPP/ENOTSUP, a few answer EPERM or
+#: ENOSYS.  Only these fall back to the copy publish; a real EACCES/EIO
+#: still surfaces.
+_NO_HARDLINK = frozenset(
+    (
+        errno.EXDEV,
+        errno.EOPNOTSUPP,
+        getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+        errno.EPERM,
+        errno.ENOSYS,
+    )
+)
+
+
+def _publish_private(temporary: Path, path: Path) -> None:
+    """Publish `temporary` as `path` and never replace an existing `path`.
+
+    A hard link is the preferred publish: exclusive-by-construction, so a
+    concurrent writer loses loudly instead of clobbering a session, and no
+    partial output can ever be visible.  Filesystems without hard links
+    (FAT/exFAT/SMB/overlay mounts) reject ``link(2)``; there we fall back to
+    an ``O_EXCL`` create plus a byte copy, which keeps the never-overwrite
+    guarantee (the half-written file is unlinked if the copy fails) and
+    keeps the 0600 mode set by the caller.
+    """
+    try:
+        os.link(temporary, path)
+        return
+    except OSError as exc:
+        if exc.errno not in _NO_HARDLINK:
+            raise
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as destination, open(temporary, "rb") as source:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(path, 0o600)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def write_text_file(
     path: typing.Union[str, Path],
     text: str,
 ) -> None:
     """Publish a session-string file privately.
 
-    Same discipline as :func:`write_sqlite_file` (its hard-link publish is
-    copied verbatim): the text is written to a temporary file next to the
-    destination and hard-linked into place, so an existing file is never
-    replaced and a failed write leaves no partial output.  Output is chmod
-    0600 — a session string is a credential.
+    Same discipline as :func:`write_sqlite_file` (it shares the publish
+    helper): the text is written to a temporary file next to the destination
+    and hard-linked into place, so an existing file is never replaced and a
+    failed write leaves no partial output.  On filesystems without hard
+    links the publish degrades to an ``O_EXCL`` copy (see
+    :func:`_publish_private`).  Output is chmod 0600 — a session string is a
+    credential.
     """
     path = Path(path)
     if path.exists() or path.is_symlink():
@@ -178,7 +227,7 @@ def write_text_file(
             fp.flush()
             os.fsync(fp.fileno())
         os.chmod(temporary, 0o600)
-        os.link(temporary, path)
+        _publish_private(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -190,10 +239,12 @@ def write_sqlite_file(
     """Build a session database privately, then publish it exclusively.
 
     The database is created under a temporary name next to the destination
-    and hard-linked into place, so an existing file is never replaced (a
-    concurrent writer loses loudly instead of clobbering a session) and a
-    failed write leaves no partial output.  Output is chmod 0600 — session
-    files are credentials.  Ported from TGConvertor's ``write_database``.
+    and published exclusively (hard link where the filesystem has them, else
+    an ``O_EXCL`` copy — see :func:`_publish_private`), so an existing file
+    is never replaced (a concurrent writer loses loudly instead of clobbering
+    a session) and a failed write leaves no partial output.  Output is chmod
+    0600 — session files are credentials.  Ported from TGConvertor's
+    ``write_database``.
     """
     path = Path(path)
     if path.exists() or path.is_symlink():
@@ -207,6 +258,6 @@ def write_sqlite_file(
             populate(db)
             db.commit()
         os.chmod(temporary, 0o600)
-        os.link(temporary, path)
+        _publish_private(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -165,6 +165,15 @@ class MTP(BaseObject):  # nocov
                 for endpoint in endpoints:
                     stream.writeInt32(endpoint.id)
                     stream.writeInt32(endpoint.flags)
+                    # fork note: `port` is part of the on-wire record —
+                    # tdesktop writes `id, flags, port, ipSize, ip,
+                    # secretSize, secret` (mtproto_dc_options.cpp,
+                    # DcOptions::serialize) and our own reader
+                    # (constructFromSerialized above) reads port right
+                    # after flags. Omitting it shifted every following
+                    # field by 4 bytes, so every blob written here was
+                    # unreadable even by us.
+                    stream.writeInt32(endpoint.port)
 
                     stream.writeInt32(len(endpoint.ip))
                     stream.writeRawData(endpoint.ip.encode("ascii"))

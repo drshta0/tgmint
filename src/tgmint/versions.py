@@ -44,7 +44,11 @@ __all__ = ["PINNED", "SOURCES", "CACHE_TTL_SECONDS", "current_version"]
 # weekly freshness job keeps them current.
 PINNED: dict[str, str] = {
     "tdesktop": "7.3.3",            # https://github.com/telegramdesktop/tdesktop/releases
-    "android": "13.1.0 (72291)",   # https://github.com/DrKLO/Telegram
+    # DrKLO's own wire string: TLRPC.java at the 13.1.0 commit carries
+    # APP_VERSION_CODE 7229 (the APK's ABI-split versionCode is 72291).
+    # Must equal layers.ANDROID_LAYERS[232] or parity can never resolve the
+    # layer of a pinned-current Android identity.
+    "android": "13.1.0 (7229)",     # https://github.com/DrKLO/Telegram
     "android_x": "0.29.1 (1817)",  # https://github.com/DrKLO/Telegram
     "ios": "13.1.1",                # https://github.com/TelegramMessenger/Telegram-iOS
     "macos": "11.14.1",             # https://github.com/overtake/TelegramSwift
@@ -179,11 +183,6 @@ def _fetch_ios(timeout: float) -> str | None:
 # e.g. `MARKETING_VERSION = 11.14.1;` in the Xcode project file
 _MACOS_VERSION_RE = re.compile(r"MARKETING_VERSION\s*=\s*(\d+\.\d+\.\d+)")
 
-# loose shape a plain-text version endpoint may return ("12.0.47",
-# "1.0.1 K", "0.29.1-beta") — anything else (HTML, JSON, a captcha page)
-# is not a version
-_VERSION_TEXT_RE = re.compile(r"\d[\w.\- ]*")
-
 
 def _fetch_macos(timeout: float) -> str | None:
     """Telegram-Swift (macOS) MARKETING_VERSION from the raw pbxproj.
@@ -207,22 +206,44 @@ def _android_version_from(version_name: str, version_code: int | None) -> str | 
     """Normalize APKPure's fields into the official ``"x.y.z (code)"``
     app_version shape used by the android/android_x pins.
 
-    APKPure serves ABI-split names for Telegram X — "0.29.1.1817-arm64-v8a"
-    with a split versionCode 1817302 — where the fourth component is the
-    base code (the "(1791)"-style number the pin carries). Plain Telegram
-    is "13.1.0" with a straight code.
+    APKPure serves the **ABI-split** ``versionCode``, which carries one
+    extra trailing digit on top of the code the app itself prints in
+    ``app_version``: Telegram 13.1.0 is versionCode 72291 but reports
+    ``"13.1.0 (7229)"`` on the wire (DrKLO's own TLRPC.java at the 13.1.0
+    commit says 7229 — see ``tgmint.layers.ANDROID_LAYERS[232]``). So a
+    code of 5+ digits is truncated by that one split digit; otherwise the
+    fetched string would never match the verified table or the pin.
+
+    Telegram X is worse: "0.29.1.1817-arm64-v8a" with split code 1817302,
+    where the *fourth name component* is the base code — that wins over
+    any truncation of the code field.
+
+    ``version_code=None`` means the page did not expose the field at all
+    (no code is emitted); ``0`` is a real reported value and is kept, not
+    treated as absent.
     """
     try:
         name = version_name.split("-", 1)[0].strip()  # drop "-arm64-v8a" etc.
         parts = name.split(".")
-        code: str | None = str(version_code) if version_code else None
+
+        code: str | None = None
+        if version_code is not None:
+            code_num = int(version_code)
+            if code_num >= 0:
+                # ABI split: "<printed code><abi digits>", e.g. 7229 ->
+                # 72291 and 1817 -> 1817302. Strip split digits until the
+                # code is back in the 4-digit range the app prints.
+                while code_num >= 10000:
+                    code_num //= 10
+                code = str(code_num)
+
         if len(parts) == 4 and parts[3].isdigit():
             code = parts[3]  # "0.29.1.1817" -> version 0.29.1, code 1817
             parts = parts[:3]
         version = ".".join(parts)
         if not version or not re.fullmatch(r"[\d]+(\.[\d]+)*", version):
             return None
-        return f"{version} ({code})" if code else version
+        return f"{version} ({code})" if code is not None else version
     except Exception:
         return None
 

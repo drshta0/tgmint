@@ -1048,20 +1048,28 @@ class LoginChoreographyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.session.dc_id, 4)
 
     async def test_two_factor_without_a_password_asks_for_one(self):
+        """No password: the neutral signal propagates and the DC is restored."""
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_store(tmpdir, home_dc=4)
             responses = login_responses(
                 store, finish=pyrogram_errors.SessionPasswordNeeded()
             )
             client = FakeClient(dc_id=2, responses=responses)
-            with self.assertRaises(core.PasskeyError) as ctx:
+            old_session = client.session
+            with self.assertRaises(core.TwoFactorRequired) as ctx:
                 await drv.login_with_passkey(client, path=store.path)
+            # deliberately NOT a PasskeyError: a caller guarding against a
+            # corrupt store must not swallow the password prompt
+            self.assertNotIsInstance(ctx.exception, core.PasskeyError)
             self.assertIn("2FA", str(ctx.exception))
             self.assertIn("password", str(ctx.exception))
             self.assertEqual(client.password_calls, [])
-            # the home-DC session is what the password step needs: not restored
-            self.assertEqual(client.session.dc_id, 4)
-            self.assertEqual(client.storage.values["dc_id"], 4)
+            # a retry has to start from the DC it originally connected to
+            self.assertIs(client.session, old_session)
+            self.assertEqual(old_session.start_calls, 1)
+            self.assertEqual(client.session.dc_id, 2)
+            self.assertEqual(client.storage.values["dc_id"], 2)
+            self.assertEqual(client.storage.values["auth_key"], b"\x7f" * 256)
 
     async def test_two_factor_with_a_password_completes_the_login(self):
         with tempfile.TemporaryDirectory() as tmpdir:

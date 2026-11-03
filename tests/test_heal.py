@@ -31,6 +31,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 from tgmint import codec
@@ -484,6 +485,7 @@ class Refusals(HealBase):
     def test_profile_target_needs_a_profile_source(self):
         path = session_file(self.tmp)
         passkey = passkey_file(self.tmp)
+        out = os.path.join(self.tmp, "healed.tgmint")
         with self.assertRaises(HealRefusal) as ctx:
             run(
                 heal_session(
@@ -492,11 +494,87 @@ class Refusals(HealBase):
                     session_format="pyrogram-string",
                     force=True,
                     to_format="profile",
+                    out=out,  # a format change needs --out since v1.18
                     client_factory=FakeClients(login=FakeClient()),
                     login=FakeLogin(),
                 )
             )
         self.assertIn("profile seal", str(ctx.exception))
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_format_change_without_out_is_refused(self):
+        # converting in place would destroy the original format while the
+        # file name kept claiming it
+        path = session_file(self.tmp)
+        passkey = passkey_file(self.tmp)
+        with open(path, "rb") as fp:
+            before = fp.read()
+        clients = FakeClients(login=FakeClient())
+        with self.assertRaises(HealRefusal) as ctx:
+            run(
+                heal_session(
+                    path,
+                    passkey_path=passkey,
+                    session_format="pyrogram-string",
+                    force=True,
+                    to_format="gramjs-string",
+                    client_factory=clients,
+                    login=FakeLogin(),
+                )
+            )
+        self.assertIn("--out", str(ctx.exception))
+        self.assertEqual(clients.calls, [])  # refused before any client
+        with open(path, "rb") as fp:
+            self.assertEqual(fp.read(), before)
+
+    def test_a_format_change_with_out_writes_the_new_file_only(self):
+        path = session_file(self.tmp)
+        passkey = passkey_file(self.tmp)
+        with open(path, "rb") as fp:
+            before = fp.read()
+        out = os.path.join(self.tmp, "healed.gramjs")
+        report = run(
+            heal_session(
+                path,
+                passkey_path=passkey,
+                session_format="pyrogram-string",
+                force=True,
+                to_format="gramjs-string",
+                out=out,
+                client_factory=FakeClients(login=FakeClient()),
+                login=FakeLogin(),
+            )
+        )
+        self.assertEqual(report["action"], "healed")
+        self.assertEqual(report["output"], out)
+        self.assertFalse(report["in_place"])
+        self.assertEqual(gramjs.read_string(open(out, encoding="ascii").read()).auth_key, NEW_KEY)
+        # the original format is untouched
+        with open(path, "rb") as fp:
+            self.assertEqual(fp.read(), before)
+
+    def test_an_existing_out_is_refused(self):
+        path = session_file(self.tmp)
+        passkey = passkey_file(self.tmp)
+        out = os.path.join(self.tmp, "taken.gramjs")
+        with open(out, "w", encoding="ascii") as fp:
+            fp.write("keep me")
+        with self.assertRaises(HealRefusal) as ctx:
+            run(
+                heal_session(
+                    path,
+                    passkey_path=passkey,
+                    session_format="pyrogram-string",
+                    force=True,
+                    to_format="gramjs-string",
+                    out=out,
+                    client_factory=FakeClients(login=FakeClient()),
+                    login=FakeLogin(),
+                )
+            )
+        self.assertIn("already exists", str(ctx.exception))
+        with open(out, encoding="ascii") as fp:
+            self.assertEqual(fp.read(), "keep me")
 
     def test_missing_inputs(self):
         passkey = passkey_file(self.tmp)
@@ -694,6 +772,7 @@ class EnvelopeSource(HealBase):
     def test_envelope_can_be_downgraded_to_a_plain_session(self):
         path = self._profile()
         passkey = passkey_file(self.tmp)
+        out = os.path.join(self.tmp, "healed.string")
         run(
             heal_session(
                 path,
@@ -701,12 +780,205 @@ class EnvelopeSource(HealBase):
                 passphrase="pw",
                 force=True,
                 to_format="telethon-string",
+                out=out,  # a format change never happens in place
                 client_factory=FakeClients(login=FakeClient()),
                 login=FakeLogin(),
             )
         )
-        fresh = codec.read_session(path, "telethon-string")
+        fresh = codec.read_session(out, "telethon-string")
         self.assertEqual(fresh.auth_key, NEW_KEY)
+        # the envelope itself was not touched
+        self.assertEqual(open_profile(path, passphrase="pw").session.auth_key, OLD_KEY)
+
+
+class SymlinkedSession(HealBase):
+    """os.replace on a link replaces the LINK.
+
+    The heal must refuse a symlinked session instead of reporting
+    "healed" while the real file keeps the dead auth key.
+    """
+
+    def _link(self):
+        target = session_file(self.tmp, "telethon-string")
+        link = os.path.join(self.tmp, "linked.string")
+        os.symlink(target, link)
+        return target, link
+
+    def test_a_symlinked_session_is_refused_before_any_client(self):
+        target, link = self._link()
+        passkey = passkey_file(self.tmp)
+        with open(target, "rb") as fp:
+            before = fp.read()
+        clients = FakeClients(probe=FakeClient(), login=FakeClient())
+        with self.assertRaises(HealRefusal) as ctx:
+            run(
+                heal_session(
+                    link,
+                    passkey_path=passkey,
+                    session_format="telethon-string",
+                    live=True,
+                    force=True,
+                    probe=dead_probe,
+                    client_factory=clients,
+                    login=FakeLogin(),
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("linked.string", message)
+        self.assertEqual(clients.calls, [])  # refused before the probe/login
+        # the link is still a link and the target still holds the old key
+        self.assertTrue(os.path.islink(link))
+        with open(target, "rb") as fp:
+            self.assertEqual(fp.read(), before)
+
+    def test_write_session_atomically_refuses_a_symlink(self):
+        _target, link = self._link()
+        with self.assertRaises(HealRefusal) as ctx:
+            write_session_atomically(session(), link, "telethon-string")
+        self.assertIn("symlink", str(ctx.exception))
+
+    def test_a_symlinked_out_is_refused(self):
+        path = session_file(self.tmp)
+        passkey = passkey_file(self.tmp)
+        real_out = os.path.join(self.tmp, "real.string")
+        with open(real_out, "w", encoding="ascii") as fp:
+            fp.write("keep me")
+        link_out = os.path.join(self.tmp, "out.link")
+        os.symlink(real_out, link_out)
+        with self.assertRaises(HealRefusal) as ctx:
+            run(
+                heal_session(
+                    path,
+                    passkey_path=passkey,
+                    session_format="telethon-string",
+                    force=True,
+                    out=link_out,
+                    client_factory=FakeClients(login=FakeClient()),
+                    login=FakeLogin(),
+                )
+            )
+        self.assertIn("symlink", str(ctx.exception))
+        with open(real_out, encoding="ascii") as fp:
+            self.assertEqual(fp.read(), "keep me")
+
+
+class PlaceholderHonesty(HealBase):
+    """the placeholder the file really holds.
+
+    ``pyrogram-string`` needs a ``user_id`` and a session with none gets
+    777000 written into it, with the codec saying so.  Heal used to throw
+    that result away — file says 777000, report says ``user_id: None``,
+    ``notes: []``.  Both halves are pinned here: the writer reports it,
+    and the heal report carries it through.
+    """
+
+    def test_the_writer_reports_the_placeholder(self):
+        from tgmint.heal import _write_session_atomically
+
+        out = os.path.join(self.tmp, "written.pyro")
+        result = _write_session_atomically(
+            SessionData(dc_id=DC_ID, auth_key=NEW_KEY), out, "pyrogram-string"
+        )
+        # both placeholders the destination format needs are reported
+        self.assertEqual(result["filled"], ["user_id", "api_id"])
+        self.assertTrue(any("placeholder" in note for note in result["notes"]))
+        self.assertTrue(any("api_id" in note for note in result["notes"]))
+        self.assertEqual(result["output"], out)
+        self.assertEqual(codec.read_session(out, "pyrogram-string").user_id, 777000)
+
+    def test_the_heal_report_surfaces_the_codec_filled_and_notes(self):
+        # a store the login can't improve on: heal never invents an id, so
+        # the placeholder path is the codec's — the report must carry it
+        path = session_file(self.tmp, "telethon-string")
+        passkey = passkey_file(self.tmp)
+        out = os.path.join(self.tmp, "healed.pyro")
+        real = codec.write_session
+
+        def fake_write(data, destination, destination_format, **kwargs):
+            result = real(data, destination, destination_format, **kwargs)
+            result["filled"] = ["user_id"]
+            result["notes"] = [
+                "user_id: an in-memory session stores none; wrote placeholder "
+                "777000 — the destination client learns the real id from the "
+                "server on first connect"
+            ]
+            result["user_id"] = 777000
+            return result
+
+        with mock.patch.object(codec, "write_session", side_effect=fake_write):
+            report = run(
+                heal_session(
+                    path,
+                    passkey_path=passkey,
+                    session_format="telethon-string",
+                    force=True,
+                    to_format="pyrogram-string",
+                    out=out,
+                    client_factory=FakeClients(login=FakeClient()),
+                    login=FakeLogin(),
+                )
+            )
+        self.assertEqual(report["action"], "healed")
+        self.assertEqual(report["filled"], ["user_id"])
+        self.assertTrue(report["new"]["user_id_is_placeholder"])
+        self.assertEqual(report["new"]["user_id"], 777000)
+        self.assertTrue(
+            any("placeholder" in note for note in report["notes"]), report["notes"]
+        )
+
+    def test_a_known_user_id_is_not_replaced_by_a_placeholder(self):
+        path = session_file(self.tmp, "pyrogram-string")
+        passkey = passkey_file(self.tmp)
+        out = os.path.join(self.tmp, "healed.pyro")
+        report = run(
+            heal_session(
+                path,
+                passkey_path=passkey,
+                session_format="pyrogram-string",
+                force=True,
+                to_format="pyrogram-string",
+                out=out,
+                client_factory=FakeClients(login=FakeClient()),
+                login=FakeLogin(),
+            )
+        )
+        self.assertEqual(report["filled"], [])
+        self.assertEqual(report["new"]["user_id"], USER_ID)
+        self.assertNotIn("user_id_is_placeholder", report["new"])
+
+
+class StalenessGuard(HealBase):
+    """the read→login→replace window."""
+
+    def test_a_session_changed_mid_heal_is_not_overwritten(self):
+        path = session_file(self.tmp, "telethon-string")
+        passkey = passkey_file(self.tmp)
+
+        class MutatingLogin(FakeLogin):
+            """Rewrites the session file between the read and the write."""
+
+            async def __call__(self, client, *, passkey_path, password=None):
+                with open(path, "wb") as fp:
+                    fp.write(b"someone else wrote here")
+                return await super().__call__(
+                    client, passkey_path=passkey_path, password=password
+                )
+
+        with self.assertRaises(HealRefusal) as ctx:
+            run(
+                heal_session(
+                    path,
+                    passkey_path=passkey,
+                    session_format="telethon-string",
+                    force=True,
+                    client_factory=FakeClients(login=FakeClient()),
+                    login=MutatingLogin(),
+                )
+            )
+        self.assertIn("changed", str(ctx.exception))
+        with open(path, "rb") as fp:
+            self.assertEqual(fp.read(), b"someone else wrote here")
 
 
 class ProbeClassification(unittest.TestCase):

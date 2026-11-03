@@ -157,6 +157,10 @@ def client_kwargs(
       from the fingerprint's timezone, matching what official
       clients send in ``initConnection.params``. Omitted entirely (not set
       to ``None``) when the fingerprint has no usable zone.
+    * ``init_connection_params={...}`` — set that bundle explicitly. It is
+      the very key ``tz_params=True`` injects, so it is an accepted override
+      (an explicit value replaces the tz-derived dict rather than raising
+      ``TypeError``).
 
     Fork quirk to know about: kurigram's ``Client.__init__`` lowercases
     every language field (verified 2.2.26), so a minted ``"ru-RU"``
@@ -182,6 +186,9 @@ def client_kwargs(
         "api_id",
         "api_hash",
         "system_lang_code",
+        # the same key ``tz_params=True`` injects: passing it explicitly is a
+        # legitimate override (pin/replace the tz dict), not a typo
+        "init_connection_params",
     }
     if unknown:
         # a typo'd override (e.g. device_modle=) would travel into

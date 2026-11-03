@@ -223,13 +223,28 @@ def _derive_key(passphrase: str, salt: bytes, iterations: int) -> bytes:
 
 
 def _fingerprint_dict(fingerprint: Any) -> Optional[Dict[str, Any]]:
-    """Normalize a Fingerprint | dict | None into a plain dict."""
+    """Normalize a Fingerprint | dict | None into a plain dict.
+
+    A *dict* is validated the same way :func:`open_profile` validates it:
+    ``Fingerprint.from_dict`` must accept it.  Publishing an identity the
+    read side refuses to load would produce an envelope nobody can open,
+    which is exactly what this module exists to prevent (the fingerprint
+    it writes must be one it can read back).
+    """
     if fingerprint is None:
         return None
     if isinstance(fingerprint, Fingerprint):
         return fingerprint.to_dict()
     if isinstance(fingerprint, dict):
-        return dict(fingerprint)
+        data = dict(fingerprint)
+        try:
+            Fingerprint.from_dict(data)
+        except (ValueError, TypeError) as exc:
+            raise ProfileError(
+                "fingerprint is not a usable Fingerprint "
+                f"(open_profile would refuse this envelope): {exc}"
+            ) from None
+        return data
     raise ProfileError(
         "fingerprint must be a Fingerprint, a dict, or None, got "
         f"{type(fingerprint).__name__}"
@@ -357,9 +372,12 @@ def seal(
         session_format: the codec format name the identity came from
             (one of :data:`SESSION_FORMATS`); recorded as provenance.
         fingerprint: a :class:`~tgmint.fingerprint.Fingerprint`, its dict
-            form, or ``None``.  A dict may additionally carry ``user_id``
-            / ``dc_id``; those are cross-checked when the profile is
-            opened.
+            form, or ``None``.  A dict must be one
+            :meth:`~tgmint.fingerprint.Fingerprint.from_dict` accepts, and
+            may additionally carry ``user_id`` / ``dc_id``; those are
+            cross-checked against the session here *and* when the profile
+            is opened, so ``seal`` never publishes an envelope that
+            :func:`open_profile` would refuse.
         passkey: the passkey store's JSON object (``PasskeyStore.to_dict()``)
             or ``None``.
         passphrase: when given, the container is sealed with it; ``None``
@@ -372,15 +390,20 @@ def seal(
 
     Raises:
         ProfileError: unknown session format, an unrepresentable session,
-            a malformed passkey payload, or missing crypto when sealing.
+            a malformed passkey payload, a fingerprint dict
+            ``Fingerprint.from_dict`` refuses, a part that disagrees with
+            the session (``user_id`` / ``dc_id`` / another account's
+            passkey — the same cross-validation :func:`open_profile`
+            runs), or missing crypto when sealing.
     """
     if not isinstance(session_format, str) or session_format not in _SESSION_CODECS:
         raise ProfileError(
             f"unknown session format {session_format!r}; expected one of "
             f"{list(SESSION_FORMATS)}"
         )
-    writer, _reader = _SESSION_CODECS[session_format]
+    writer, reader = _SESSION_CODECS[session_format]
 
+    stored_session: SessionData
     if isinstance(session, SessionData):
         try:
             payload = writer(session.validated())
@@ -388,6 +411,7 @@ def seal(
             raise ProfileError(
                 f"cannot store this session as {session_format}: {exc}"
             ) from None
+        stored_session = session
         encoding = "utf8"
     elif isinstance(session, (bytes, bytearray)):
         raw = bytes(session)
@@ -401,7 +425,7 @@ def seal(
                 f"of a {session_format} session"
             ) from None
         try:  # fail fast: seal only what can be opened again
-            _SESSION_CODECS[session_format][1](text)
+            stored_session = reader(text)
         except CodecError as exc:
             raise ProfileError(
                 f"the bytes payload is not a readable {session_format} "
@@ -416,6 +440,24 @@ def seal(
             f"{session_format}, got {type(session).__name__}"
         )
 
+    fingerprint_data = _fingerprint_dict(fingerprint)
+    passkey_data = _passkey_dict(passkey)
+    # seal only what open_profile will accept: the same cross-validation
+    # the read side runs, on the same parts, so a mismatch (fingerprint
+    # user_id/dc_id, another account's passkey) is refused here instead of
+    # being published as an envelope nobody can open again.
+    _cross_validate(
+        "<profile being sealed>",
+        stored_session,
+        recorded_user_id=None
+        if fingerprint_data is None
+        else fingerprint_data.get("user_id"),
+        recorded_dc_id=None
+        if fingerprint_data is None
+        else fingerprint_data.get("dc_id"),
+        passkey=passkey_data,
+    )
+
     container: Dict[str, Any] = {
         "format": FORMAT,
         "session": {
@@ -423,8 +465,8 @@ def seal(
             "encoding": encoding,
             "data": _b64e(payload.encode("utf-8")) if encoding == "base64" else payload,
         },
-        "fingerprint": _fingerprint_dict(fingerprint),
-        "passkey": _passkey_dict(passkey),
+        "fingerprint": fingerprint_data,
+        "passkey": passkey_data,
         "meta": {
             "created": _now_iso(),
             "tgmint": _tgmint_version,
@@ -559,6 +601,29 @@ def _passkey_user_id(passkey: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+def _coerce_id(where: str, what: str, value: Any) -> Optional[int]:
+    """One identity number, or ``ProfileError``.
+
+    ``int()`` alone is not enough: a crafted container can hold a list, an
+    object or a float, and the bare ``TypeError`` that would escape is not
+    a :class:`ProfileError` — it breaks the module contract that every
+    read-side failure is one exception type (and the CLI turns it into a
+    traceback instead of an exit-code-2 refusal).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ProfileError(
+            f"{where}: {what} is not an integer ({value!r})"
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ProfileError(
+            f"{where}: {what} is not an integer ({value!r})"
+        ) from None
+
+
 def _cross_validate(
     where: str,
     session: SessionData,
@@ -572,32 +637,41 @@ def _cross_validate(
     The envelope's whole point is that its pieces belong together, so two
     known-and-different identities are an error, not a warning: healing or
     converting from such a profile would move one account's session under
-    another account's identity.
+    another account's identity.  Every id is coerced defensively first, so
+    a crafted container is a :class:`ProfileError`, never a bare
+    ``TypeError``.
     """
+    session_user_id = _coerce_id(where, "the session's user_id", session.user_id)
+    session_dc_id = _coerce_id(where, "the session's dc_id", session.dc_id)
+    fingerprint_user_id = _coerce_id(
+        where, "fingerprint user_id", recorded_user_id
+    )
+    fingerprint_dc_id = _coerce_id(where, "fingerprint dc_id", recorded_dc_id)
+
     if (
-        recorded_user_id is not None
-        and session.user_id is not None
-        and int(recorded_user_id) != int(session.user_id)
+        fingerprint_user_id is not None
+        and session_user_id is not None
+        and fingerprint_user_id != session_user_id
     ):
         raise ProfileError(
-            f"{where}: fingerprint says user_id {int(recorded_user_id)} but "
-            f"the session belongs to user_id {int(session.user_id)}"
+            f"{where}: fingerprint says user_id {fingerprint_user_id} but "
+            f"the session belongs to user_id {session_user_id}"
         )
-    if recorded_dc_id is not None and int(recorded_dc_id) != int(session.dc_id):
+    if fingerprint_dc_id is not None and fingerprint_dc_id != session_dc_id:
         raise ProfileError(
-            f"{where}: fingerprint says dc_id {int(recorded_dc_id)} but the "
-            f"session lives on dc_id {int(session.dc_id)}"
+            f"{where}: fingerprint says dc_id {fingerprint_dc_id} but the "
+            f"session lives on dc_id {session_dc_id}"
         )
     if passkey is not None:
         passkey_user = _passkey_user_id(passkey)
         if (
             passkey_user is not None
-            and session.user_id is not None
-            and passkey_user != int(session.user_id)
+            and session_user_id is not None
+            and passkey_user != session_user_id
         ):
             raise ProfileError(
                 f"{where}: the passkey belongs to user_id {passkey_user} but "
-                f"the session belongs to user_id {int(session.user_id)}"
+                f"the session belongs to user_id {session_user_id}"
             )
 
 
