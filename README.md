@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/tgmint/"><img alt="PyPI" src="https://img.shields.io/pypi/v/tgmint?color=0f766e"></a>
+  <a href="https://pypi.org/project/tgmint/"><img alt="PyPI" src="https://img.shields.io/pypi/v/tgmint?color=0f766e&label=pypi"></a>
   <a href="https://pypi.org/project/tgmint/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/tgmint?color=0f766e"></a>
   <a href="https://github.com/drshta0/tgmint/actions/workflows/package.yml"><img alt="tests" src="https://github.com/drshta0/tgmint/actions/workflows/package.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-0f766e"></a>
