@@ -7,12 +7,14 @@ on:
     - 'src/**'
     - 'tests/**'
     - '.github/**'
+    - 'pyproject.toml'
   pull_request:
     branches: [ main ]
     paths:
     - 'src/**'
     - 'tests/**'
     - '.github/**'
+    - 'pyproject.toml'
 
 jobs:
   build:
@@ -35,8 +37,12 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install -e .[qt,passkeys]
+        # kurigram: without a Pyrogram-family package installed, the
+        # Pyrogram passkey / cadence / QR / adapter tests skip silently.
+        python -m pip install -e .[qt,passkeys] kurigram pytest
 
     - name: Running tests
       run: |
-        python -m unittest discover -s tests -p "test_*.py" -v
+        # pytest (not unittest discover): it also collects the plain
+        # function tests and applies tests/conftest.py.
+        python -m pytest -q -rs

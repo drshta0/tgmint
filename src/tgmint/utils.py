@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from . import debug
 
-from typing import Coroutine, Tuple, Type, Callable, TypeVar, Optional, List, Any, Dict
+from typing import Callable, TypeVar, Optional, Any
 from types import FunctionType
 
 import abc
@@ -18,7 +18,7 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 
 class BaseMetaClass(abc.ABCMeta):  # pragma: no cover
     def __new__(
-        cls: Type[_T], clsName: str, bases: Tuple[type], attrs: Dict[str, Any]
+        cls: type[_T], clsName: str, bases: tuple[type], attrs: dict[str, Any]
     ) -> _T:
 
         # Hook all subclass methods
@@ -47,11 +47,11 @@ class BaseMetaClass(abc.ABCMeta):  # pragma: no cover
         return result
 
 
-class BaseObject(object, metaclass=BaseMetaClass):
+class BaseObject(metaclass=BaseMetaClass):
     pass
 
 
-class override(object):  # nocov
+class override:  # nocov
     """
     To use inside a class decorated with @extend_class\n
     Any attributes decorated with @override will be replaced
@@ -75,7 +75,7 @@ class override(object):  # nocov
         return func.__isOverride__
 
 
-class extend_class(object):  # nocov
+class extend_class:  # nocov
     """
     Extend a class, all attributes will be added to its parents\n
     This won't override attributes that are already existed, please refer to @override or @extend_override_class to do this
@@ -91,7 +91,19 @@ class extend_class(object):  # nocov
             )
 
         newAttributes = dict(decorated_cls.__dict__)
-        crossDelete = ["__abstractmethods__", "__module__", "_abc_impl", "__doc__"]
+        # fork note: __firstlineno__ / __static_attributes__ are compiler
+        # metadata that Python 3.13+ adds to every class __dict__. They
+        # describe the decorating class itself, so never copy them onto
+        # the base; on 3.13 they otherwise raise "already exists ... not
+        # marked @override" and the Telethon layer cannot be imported.
+        crossDelete = [
+            "__abstractmethods__",
+            "__module__",
+            "_abc_impl",
+            "__doc__",
+            "__firstlineno__",
+            "__static_attributes__",
+        ]
         [
             (newAttributes.pop(cross) if cross in newAttributes else None)
             for cross in crossDelete
@@ -180,7 +192,7 @@ class sharemethod(type):
     def __set_name__(self, owner, name):
         self.__owner__ = owner
 
-    def __new__(cls: Type[_T], func: _F) -> Type[_F]:
+    def __new__(cls: type[_T], func: _F) -> type[_F]:
 
         clsName = func.__class__.__name__
         bases = func.__class__.__bases__

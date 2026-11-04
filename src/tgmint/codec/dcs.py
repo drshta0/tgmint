@@ -15,7 +15,6 @@ sync with TGConvertor upstream.
 
 from __future__ import annotations
 
-import typing
 
 from .data import CodecError
 
@@ -51,7 +50,7 @@ TEST_ADDRESSES = frozenset(TEST_DC.values()) | frozenset(TEST_DC_IPV6.values())
 
 def data_center(
     dc_id: int, test_mode: bool = False, ipv6: bool = False
-) -> typing.Tuple[str, int]:
+) -> tuple[str, int]:
     """Return the ``(address, port)`` used by clients for ``dc_id``.
 
     Raises :class:`CodecError` for unknown data centers — callers must then

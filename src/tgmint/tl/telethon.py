@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .configs import *
-from . import shared as tl
 
 from telethon.errors.rpcerrorlist import (
     PasswordHashInvalidError,
@@ -12,10 +11,10 @@ from telethon.errors.rpcerrorlist import (
     HashInvalidError,
 )
 from telethon.tl.types import TypeInputClientProxy, TypeJSONValue
-from telethon.tl.types.auth import LoginTokenMigrateTo
 import logging
 import warnings
-from typing import Awaitable
+import typing
+from collections.abc import Awaitable
 
 
 @extend_override_class
@@ -129,7 +128,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
         api_id: int = 0,
         api_hash: str = None,
         *,
-        connection: typing.Type[Connection] = ConnectionTcpFull,
+        connection: type[Connection] = ConnectionTcpFull,
         use_ipv6: bool = False,
         proxy: Union[tuple, dict] = None,
         local_addr: Union[str, tuple] = None,
@@ -496,12 +495,12 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
         try:
             await self(functions.account.ResetAuthorizationRequest(hash))
 
-        except FreshResetAuthorisationForbiddenError as e:
+        except FreshResetAuthorisationForbiddenError:
             raise FreshResetAuthorisationForbiddenError(
                 "You can't logout other sessions if less than 24 hours have passed since you logged on the current session."
             )
 
-        except HashInvalidError as e:
+        except HashInvalidError:
             raise HashInvalidError("The provided hash is invalid.")
 
     async def TerminateAllSessions(self) -> bool:
@@ -565,7 +564,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                     "Platform": session.platform,
                     "System": session.system_version,
                     "API_ID": session.api_id,
-                    "App name": "{} {}".format(session.app_name, session.app_version),
+                    "App name": f"{session.app_name} {session.app_version}",
                     "Official App": "✔" if session.official_app else "✖",
                 }
             )
@@ -632,7 +631,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
         api: Union[Type[APIData], APIData] = API.TelegramDesktop,
         password: str = None,
         *,
-        connection: typing.Type[Connection] = ConnectionTcpFull,
+        connection: type[Connection] = ConnectionTcpFull,
         use_ipv6: bool = False,
         proxy: Union[tuple, dict] = None,
         local_addr: Union[str, tuple] = None,
@@ -702,7 +701,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                 return newClient
 
         if not self._self_id:
-            oldMe = await self.get_me()
+            await self.get_me()
 
         timeout_err = None
 
@@ -742,9 +741,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                 # >24h would wrap through .seconds' time-of-day component
                 time_out = int((qr_login.expires - time_now).total_seconds()) + 5
 
-                resp = await self(
-                    functions.auth.AcceptLoginTokenRequest(qr_login.token)
-                )
+                await self(functions.auth.AcceptLoginTokenRequest(qr_login.token))
 
                 await qr_login.wait(time_out)
 
@@ -762,15 +759,13 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
             except (TimeoutError, asyncio.TimeoutError) as e:
 
                 warnings.warn(
-                    "\nQRLoginToNewClient attemp {} failed because {}".format(
-                        attempt + 1, type(e)
-                    )
+                    f"\nQRLoginToNewClient attemp {attempt + 1} failed because {type(e)}"
                 )
                 timeout_err = TimeoutError(
                     "Something went wrong, i couldn't perform the QR login process"
                 )
 
-            except telethon.errors.SessionPasswordNeededError as e:
+            except telethon.errors.SessionPasswordNeededError:
 
                 # requires an 2fa password
 
@@ -801,7 +796,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
                     raise PasswordIncorrect(e.__str__()) from e
 
             warnings.warn(
-                "\nQRLoginToNewClient attemp {} failed. Retrying..".format(attempt + 1)
+                f"\nQRLoginToNewClient attemp {attempt + 1} failed. Retrying.."
             )
 
         if timeout_err:
@@ -908,7 +903,7 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
         api: Union[Type[APIData], APIData] = API.TelegramDesktop,
         password: str = None,
         *,
-        connection: typing.Type[Connection] = ConnectionTcpFull,
+        connection: type[Connection] = ConnectionTcpFull,
         use_ipv6: bool = False,
         proxy: Union[tuple, dict] = None,
         local_addr: Union[str, tuple] = None,
@@ -1027,9 +1022,11 @@ class TelegramClient(telethon.TelegramClient, BaseObject):
         )
 
 
-def PrettyTable(table: List[Dict[str, Any]], addSplit: List[int] = []):
+def PrettyTable(table: List[Dict[str, Any]], addSplit: List[int] = None):
 
     # ! Warning: SUPER DIRTY CODE AHEAD
+    if addSplit is None:
+        addSplit = []
     padding = {}
 
     result = ""

@@ -51,7 +51,6 @@ try:  # kurigram, pyrofork, or any other distribution providing `pyrogram`
     import pyrogram
     from pyrogram import errors as pyrogram_errors
     from pyrogram import raw
-    from pyrogram import types as pyrogram_types
     from pyrogram.raw.core.tl_object import TLObject
     from pyrogram import Client
 
@@ -178,7 +177,6 @@ def authorization_payload(user_id=USER_ID, *, constructor=CTOR_AUTHORIZATION,
                           user_constructor=CTOR_USER_LAYER229, tmp_sessions=None,
                           otherwise_relogin_days=None, future_auth_token=None):
     flags = 0
-    tail = b""
     if otherwise_relogin_days is not None:
         flags |= 2
     if tmp_sessions is not None:
@@ -1003,7 +1001,7 @@ class LoginChoreographyTest(unittest.IsolatedAsyncioTestCase):
     async def test_cross_dc_login_switches_then_finishes_on_the_home_dc(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_store(tmpdir, home_dc=4)
-            old_key = client_key = b"\x7f" * 256  # FakeClient's key
+            old_key = b"\x7f" * 256  # FakeClient's key
             responses = login_responses(store)
             client = FakeClient(dc_id=2, responses=responses)
             me = await drv.login_with_passkey(client, path=store.path)
@@ -1328,3 +1326,38 @@ print("SOFT-IMPORT-OK")
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(SKIP_REASON is not None, SKIP_REASON or "")
+class FinishIdentityGuardTest(unittest.IsolatedAsyncioTestCase):
+    """#61: the framework's own parse must match the passkey's account.
+
+    Pyrogram-family layers give the core an id it may not be able to read
+    from the bytes (kurigram 2.2.26 parses ``user#b1b8cc83``), so the driver
+    reads the id from the object it was handed and checks THAT against the
+    store's user handle before any storage write.
+    """
+
+    async def test_a_login_answering_another_account_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_store(tmpdir, home_dc=2)
+            assert store.user_id == USER_ID
+            responses = login_responses(
+                store, finish=parse_payload(authorization_payload(USER_ID + 1))
+            )
+            client = FakeClient(dc_id=2, responses=responses)
+            with self.assertRaises(core.PasskeyError) as ctx:
+                await drv.login_with_passkey(client, path=store.path)
+            message = str(ctx.exception)
+            self.assertIn(str(USER_ID + 1), message)
+            self.assertIn(str(USER_ID), message)
+            # nothing was written into the framework storage
+            self.assertIsNone(client.storage.values.get("user_id"))
+
+    async def test_a_login_answering_the_same_account_still_works(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_store(tmpdir, home_dc=2)
+            client = FakeClient(dc_id=2, responses=login_responses(store))
+            me = await drv.login_with_passkey(client, path=store.path)
+            self.assertEqual(me.id, USER_ID)
+            self.assertEqual(client.storage.values["user_id"], USER_ID)

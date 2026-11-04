@@ -92,7 +92,7 @@ def _is_ip(address: typing.Any) -> bool:
     return True
 
 
-def _resolve_endpoint(data: SessionData) -> typing.Tuple[str, int, int]:
+def _resolve_endpoint(data: SessionData) -> tuple[str, int, int]:
     """Resolve (address, port, packed-IP length) for a Telethon endpoint.
 
     ``dc_id`` is authoritative: Telethon packs a *binary* IP, so an absent

@@ -10,6 +10,7 @@ how a dead command stayed green (see the v1.16.1 changelog).
 
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -249,7 +250,7 @@ class ParityCliTest(unittest.TestCase):
         # telethon hardcodes "")
         self.assertEqual(_find_key(envelope, "lang_pack"), "android")
         self.assertNotEqual(_find_key(envelope, "lang_pack"), "")
-        self.assertEqual(_find_key(envelope, "api_id"), 4)
+        self.assertEqual(_find_key(envelope, "api_id"), 6)
         for field in (
             "device_model", "system_version", "app_version",
             "system_lang_code", "lang_code",
@@ -668,6 +669,297 @@ class ConvertCliTest(unittest.TestCase):
             with open(out, encoding="ascii") as fp:
                 string = fp.read().strip()
             self.assertEqual(pyrogram.read_string(string).auth_key, self.KEY)
+
+
+class VerifyCliTest(unittest.TestCase):
+    """`tgmint verify` — the offline report and its 0/1/2 exit trio.
+
+    Every fixture is a fixed 256-byte auth_key in a temp directory (the
+    same discipline as ConvertCliTest); nothing here may touch the
+    network, and no output may contain the key itself — only its hashes.
+    """
+
+    KEY = bytes(range(256))
+    DC = 2
+    USER = 777000
+    API = 2040
+
+    def _key_id(self):
+        return hashlib.sha1(self.KEY).digest()[-8:].hex()
+
+    def _telethon_sqlite(self, tmp, name="acct.session"):
+        path = os.path.join(tmp, name)
+        telethon.write_sqlite(
+            SessionData(dc_id=self.DC, auth_key=self.KEY), path
+        )
+        return path  # write_sqlite publishes mode 0600
+
+    def _string_file(self, tmp, text, name):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="ascii") as fp:
+            fp.write(text)
+        os.chmod(path, 0o600)  # isolate the checks under test from perm warnings
+        return path
+
+    def test_telethon_sqlite_is_ok_and_leaks_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            code, out_json, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 0, err)
+            # the key itself never appears in either mode — only hashes
+            code, out_text, err = run_cli(["verify", path])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn(self.KEY.hex(), out_text)
+            self.assertNotIn(repr(self.KEY), out_text)
+            payload = json.loads(out_json)
+            self.assertNotIn(self.KEY.hex(), out_json)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["command"], "verify")
+            self.assertEqual(payload["format"], "telethon-session")
+            self.assertTrue(payload["detected"])
+            self.assertEqual(payload["dc_id"], self.DC)
+            self.assertIsNone(payload["user_id"])  # telethon stores none
+            self.assertIsNone(payload["api_id"])
+            self.assertFalse(payload["test_mode"])
+            self.assertEqual(payload["auth_key_id"], self._key_id())
+            self.assertEqual(
+                payload["auth_key_sha256"],
+                hashlib.sha256(self.KEY).hexdigest(),
+            )
+            self.assertEqual(payload["placeholders"], [])
+            self.assertEqual(payload["warnings"], [])
+            self.assertEqual(payload["permissions"], {"kind": "file", "mode": "0600"})
+            self.assertIn("telethon-session (detected)", out_text)
+            self.assertIn(f"auth_key_id: {self._key_id()}", out_text)
+
+    def test_pyrogram_sqlite_is_detected_with_placeholder_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "acct.pyrogram.session")
+            pyrogram.write_sqlite(
+                SessionData(
+                    dc_id=self.DC, auth_key=self.KEY,
+                    user_id=self.USER, api_id=self.API,
+                ),
+                path,
+            )
+            code, out, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 2, err)  # readable, with warnings
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["format"], "pyrogram-session")
+            self.assertEqual(payload["user_id"], self.USER)
+            self.assertEqual(payload["api_id"], self.API)
+            self.assertEqual(payload["placeholders"], ["user_id", "api_id"])
+            self.assertEqual(len(payload["warnings"]), 2)
+            self.assertIn("777000", payload["warnings"][0])
+            self.assertIn("2040", payload["warnings"][1])
+
+    def test_saved_gramjs_string_is_detected(self):
+        # a session-string FILE runs the reader chain.  DC 2's resolved
+        # address is 14 bytes long — exactly the shape a naive Telethon
+        # reader would misparse (and then report a WRONG key hash), so
+        # this pins both the detection and the key it reports
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._string_file(
+                tmp, gramjs.write_string(SessionData(dc_id=self.DC, auth_key=self.KEY)),
+                "saved.gramjs.string",
+            )
+            code, out, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["format"], "gramjs-string")
+            self.assertTrue(payload["detected"])
+            self.assertEqual(payload["auth_key_id"], self._key_id())
+
+    def test_explicit_from_format_overrides_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            code, out, err = run_cli(
+                ["verify", path, "--from-format", "telethon-session", "--json"]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["format"], "telethon-session")
+            self.assertFalse(payload["detected"])
+
+    def test_group_readable_session_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            os.chmod(path, 0o644)
+            code, out, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 2, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["permissions"], {"kind": "file", "mode": "0644"})
+            self.assertEqual(len(payload["warnings"]), 1)
+            self.assertIn("group/other", payload["warnings"][0])
+            self.assertIn("chmod 600", payload["warnings"][0])
+            # human mode says it too
+            code, out, err = run_cli(["verify", path])
+            self.assertEqual(code, 2)
+            self.assertIn("warning:", out)
+
+    def test_stricter_than_0600_stays_quiet(self):
+        # 0400 is still private — only group/other access warns
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            os.chmod(path, 0o400)
+            code, out, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["warnings"], [])
+            self.assertEqual(payload["permissions"]["mode"], "0400")
+
+    def test_missing_path_is_unreadable(self):
+        code, out, err = run_cli(
+            ["verify", os.path.join("surely", "not", "here.session"), "--json"]
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["command"], "verify")
+        self.assertIn("no such file", payload["error"])
+        self.assertIn("no such file", err)
+
+    def test_garbage_file_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._string_file(tmp, "definitely not a session", "junk.txt")
+            code, out, err = run_cli(["verify", path, "--json"])
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertIn("any known session format", payload["error"])
+
+    def test_explicit_wrong_format_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            code, out, err = run_cli(
+                ["verify", path, "--from-format", "pyrogram-string", "--json"]
+            )
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertIn("not readable as pyrogram-string", payload["error"])
+
+    def test_unset_passcode_env_is_an_error(self):
+        # a typo'd variable name must not read as "no passcode" (verify
+        # reports its own exit trio, so the failure is its 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._telethon_sqlite(tmp)
+            code, out, err = run_cli(
+                ["verify", path, "--passcode-env", "TGMINT_SURELY_NOT_SET", "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("TGMINT_SURELY_NOT_SET", err)
+            self.assertIn("not set", json.loads(out)["error"])
+
+    def test_help_documents_the_exit_codes(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main(["verify", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        for fragment in ("0 ok", "1 unreadable", "2 readable"):
+            self.assertIn(fragment, buffer.getvalue())
+
+    @unittest.skipUnless(HAVE_TD, "tgmint.td (tgcrypto) not installed — tdata skipped")
+    def test_tdata_folder_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            code, out, err = run_cli(
+                [
+                    "convert",
+                    "--from", telethon.write_string(
+                        SessionData(dc_id=self.DC, auth_key=self.KEY)
+                    ),
+                    "--from-format", "telethon-string",
+                    "--to", folder,
+                    "--to-format", "tdata",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            code, out, err = run_cli(["verify", folder, "--json"])
+            self.assertEqual(code, 2, err)  # tdata got the 777000 fill
+            payload = json.loads(out)
+            self.assertEqual(payload["format"], "tdata")
+            self.assertTrue(payload["detected"])
+            self.assertEqual(payload["dc_id"], self.DC)
+            self.assertEqual(payload["user_id"], 777000)
+            self.assertEqual(payload["placeholders"], ["user_id"])
+            self.assertEqual(payload["auth_key_id"], self._key_id())
+            # the convert-written tree is hardened 0700/0600 — no perm warning
+            self.assertEqual(
+                payload["permissions"]["files_group_or_other_accessible"], 0
+            )
+            self.assertEqual(len(payload["warnings"]), 1)
+
+    @unittest.skipUnless(HAVE_TD, "tgmint.td (tgcrypto) not installed — tdata skipped")
+    def test_passcoded_tdata_needs_the_passcode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "tdata")
+            with mock.patch.dict(os.environ, {"TGMINT_TEST_CODE": "s3cret"}):
+                code, out, err = run_cli(
+                    [
+                        "convert",
+                        "--from", telethon.write_string(
+                            SessionData(dc_id=self.DC, auth_key=self.KEY)
+                        ),
+                        "--from-format", "telethon-string",
+                        "--to", folder,
+                        "--to-format", "tdata",
+                        "--passcode-env", "TGMINT_TEST_CODE",
+                        "--json",
+                    ]
+                )
+                self.assertEqual(code, 0, err)
+                # without the passcode: unreadable, with a pointer to the flag
+                code, out, err = run_cli(["verify", folder, "--json"])
+                self.assertEqual(code, 1)
+                self.assertIn("--passcode-env", json.loads(out)["error"])
+                # with it: readable (the placeholder user_id still warns)
+                code, out, err = run_cli(
+                    ["verify", folder, "--passcode-env", "TGMINT_TEST_CODE", "--json"]
+                )
+                self.assertEqual(code, 2, err)
+                payload = json.loads(out)
+                self.assertEqual(payload["auth_key_id"], self._key_id())
+
+    def test_sealed_profile_needs_its_passphrase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = os.path.join(tmp, "acct.string")
+            with open(session, "w", encoding="ascii") as fp:
+                fp.write(
+                    telethon.write_string(SessionData(dc_id=self.DC, auth_key=self.KEY))
+                )
+            profile = os.path.join(tmp, "acct.tgmint")
+            with mock.patch.dict(os.environ, {"TGMINT_TEST_PASS": "hunter2"}):
+                code, out, err = run_cli(
+                    [
+                        "profile", "seal",
+                        "--session", session,
+                        "--from-format", "telethon-string",
+                        "--out", profile,
+                        "--passphrase-env", "TGMINT_TEST_PASS",
+                    ]
+                )
+                self.assertEqual(code, 0, err)
+
+                # no passphrase: unreadable, and the error says how to give one
+                code, out, err = run_cli(["verify", profile, "--json"])
+                self.assertEqual(code, 1)
+                self.assertIn("passphrase", json.loads(out)["error"])
+
+                # with it: the session reads; the source stored no
+                # user_id/api_id, so nothing warns
+                code, out, err = run_cli(
+                    ["verify", profile, "--passphrase-env", "TGMINT_TEST_PASS", "--json"]
+                )
+                self.assertEqual(code, 0, err)
+                payload = json.loads(out)
+                self.assertEqual(payload["format"], "profile")
+                self.assertTrue(payload["detected"])
+                self.assertEqual(payload["auth_key_id"], self._key_id())
+                self.assertEqual(payload["warnings"], [])
+                self.assertNotIn(self.KEY.hex(), out)
 
 
 class LoginPasskeyCliTest(unittest.TestCase):
@@ -1753,3 +2045,140 @@ class MainModuleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExitCodeContractTest(unittest.TestCase):
+    """#33: the documented exit-code trio must match the code that emits it."""
+
+    def test_the_constants_are_the_documented_trio(self):
+        self.assertEqual(
+            (cli.EXIT_OK, cli.EXIT_PROBLEMS, cli.EXIT_ERROR), (0, 1, 2)
+        )
+        for fragment in ("0 success", "1 audit found problems", "2 error"):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, cli._EXIT_EPILOG)
+
+    def test_every_subcommand_uses_the_documented_epilog(self):
+        parser = cli._build_parser()
+        actions = [
+            action
+            for action in parser._actions
+            if isinstance(action, __import__("argparse")._SubParsersAction)
+        ]
+        self.assertTrue(actions)
+        seen = set()
+        for action in actions:
+            for name, subparser in action.choices.items():
+                seen.add(name)
+                with self.subTest(command=name):
+                    # either the exit-code trio or verify's own trio (it has
+                    # a second meaning for exit 1), never ad-hoc text
+                    self.assertIn(subparser.epilog, (cli._EXIT_EPILOG, cli._VERIFY_EPILOG))
+        # sanity: the sweep above actually visited the commands
+        for command in ("mint", "convert", "audit", "heal", "bootstrap", "verify"):
+            self.assertIn(command, seen)
+
+    def test_only_the_audit_path_reports_problems(self):
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(cli))
+        carriers = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and inner.id == "EXIT_PROBLEMS":
+                    carriers.add(node.name)
+        self.assertEqual(carriers, {"_cmd_audit"})
+
+
+class BootstrapPassphraseGateTest(unittest.TestCase):
+    """#31: bootstrap must only ask for a passphrase for a profile source."""
+
+    def test_a_plain_session_is_not_asked_for_a_profile_passphrase(self):
+        from tgmint.bootstrap import BootstrapError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "plain.session")
+            codec.write_session(_session(), path, "telethon-session")
+
+            prompt = mock.patch.object(
+                cli, "_resolve_passphrase", side_effect=AssertionError("prompted")
+            )
+            # stop the command right after the session read: the gate under
+            # test sits between the two
+            api = mock.patch.object(
+                cli, "_bootstrap_api", side_effect=BootstrapError("stop here")
+            )
+            with prompt, api:
+                code, out, err = run_cli(
+                    [
+                        "bootstrap", "--session", path, "--preset", "desktop",
+                        "--json",
+                    ]
+                )
+        self.assertEqual(code, 2, err)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertIn("stop here", payload["error"])
+
+
+class HelpTextHonestyTest(unittest.TestCase):
+    """#37: the CLI never advertises a command it does not have."""
+
+    def test_the_dead_emit_command_is_gone(self):
+        import pathlib
+
+        source = pathlib.Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("tgmint emit", source)
+        parser = cli._build_parser()
+        help_text = parser.format_help()
+        self.assertNotIn("emit", help_text)
+        # the commands it does have are all dispatchable
+        for command in (
+            "mint", "inspect", "audit", "freshness", "parity", "convert",
+            "login-passkey", "profile", "heal", "bootstrap", "cadence", "doctor",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, help_text)
+
+
+class ApiIdPublishedHintTest(unittest.TestCase):
+    """Telegram refuses a published official app id for new logins
+    (API_ID_PUBLISHED_FLOOD, seen live 2026-11-04 for Android's 4). The
+    login commands must say which way out exists, not just echo the RPC."""
+
+    def test_hint_on_the_telethon_error_class(self):
+        exc = type("ApiIdPublishedFloodError", (Exception,), {})(
+            "This API id was published somewhere, you can't use it now"
+        )
+        message = cli._login_error("login-qr", exc, "android")
+        self.assertIn("login-qr failed:", message)
+        self.assertIn("preset 'android'", message)
+        self.assertIn("--preset", message)
+
+    def test_hint_through_a_wrapping_error(self):
+        try:
+            try:
+                raise RuntimeError("rpc error API_ID_PUBLISHED_FLOOD")
+            except RuntimeError as inner:
+                raise ValueError("heal: re-login failed") from inner
+        except ValueError as outer:
+            message = cli._login_error("heal", outer)
+        self.assertIn("refuses this official app id", message)
+
+    def test_no_hint_for_other_errors(self):
+        message = cli._login_error("login-qr", RuntimeError("timed out"), "desktop")
+        self.assertEqual(message, "login-qr failed: timed out")
+
+
+class AndroidPresetApiIdTest(unittest.TestCase):
+    def test_preset_does_not_use_the_published_pair(self):
+        from tgmint.api import API
+        from tgmint.codec.android import OFFICIAL_APP_API_ID
+
+        # 4 is what the real APK ships, but Telegram refuses it for new
+        # logins from anything else; the preset must stay on 6.
+        self.assertEqual(API.TelegramAndroid.api_id, 6)
+        self.assertNotEqual(API.TelegramAndroid.api_id, OFFICIAL_APP_API_ID)

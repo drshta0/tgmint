@@ -84,7 +84,7 @@ def load_sidecar(path) -> dict:
     or if the file is not valid JSON.
     """
     path = pathlib.Path(path)
-    with open(path, "r", encoding="utf-8") as fp:
+    with open(path, encoding="utf-8") as fp:
         data = json.load(fp)
 
     version = data.get("schema_version") if isinstance(data, dict) else None

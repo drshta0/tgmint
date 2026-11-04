@@ -183,6 +183,20 @@ class ClientKwargsTest(unittest.TestCase):
         pinned = client_kwargs(fp, app_version="13.1.1")
         self.assertEqual(pinned["app_version"], "13.1.1")
 
+    def test_init_connection_params_override_is_accepted(self):
+        # #66: the key ``tz_params=True`` injects is also a legitimate
+        # explicit override (pin or replace the dict); it used to be rejected
+        # as an unknown fingerprint field name
+        _, fp = _mint("TelegramIOS", "icp")
+        pinned = client_kwargs(fp, init_connection_params={"tz_offset": 3600})
+        self.assertEqual(pinned["init_connection_params"], {"tz_offset": 3600})
+        # ... and it wins over what tz_params would inject
+        _, zone_fp = _mint("TelegramDesktop", "icp2", system="windows", locale="auto")
+        combined = client_kwargs(
+            zone_fp, tz_params=True, init_connection_params={"tz_offset": -7200}
+        )
+        self.assertEqual(combined["init_connection_params"], {"tz_offset": -7200})
+
     def test_unknown_override_raises(self):
         _, fp = _mint("TelegramIOS", "typo")
         with self.assertRaises(TypeError):

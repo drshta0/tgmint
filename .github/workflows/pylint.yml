@@ -1,7 +1,8 @@
-# Smoke lint only: E9 (syntax errors), F63 (invalid logic), F7 (syntax
-# errors in futures). The legacy codebase is not yet ruff-clean under the
-# full rule set and that's fine — this job exists to catch outright
-# breakage, not style.
+# Ruff runs from the repo's pyproject.toml config ([tool.ruff.lint]):
+# E9/F63/F7 (breakage) plus F401, F811, F841, B006, B008 and the UP
+# pyupgrade rules, at target-version py39. UP007/UP045 are excluded
+# there on purpose (PEP 604 `X | Y` annotations cannot be evaluated on
+# Python 3.9); see pyproject.toml for the full rationale.
 
 name: lint
 
@@ -20,6 +21,6 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install ruff
-    - name: Ruff smoke lint
+    - name: Ruff lint (pyproject config)
       run: |
-        ruff check src tests --select E9,F63,F7
+        ruff check src tests

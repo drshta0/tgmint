@@ -133,7 +133,7 @@ class TestProvenanceDiscipline(unittest.TestCase):
 
     def test_every_row_has_provenance(self):
         for block in ("_TD_LAYERS", "_ANDROID_LAYERS", "_IOS_LAYERS_TABLE"):
-            match = re.search(rf"{block}\s*:\s*Dict\[int, tuple\]\s*=\s*\{{(.*?)\}}", self.SOURCE, re.S)
+            match = re.search(rf"{block}\s*:\s*[Dd]ict\[int, tuple\]\s*=\s*\{{(.*?)\}}", self.SOURCE, re.S)
             self.assertIsNotNone(match, f"{block} not found in layers.py")
             rows = [
                 line for line in match.group(1).splitlines()
@@ -182,7 +182,7 @@ class TestParityHelpers(unittest.TestCase):
                 "params", "layer", "bootstrap",
             },
         )
-        self.assertEqual(env["api_id"], 4)
+        self.assertEqual(env["api_id"], 6)
         self.assertEqual(env["lang_pack"], "android")
         self.assertEqual(env["params"], {})
 

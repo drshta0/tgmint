@@ -110,7 +110,7 @@ class BootstrapError(Exception):
     """
 
     #: the partial replay report, when the error came out of a live run
-    report: typing.Optional[typing.Dict[str, typing.Any]] = None
+    report: typing.Optional[dict[str, typing.Any]] = None
     #: the 1-based step the replay stopped at, when known
     stopped_at: typing.Optional[int] = None
     #: how many requests were sent before the failure, when known
@@ -127,11 +127,11 @@ STEP_TIMEOUT_SECONDS: float = 60.0
 #: update-state layer, ``account`` is per-account configuration, ``dialogs``
 #: is the first screen, ``cosmetic`` is the sticker/reaction/premium
 #: fan-out that only paints UI.
-PHASES: typing.Tuple[str, ...] = ("session", "account", "dialogs", "cosmetic")
+PHASES: tuple[str, ...] = ("session", "account", "dialogs", "cosmetic")
 
 #: Platforms with a source-verified sequence (iOS is not covered: the
 #: relevant files are large remote blobs, so there is no file:line claim).
-PLATFORMS: typing.Tuple[str, ...] = ("android", "desktop")
+PLATFORMS: tuple[str, ...] = ("android", "desktop")
 
 
 @dataclass(frozen=True)
@@ -163,7 +163,7 @@ class Step:
                 f"{list(PHASES)}"
             )
 
-    def as_dict(self) -> typing.Dict[str, str]:
+    def as_dict(self) -> dict[str, str]:
         """A JSON-friendly copy (no status; see :func:`describe`)."""
         return {
             "name": self.name,
@@ -181,7 +181,7 @@ class Step:
 #: Read-only startup reads.  A step whose method is not in this set (and is
 #: not a cosmetic step) cannot be part of a sequence: adding one is a code
 #: change that has to argue with this comment first.
-SAFE_METHODS: typing.FrozenSet[str] = frozenset(
+SAFE_METHODS: frozenset[str] = frozenset(
     {
         "help.getConfig",
         "help.getAppConfig",
@@ -208,7 +208,7 @@ SAFE_METHODS: typing.FrozenSet[str] = frozenset(
 #: State-mutating or authentication methods.  ``"auth.*"`` is matched as a
 #: prefix (see :func:`is_forbidden`), so no ``auth.`` constructor can be
 #: added by accident either.
-FORBIDDEN_METHODS: typing.FrozenSet[str] = frozenset(
+FORBIDDEN_METHODS: frozenset[str] = frozenset(
     {
         "account.updateStatus",
         "account.registerDevice",
@@ -221,7 +221,7 @@ FORBIDDEN_METHODS: typing.FrozenSet[str] = frozenset(
 #: reaction set and the premium promo.  Read-only, but they download a pile
 #: of media a non-UI client has no use for, so they are opt-in
 #: (``include_cosmetic=True``).
-COSMETIC_METHODS: typing.FrozenSet[str] = frozenset(
+COSMETIC_METHODS: frozenset[str] = frozenset(
     {
         "messages.getStickerSet",
         "messages.getFavedStickers",
@@ -246,7 +246,7 @@ def is_forbidden(method: str) -> bool:
 # the sequences (spec.json, order as the source proves it)
 # ---------------------------------------------------------------------------
 
-_ANDROID: typing.Tuple[Step, ...] = (
+_ANDROID: tuple[Step, ...] = (
     Step(
         name="help.getConfig",
         method="help.getConfig",
@@ -505,7 +505,7 @@ _ANDROID: typing.Tuple[Step, ...] = (
     ),
 )
 
-_DESKTOP: typing.Tuple[Step, ...] = (
+_DESKTOP: tuple[Step, ...] = (
     Step(
         name="help.getConfig",
         method="help.getConfig",
@@ -635,18 +635,18 @@ _DESKTOP: typing.Tuple[Step, ...] = (
 
 #: platform -> ordered steps, cosmetic rows included in their source
 #: position.  :func:`sequence` filters the cosmetic ones out by default.
-BOOTSTRAP_SEQUENCES: typing.Dict[str, typing.Tuple[Step, ...]] = {
+BOOTSTRAP_SEQUENCES: dict[str, tuple[Step, ...]] = {
     "android": _ANDROID,
     "desktop": _DESKTOP,
 }
 
 #: The client versions the sequences were read from (spec.json).
-CLIENT_VERSIONS: typing.Dict[str, str] = {"android": "12.10.6", "desktop": "7.3.3"}
+CLIENT_VERSIONS: dict[str, str] = {"android": "12.10.6", "desktop": "7.3.3"}
 
 #: Methods that are never replayed, with the reason.  Documentation for
 #: humans and for ``--dry-run`` output; the allowlists above are the
 #: enforcement.
-EXCLUDED_METHODS: typing.Dict[str, str] = {
+EXCLUDED_METHODS: dict[str, str] = {
     "account.updateStatus": (
         "mutates server state: it publishes an online/last-seen time the "
         "caller did not ask for"
@@ -692,10 +692,10 @@ EXCLUDED_METHODS: typing.Dict[str, str] = {
 }
 
 #: platform -> lang_pack for ``langpack.getLanguages``
-_LANG_PACK: typing.Dict[str, str] = {"android": "android", "desktop": "tdesktop"}
+_LANG_PACK: dict[str, str] = {"android": "android", "desktop": "tdesktop"}
 
 #: platform aliases accepted by :func:`sequence` / :func:`platform_for`
-_ALIASES: typing.Dict[str, str] = {
+_ALIASES: dict[str, str] = {
     "android": "android",
     "android_x": "android",
     "android-x": "android",
@@ -704,7 +704,7 @@ _ALIASES: typing.Dict[str, str] = {
 }
 
 #: families with no source-verified sequence (yet)
-_UNSUPPORTED: typing.Dict[str, str] = {
+_UNSUPPORTED: dict[str, str] = {
     "ios": "the iOS client ships as remote blobs, so the spec has no file:line rows for it",
     "macos": "the macOS client shares the desktop core but was not part of the F5 read",
 }
@@ -778,7 +778,7 @@ def platform_for(identity: typing.Any) -> str:
 
 def _validate(platform: str, steps: typing.Sequence[Step]) -> None:
     """Refuse a sequence that escapes the allowlists (called on every use)."""
-    seen: typing.Set[str] = set()
+    seen: set[str] = set()
     for step in steps:
         if not isinstance(step, Step):  # pragma: no cover - defensive
             raise BootstrapError(f"sequence contains {step!r}, expected a Step")
@@ -804,7 +804,7 @@ def _validate(platform: str, steps: typing.Sequence[Step]) -> None:
         seen.add(step.name)
 
 
-def sequence(platform: str, *, include_cosmetic: bool = False) -> typing.Tuple[Step, ...]:
+def sequence(platform: str, *, include_cosmetic: bool = False) -> tuple[Step, ...]:
     """The ordered steps for `platform`.
 
     Args:
@@ -830,7 +830,7 @@ def sequence(platform: str, *, include_cosmetic: bool = False) -> typing.Tuple[S
     return steps
 
 
-def describe(platform: str, *, include_cosmetic: bool = False) -> typing.Dict[str, typing.Any]:
+def describe(platform: str, *, include_cosmetic: bool = False) -> dict[str, typing.Any]:
     """The plan as plain data (pure: no client, no network, no Telethon).
 
     Returns a JSON-friendly dict: ``platform``, ``client_version``,
@@ -864,7 +864,7 @@ def describe(platform: str, *, include_cosmetic: bool = False) -> typing.Dict[st
 # ---------------------------------------------------------------------------
 
 #: step name suffix -> Telethon peer-class name for the notify-settings trio
-_NOTIFY_PEERS: typing.Dict[str, str] = {
+_NOTIFY_PEERS: dict[str, str] = {
     "chats": "InputNotifyChats",
     "users": "InputNotifyUsers",
     "broadcasts": "InputNotifyBroadcasts",
@@ -883,12 +883,12 @@ def _notify_peer_class(step: Step) -> typing.Optional[str]:
 #: Telethon layer made mandatory (``hash=0`` is TL's "I have no cached
 #: copy, send everything" idiom).  Anything else is not invented: the step
 #: is skipped instead.
-_NEUTRAL_ARGS: typing.Dict[str, typing.Any] = {"hash": 0}
+_NEUTRAL_ARGS: dict[str, typing.Any] = {"hash": 0}
 
 
 def _complete_required_args(
-    cls: typing.Any, provided: typing.Dict[str, typing.Any]
-) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    cls: typing.Any, provided: dict[str, typing.Any]
+) -> typing.Optional[dict[str, typing.Any]]:
     """``provided`` plus the required constructor args the replay may fill.
 
     Returns ``None`` when a required argument is one this module has no
@@ -899,7 +899,7 @@ def _complete_required_args(
         signature = inspect.signature(cls.__init__)
     except (TypeError, ValueError):  # pragma: no cover - C-level classes
         return None
-    required: typing.List[str] = []
+    required: list[str] = []
     for parameter in signature.parameters.values():
         if parameter.name in ("self",) or parameter.name in provided:
             continue
@@ -1038,11 +1038,11 @@ def _make_builder(platform: str) -> typing.Callable[[Step], typing.Optional[typi
 
 #: exception classes that mean "the session or the transport is gone", so
 #: the replay stops instead of recording twenty failures
-_FATAL_TYPES: typing.Tuple[type, ...] = (ConnectionError, TimeoutError, OSError)
+_FATAL_TYPES: tuple[type, ...] = (ConnectionError, TimeoutError, OSError)
 
 #: names of Telethon/OS errors that are fatal even without the class (a
 #: fake client in a test, or a Telethon that renamed one)
-_FATAL_NAMES: typing.FrozenSet[str] = frozenset(
+_FATAL_NAMES: frozenset[str] = frozenset(
     {
         "AuthKeyError",
         "AuthKeyUnregisteredError",
@@ -1063,13 +1063,13 @@ _FATAL_NAMES: typing.FrozenSet[str] = frozenset(
 )
 
 
-def _telethon_fatal_types() -> typing.Tuple[type, ...]:
+def _telethon_fatal_types() -> tuple[type, ...]:
     """Telethon's own fatal bases, or an empty tuple without Telethon."""
     try:
         from telethon.errors import AuthKeyError, RPCConnectionError
     except Exception:  # pragma: no cover - telethon absent or renamed
         return ()
-    fatal: typing.List[type] = []
+    fatal: list[type] = []
     for cls in (AuthKeyError, RPCConnectionError):
         if isinstance(cls, type):
             fatal.append(cls)
@@ -1089,11 +1089,11 @@ def _is_fatal(exc: BaseException) -> bool:
 
 
 def _fatal_error(
-    report: typing.Dict[str, typing.Any],
+    report: dict[str, typing.Any],
     index: int,
-    step: "Step",
+    step: Step,
     exc: BaseException,
-) -> "BootstrapError":
+) -> BootstrapError:
     """The BootstrapError a fatal stop raises, with the partial report.
 
     The exception class is not enough on its own: when a replay dies at
@@ -1119,7 +1119,7 @@ async def replay_startup(
     dry_run: bool = False,
     request: typing.Optional[typing.Callable[[Step], typing.Any]] = None,
     step_timeout: typing.Optional[float] = STEP_TIMEOUT_SECONDS,
-) -> typing.Dict[str, typing.Any]:
+) -> dict[str, typing.Any]:
     """Send the startup batch of `platform` through an authorized client.
 
     The client only needs to be callable: every step is
@@ -1167,7 +1167,7 @@ async def replay_startup(
     platform_key = _normalize_platform(platform)
     builder = request or _make_builder(platform_key)
 
-    report: typing.Dict[str, typing.Any] = {
+    report: dict[str, typing.Any] = {
         "platform": platform_key,
         "include_cosmetic": bool(include_cosmetic),
         "dry_run": bool(dry_run),

@@ -255,7 +255,7 @@ def write_sqlite(
         else:
             db.execute("CREATE INDEX idx_peers_username ON peers (username)")
 
-        values: typing.Tuple[typing.Any, ...] = (data.dc_id,)
+        values: tuple[typing.Any, ...] = (data.dc_id,)
         if extended:
             values += (address, port)
         values += (

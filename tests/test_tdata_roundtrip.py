@@ -334,7 +334,6 @@ class TestLegacyLocalKey(unittest.TestCase):
         # an empty record (size 0) used to leave the descriptor
         # uninitialised: writes silently vanished and PrepareEncrypted
         # produced a record that could not be decrypted back
-        from tgmint.td.configs import QByteArray
         from tgmint.td.storage import Storage
 
         key = AuthKey(os.urandom(256), AuthKeyType.Generated, DcId(0))
@@ -377,3 +376,260 @@ class TestDcOptionsDedup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _read_key_file(directory, key_file="data"):
+    """(header, salt, wrapped local key, encrypted account info) of key_datas."""
+    from tgmint.td import storage as st
+    from tgmint.td.configs import QByteArray
+
+    key_data = st.Storage.ReadFile("key_" + key_file, directory)
+    salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
+    key_data.stream >> salt >> key_encrypted >> info_encrypted
+    return key_data, salt, key_encrypted, info_encrypted
+
+
+def _write_key_file(directory, salt, key_encrypted, info_encrypted, key_file="data"):
+    """Rewrite key_datas with the same salt but a caller-supplied body."""
+    from tgmint.td import storage as st
+
+    file = st.Storage.FileWriteDescriptor("key_" + key_file, directory)
+    file.writeData(salt)
+    file.writeData(key_encrypted)
+    file.writeData(info_encrypted)
+    file.finish()
+
+
+def _unwrap_local_key(salt, key_encrypted, passcode=b""):
+    """The 256-byte local key a key_datas header wraps (empty passcode)."""
+    from tgmint.td import storage as st
+    from tgmint.td.auth import AuthKey
+    from tgmint.td.configs import QByteArray
+
+    passcode_key = st.Storage.CreateLocalKey(salt, QByteArray(passcode))
+    inner = st.Storage.DecryptLocal(key_encrypted, passcode_key)
+    return AuthKey(inner.stream.readRawData(256)), passcode_key
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt5 not installed — key tests skipped")
+class TestKeyFileGuards(unittest.TestCase):
+    """Crafted key_datas bodies — review td findings 13 and 44.
+
+    Both live on the load path *before* any account is constructed, so a
+    small crafted key_datas is enough: no account files are needed.
+    """
+
+    def test_a_short_wrapped_local_key_is_a_qdatastream_failure(self):
+        # #44: a truncated wrapped key used to be trusted as-is
+        # (readRawData(256) without checking status/length)
+        import tempfile
+
+        from tgmint.exception import OpenTeleException
+        from tgmint.td import storage as st
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            self.assertTrue(td.SaveTData(tmp))
+            _key_data, salt, key_encrypted, info_encrypted = _read_key_file(tmp)
+
+            _, passcode_key = _unwrap_local_key(salt, key_encrypted)
+
+            short = st.Storage.EncryptedDescriptor(4)
+            short.stream.writeInt32(0xDEADBEEF)
+            _write_key_file(
+                tmp, salt, st.Storage.PrepareEncrypted(short, passcode_key), info_encrypted
+            )
+
+            with self.assertRaises(OpenTeleException) as ctx:
+                TDesktop(tmp)
+            self.assertIn("local key", str(ctx.exception))
+            # the old code produced a 4-byte AuthKey and carried on
+            self.assertNotIn("Bad local key size in key data: 4", str(ctx.exception))
+
+    def test_an_implausible_accounts_count_is_refused(self):
+        # #13: count came straight off the file, so a crafted header could
+        # declare millions of accounts and hang the loader
+        import tempfile
+
+        from tgmint.exception import OpenTeleException
+        from tgmint.td import storage as st
+        from tgmint.td.tdesktop import TDesktop as TDesktopClass
+
+        cap = TDesktopClass.kMaxAccounts
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            self.assertTrue(td.SaveTData(tmp))
+            _key_data, salt, key_encrypted, _info_encrypted = _read_key_file(tmp)
+            local_key, _passcode_key = _unwrap_local_key(salt, key_encrypted)
+
+            count = cap + 1
+            info = st.Storage.EncryptedDescriptor(4 + 4 * count)
+            info.stream.writeInt32(count)
+            for index in range(count):
+                info.stream.writeInt32(index)
+
+            _write_key_file(
+                tmp, salt, key_encrypted, st.Storage.PrepareEncrypted(info, local_key)
+            )
+
+            with self.assertRaises(OpenTeleException) as ctx:
+                TDesktop(tmp)
+            self.assertIn("implausible accounts count", str(ctx.exception))
+            self.assertIn(str(count), str(ctx.exception))
+            self.assertIn(str(cap), str(ctx.exception))
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt5 not installed — mtp data tests skipped")
+class TestMtpDataBlocks(unittest.TestCase):
+    """readMtpData is a LOOP over blocks (review td finding 45)."""
+
+    def test_a_file_with_more_than_one_block_is_read_completely(self):
+        # #45: only the FIRST block was read, and it had to be the
+        # authorization — a legacy-style file carrying settings blocks first
+        # lost its authorization (or was rejected)
+        import tempfile
+
+        from tgmint.td import storage as st
+        from tgmint.td.configs import dbi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            self.assertTrue(td.SaveTData(tmp))
+
+            serialized = td.mainAccount.serializeMtpAuthorization()
+            size = 4 + 4 + 4 + serialized.size()
+            blocks = st.Storage.EncryptedDescriptor(size)
+            blocks.stream.writeInt32(dbi.ChatSizeMaxOld)
+            blocks.stream.writeInt32(999)
+            blocks.stream.writeInt32(dbi.MtpAuthorization)
+            blocks.stream << serialized
+
+            data_name_key = st.Storage.ComputeDataNameKey(td.keyFile)
+            file = st.Storage.FileWriteDescriptor(
+                st.Storage.ToFilePart(data_name_key), tmp
+            )
+            file.writeEncrypted(blocks, td.localKey)
+            file.finish()
+
+            loaded = TDesktop(tmp)
+            self.assertTrue(loaded.isLoaded())
+            self.assertEqual(loaded.accountsCount, 1)
+            self.assertEqual(loaded.mainAccount.UserId, USER_ID)
+
+    def test_a_file_without_an_authorization_block_is_refused(self):
+        # the loop must not accept a settings-only file either. Called on the
+        # account directly: TDesktop.__loadFromTData swallows per-account
+        # OpenTeleException, so the loader-level symptom is the generic
+        # "No account has been loaded" and the specific message would never
+        # reach the caller.
+        import tempfile
+
+        from tgmint.exception import OpenTeleException
+        from tgmint.td import storage as st
+        from tgmint.td.configs import dbi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = _build_tdesktop()
+            self.assertTrue(td.SaveTData(tmp))
+            account = TDesktop(tmp).mainAccount
+
+            blocks = st.Storage.EncryptedDescriptor(8)
+            blocks.stream.writeInt32(dbi.ChatSizeMaxOld)
+            blocks.stream.writeInt32(999)
+
+            data_name_key = st.Storage.ComputeDataNameKey(td.keyFile)
+            file = st.Storage.FileWriteDescriptor(
+                st.Storage.ToFilePart(data_name_key), tmp
+            )
+            file.writeEncrypted(blocks, td.localKey)
+            file.finish()
+
+            with self.assertRaises(OpenTeleException) as ctx:
+                account._local.readMtpData()
+            self.assertIn("mtp authorization", str(ctx.exception))
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt5 not installed — td helper tests skipped")
+class TestSerializeHelpers(unittest.TestCase):
+    """QString sizing and the error messages that name their values."""
+
+    def test_string_size_matches_what_the_writer_emits(self):
+        # #42: stringSize was sizeof(uint32)+len+sizeof(ushort) while
+        # writeQString writes a uint32 byte length + UTF-16-BE payload
+        from tgmint.td.configs import QByteArray
+        from tgmint.td.qdatastream import QDataStream
+        from tgmint.td.storage import Serialize
+
+        for text in ("", "macOS", "Telegram Desktop 6.2.1", "Привет", "🦊 emoji"):
+            with self.subTest(text=text):
+                buffer = QByteArray()
+                stream = QDataStream(buffer)
+                stream.writeQString(text)
+                self.assertEqual(Serialize.stringSize(text), buffer.size())
+
+        # the null/empty markers are a bare four-byte length
+        self.assertEqual(Serialize.stringSize(None), 4)
+        self.assertEqual(Serialize.stringSize(""), 4)
+        # and an astral character is TWO UTF-16 code units, not one
+        self.assertEqual(Serialize.stringSize("🦊"), 4 + 4)
+
+    def test_invalid_magic_message_names_the_file_and_the_magic(self):
+        # #41: the four storage error messages were not f-strings, so they
+        # printed "{fileName}" instead of the actual file
+        import tempfile
+
+        from tgmint.exception import OpenTeleException
+        from tgmint.td.storage import Storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bogus_magic = b"XXXX"
+            with open(os.path.join(tmp, "items"), "wb") as fp:
+                fp.write(bogus_magic + b"\x00" * 4)
+
+            with self.assertRaises(OpenTeleException) as ctx:
+                Storage.ReadFile("item", tmp)
+            message = str(ctx.exception)
+            self.assertIn("Invalid magic", message)
+            self.assertNotIn("{", message)
+            self.assertIn("b'XXXX'", message)  # the value, not the placeholder
+            self.assertIn("item", message)  # the logical file name
+
+    def test_invalid_checksum_message_names_the_file(self):
+        import tempfile
+
+        from tgmint.exception import OpenTeleException
+        from tgmint.td.configs import APP_VERSION, TDF_MAGIC
+        from tgmint.td.storage import Storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = b"payload"
+            with open(os.path.join(tmp, "items"), "wb") as fp:
+                fp.write(
+                    TDF_MAGIC
+                    + APP_VERSION.to_bytes(4, "little")
+                    + payload
+                    + b"\x00" * 16  # a deliberately wrong md5 trailer
+                )
+
+            with self.assertRaises(OpenTeleException) as ctx:
+                Storage.ReadFile("item", tmp)
+            message = str(ctx.exception)
+            self.assertIn("Invalid checksum", message)
+            self.assertNotIn("{", message)
+            self.assertIn("item", message)
+
+    def test_bad_encrypted_size_message_carries_the_size(self):
+        # #41 (same finding, encrypted/decrypted part sizes)
+        from tgmint.exception import OpenTeleException
+        from tgmint.td.auth import AuthKey, AuthKeyType
+        from tgmint.td.configs import DcId, QByteArray
+        from tgmint.td.storage import Storage
+
+        key = AuthKey(os.urandom(256), AuthKeyType.Generated, DcId(0))
+        blob = QByteArray(b"\x00" * 17)
+        with self.assertRaises(OpenTeleException) as ctx:
+            Storage.DecryptLocal(blob, key)
+        message = str(ctx.exception)
+        self.assertIn("Bad encrypted part size", message)
+        self.assertNotIn("{", message)
+        self.assertIn("17", message)

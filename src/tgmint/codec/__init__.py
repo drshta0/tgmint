@@ -13,6 +13,7 @@ Pyrogram-family string        :func:`tgmint.codec.pyrogram.read_string`
 GramJS StringSession          :func:`tgmint.codec.gramjs.read_string`
 tdata folder                  :func:`tgmint.codec.tdata.read`
 ``.tgmint`` profile envelope  :func:`tgmint.profile.open_profile`
+Android app data dir          :func:`tgmint.codec.android.read`
 ============================  ==============================================
 
 Writers (← :class:`SessionData`): Telethon SQLite + string, Pyrogram
@@ -29,7 +30,13 @@ The ``.tgmint`` envelope (:mod:`tgmint.profile`, ``"profile"``) is a
 other way (session → envelope) is ``tgmint profile seal``, which also
 carries the fingerprint and the passkey. The reader is imported lazily so
 ``tgmint.codec`` stays importable without touching the envelope module's
-crypto path (an unsealed profile needs none).
+crypto path (an unsealed profile needs none).  The official Android app
+data directory (``"android-dir"``) is source-only the same way and for a
+stronger reason: writing into an app's private storage is how logins
+die.  It reads the app's own ``tgnet.dat`` + ``userconfing.xml`` (no
+crypto — the key is plaintext; the hard part is acquiring the files, see
+``docs/android-acquisition.md``); the per-field spec with the pinned
+DrKLO/Telegram commit lives in :mod:`tgmint.codec.android`.
 
 Honest verification status (details in each module docstring, pinned by
 ``tests/test_codec_matrix.py``):
@@ -42,6 +49,11 @@ Honest verification status (details in each module docstring, pinned by
   GramJS oracle in this tree.
 * **Pyrogram / kurigram** — self-consistent only (we read back what we
   write); no external oracle today.
+* **Android** — the format spec is verified line-by-line against the
+  official client source (DrKLO/Telegram, commit pinned in
+  :mod:`tgmint.codec.android`) and cross-checked against AndroidTelePorter
+  (MIT); the reader is exercised against synthetic fixtures built by an
+  independent in-test encoder.  No real app dump has been read yet.
 
 The whole package is stdlib-only (sqlite3/base64/struct/ipaddress);
 PyQt5 is needed solely by the tdata reader and is imported lazily there.
@@ -59,10 +71,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Optional
+from typing import Any, Optional
 
 from .data import CodecError, SessionData, write_text_file
-from . import data, dcs, gramjs, pyrogram, telethon
+from . import android, data, dcs, gramjs, pyrogram, telethon
 
 try:  # tdata.py itself is importable without Qt (the guard is lazy)
     from . import tdata
@@ -83,6 +95,7 @@ __all__ = [
     "telethon",
     "pyrogram",
     "gramjs",
+    "android",
     "tdata",
 ]
 
@@ -108,7 +121,7 @@ _READERS = {
 PROFILE_FORMATS = frozenset({"profile", "tgmint", "tgmint-profile", "tgmint-profile/1"})
 
 #: formats `convert_session` accepts as a `source_format`
-SOURCE_FORMATS = tuple(sorted(_READERS)) + ("tdata", "profile")
+SOURCE_FORMATS = tuple(sorted(_READERS)) + ("android-dir", "tdata", "profile")
 
 
 #: destination formats that store a user_id / api_id and therefore need one
@@ -119,8 +132,8 @@ _NEEDS_API_ID = frozenset({"pyrogram-session", "pyrogram-string"})
 
 #: filled when the destination format requires a field the source format
 #: physically cannot store (e.g. Telethon strings carry no user_id).
-#: 777000 is Telegram's service account, 2040 Telegram's public web-demo
-#: app — recognisable placeholders, never a claim about the account.  The
+#: 777000 is Telegram's service account, 2040 Telegram Desktop's official
+#: app id — recognisable placeholders, never a claim about the account.  The
 #: destination client refreshes user_id from the server on first connect;
 #: construct it with the account's real api_id.  Library callers override
 #: both via the `convert_session` kwargs.
@@ -153,7 +166,9 @@ def infer_source_format(source: str) -> str:
     use it when the caller passes no format at all; an explicit format is
     never second-guessed.
     """
-    return "profile" if str(source).endswith(".tgmint") else "telethon-session"
+    if str(source).endswith(".tgmint"):
+        return "profile"
+    return "android-dir" if android.looks_like_dump(source) else "telethon-session"
 
 
 def read_session(
@@ -172,16 +187,18 @@ def read_session(
 
     Args:
         source: the session string (``*-string`` formats), a SQLite file
-            path, a ``tdata`` folder, or a ``.tgmint`` envelope file.
+            path, a ``tdata`` folder, an Android app data dump directory
+            (``android-dir``), or a ``.tgmint`` envelope file.
         source_format: one of the names in :data:`SOURCE_FORMATS`, or
-            ``None`` to infer it (``.tgmint`` -> ``profile``, otherwise
+            ``None`` to infer it (``.tgmint`` -> ``profile``, a dump
+            directory with a ``tgnet.dat`` -> ``android-dir``, otherwise
             ``telethon-session``).
         passcode: the local passcode of a ``tdata`` folder.
         passphrase: the passphrase of a sealed ``.tgmint`` envelope
             (ignored by every other format).
-        account_index: which account of a multi-account ``tdata`` folder to
-            read; ``None`` selects its main account.  Ignored by every
-            other format.
+        account_index: which account of a multi-account ``tdata`` folder or
+            Android app dump to read; ``None`` selects its main/first
+            account.  Ignored by every other format.
     """
     if source_format in (None, "", "auto"):
         source_format = infer_source_format(source)
@@ -204,11 +221,13 @@ def _read_source(
         if tdata is None:  # pragma: no cover - defensive import guard
             raise CodecError("tdata reader unavailable in this build")
         return tdata.read(source, passcode=passcode, account_index=account_index)
+    if source_format == "android-dir":
+        return android.read(source, account_index=account_index)
     reader = _READERS.get(source_format)
     if reader is None:
         raise CodecError(
             f"unknown source format {source_format!r}; expected one of "
-            f"{sorted(_READERS) + ['tdata', 'profile']}"
+            f"{sorted(_READERS) + ['android-dir', 'tdata', 'profile']}"
         )
     if source_format.endswith("-string") and os.path.isfile(source):
         # convenience: `--from` may name a file holding the session
@@ -319,7 +338,7 @@ def _write_destination(
 
 def _preserves(
     destination_format: str, variant: str = pyrogram.VARIANT_PYROGRAM
-) -> FrozenSet[str]:
+) -> frozenset[str]:
     """Fields the destination format genuinely keeps (module PRESERVES).
 
     ``variant`` matters for the Pyrogram family: the kurigram SQLite schema
@@ -351,7 +370,7 @@ def _preserves(
 #: ``is_bot=True`` is genuine data that *is* lost.  A value equal to its
 #: default therefore counts as effectively preserved, and a real ``False`` /
 #: ``0`` is still never mistaken for "absent" (``None`` is the only "unset").
-_NEUTRAL_VALUES: Dict[str, Any] = {"is_bot": False, "test_mode": False, "port": 0}
+_NEUTRAL_VALUES: dict[str, Any] = {"is_bot": False, "test_mode": False, "port": 0}
 _NO_DEFAULT = object()
 
 
@@ -371,8 +390,8 @@ def _fill_note(field: str, source_format: str, value: int) -> str:
             "the server on first connect"
         )
     return (
-        f"api_id: {source_format} stores none; wrote {value} (Telegram's "
-        "public demo app id) — construct the destination client with the "
+        f"api_id: {source_format} stores none; wrote {value} (Telegram "
+        "Desktop's official app id, a placeholder) — construct the destination client with the "
         "account's real api_id"
     )
 
@@ -382,7 +401,7 @@ def _fill_for_destination(
     destination_format: str,
     user_id: Optional[int],
     api_id: Optional[int],
-) -> "tuple":
+) -> tuple:
     """Fill the fields a destination requires but the source cannot hold."""
     filled = []
     if destination_format in _NEEDS_USER_ID and data.user_id is None:
@@ -406,7 +425,7 @@ def write_session(
     passcode: str = "",
     variant: str = "pyrogram",
     source_label: str = "an in-memory session",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Write one in-memory :class:`SessionData` in a destination format.
 
     The writer half of :func:`convert_session`, public because callers
@@ -430,7 +449,7 @@ def write_session(
         data, destination, destination_format, passcode, variant
     )
     keeps = _preserves(destination_format, variant)
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "destination_format": destination_format,
         "dc_id": data.dc_id,
         "user_id": data.user_id if "user_id" in keeps else None,
@@ -465,7 +484,7 @@ def convert_session(
     passphrase: str = "",
     variant: str = "pyrogram",
     account_index: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Convert one session between any two formats of the matrix above.
 
     This is the entrypoint the ``tgmint convert`` CLI calls — and the one
@@ -476,33 +495,38 @@ def convert_session(
     Args:
         source: the session string itself for ``*-string`` formats, the
             SQLite file path for ``*-session``, the folder for ``tdata``.
-        source_format / destination_format: the sources are
+        source_format: the format of ``source``. The sources are
             ``telethon-session``, ``telethon-string``, ``pyrogram-session``,
-            ``pyrogram-string``, ``gramjs-string``, ``tdata`` and
-            ``profile`` (a ``.tgmint`` envelope); the destinations are the
-            same set minus ``profile`` (write that one with
-            ``tgmint profile seal``).  ``source_format=None`` infers it from
-            the path: ``.tgmint`` -> ``profile``, anything else
-            ``telethon-session``.
+            ``pyrogram-string``, ``gramjs-string``, ``tdata``,
+            ``android-dir`` (an official-Android-app data dump; see
+            :mod:`tgmint.codec.android`) and ``profile`` (a ``.tgmint``
+            envelope); the destinations are the same set minus
+            ``profile`` (write that one with ``tgmint profile seal``)
+            and minus ``android-dir`` (the app dir is read-only, never
+            written).  ``source_format=None`` infers it from the path:
+            ``.tgmint`` -> ``profile``, a directory with a ``tgnet.dat``
+            -> ``android-dir``, anything else ``telethon-session``.
+        destination_format: the format to write (see ``source_format``).
         destination: output path — a file for every format except
             ``tdata`` (a folder).  Existing outputs are never overwritten
             (:class:`FileExistsError`); string outputs are files written
             with mode 0600 (the string is never echoed to the caller).
-        user_id / api_id: supplied only when the source format cannot
+        user_id: supplied only when the source format cannot
             carry a field the destination requires (Telethon, GramJS and
             tdata store no api_id; Telethon and GramJS strings store no
             user_id).  Without them a labelled placeholder is written and
             reported in the result's ``notes`` — the destination client
             refreshes ``user_id`` from the server on first connect.
+        api_id: same rule as ``user_id``.
         passcode: the local passcode of a source ``tdata`` folder (also
             used when writing one).
         passphrase: the passphrase of a sealed ``profile`` source; every
             other source format ignores it.
         variant: pyrogram SQLite variant for ``pyrogram-session``
             destinations (``"pyrogram"`` or ``"kurigram"``).
-        account_index: which account of a multi-account ``tdata`` *source*
-            folder to read; ``None`` selects its main account.  Ignored by
-            every other source format.
+        account_index: which account of a multi-account ``tdata`` or
+            ``android-dir`` *source* to read; ``None`` selects its
+            main/first account.  Ignored by every other source format.
 
     Returns:
         a JSON-friendly dict describing what was written: ``dc_id``,
@@ -536,9 +560,20 @@ def convert_session(
         variant=variant,
         source_label=source_format,
     )
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "source_format": source_format,
         "test_mode": bool(data.test_mode),
     }
     result.update(written)
+    if source_format == "android-dir" and "api_id" in written.get("preserved", ()):
+        # record where the destination's api_id came from: the Android
+        # reader pins 4, the official app's own wire identity, so no
+        # placeholder note fired — say so, so the report stays honest
+        notes = list(written.get("notes", ()))
+        notes.append(
+            f"api_id: android-dir source carried {data.api_id} — the "
+            "official Android app's own wire api_id "
+            "(tgmint.codec.android.OFFICIAL_APP_API_ID), not a placeholder"
+        )
+        result["notes"] = notes
     return result

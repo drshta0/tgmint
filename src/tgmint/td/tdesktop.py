@@ -4,6 +4,7 @@ from __future__ import annotations
 from .configs import *
 from . import shared as td
 
+import typing
 import logging
 import os
 from telethon.network.connection.connection import Connection
@@ -129,10 +130,10 @@ class TDesktop(BaseObject):
             keyFile (str, default="data"):
                 See `keyFile`.
         """
-        self.__accounts: typing.List[td.Account] = []
+        self.__accounts: list[td.Account] = []
         self.__basePath = basePath
         self.__keyFile = keyFile if (keyFile != None) else TDesktop.kDefaultKeyFile
-        self.__passcode = passcode if (passcode != None) else str("")
+        self.__passcode = passcode if (passcode != None) else ""
         self.__passcodeBytes = self.__passcode.encode("ascii")
         self.__mainAccount: Optional[td.Account] = None
         self.__active_index = -1
@@ -476,7 +477,7 @@ class TDesktop(BaseObject):
                     if account.isLoaded():
                         self.accounts.append(account)
 
-                except OpenTeleException as e:
+                except OpenTeleException:
                     pass
 
         Expects(len(self.accounts) > 0, "No account has been loaded")
@@ -549,7 +550,7 @@ class TDesktop(BaseObject):
         api: Union[Type[APIData], APIData] = API.TelegramDesktop,
         password: str = None,
         *,
-        connection: typing.Type[Connection] = ConnectionTcpFull,
+        connection: type[Connection] = ConnectionTcpFull,
         use_ipv6: bool = False,
         proxy: Union[tuple, dict] = None,
         local_addr: Union[str, tuple] = None,
@@ -663,7 +664,7 @@ class TDesktop(BaseObject):
         """
         cls.kPerformanceMode = enabled
 
-    kMaxAccounts: int = int(6)
+    kMaxAccounts: int = 6
     """The maximum amount of accounts a client can have.
 
     Telegram Desktop raised the cap from 3 to 4 (2023) and then 6 with

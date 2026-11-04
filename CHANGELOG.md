@@ -1,6 +1,175 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Documentation site rebuilt** (`mkdocs.yml`, `docs/`): new Home,
+  Getting started (three tested recipes) and Concepts pages; a CLI
+  reference generated from the argparse parser at build time
+  (`docs/hooks/cli_reference.py`, nothing generated is committed); and
+  a 12-page API reference generated from docstrings by mkdocstrings.
+  `mkdocs build --strict` is warning-free. New SVG logo
+  (`docs/assets/logo.svg`).
+- `CONTRIBUTING.md`: dev setup (venv + pytest/selfcheck/ruff), the
+  offline-tests / golden-files rule, the own-account-only guardrail
+  (PRs adding batch/farming features will be closed), the
+  cite-a-source-URL rule for every data value, and a DCO-style
+  "you wrote the code you submit" expectation.
+- `CODE_OF_CONDUCT.md`: Contributor Covenant 2.1, verbatim; reports go
+  via GitHub private vulnerability reporting / repo owner (no email).
+- `.github/dependabot.yml`: weekly dependency bumps for `pip` (repo
+  root) and `github-actions`.
+- `.github/workflows/release.yml`: on tag push `v*` — build sdist+wheel
+  with `python -m build`, `twine check`, then publish with
+  pypa/gh-action-pypi-publish via PyPI Trusted Publishing
+  (`permissions: id-token: write`, environment `pypi`). No API tokens
+  anywhere; the one-time trusted-publisher setup is documented in the
+  workflow header comment.
+- **QR login, framework-neutral** (`tgmint.qrlogin_core` +
+  `docs/qr-login.md`): `tgmint login-qr --to PATH --to-format FMT
+  [--preset ...]` shows a `tg://login` QR in the terminal, waits until
+  you confirm it from your own logged-in app, and writes the session in
+  any format — born with a minted fingerprint. The ceremony is the
+  passkey architecture again: a Telethon-free state machine
+  (`auth.exportLoginToken` / `auth.importLoginToken`, the
+  `auth.loginTokenMigrateTo` DC switch, expiry refresh, 2FA as the typed
+  `QrPasswordNeeded` result — the core never prompts) over a duck-typed
+  invoker, with thin Telethon (`tgmint.qrlogin`) and Pyrogram-family
+  (`tgmint.qrlogin_pyrogram`) drivers. The DC-switch snapshot/rollback
+  moved to a shared `tgmint.dcswitch` module both the passkey and QR
+  drivers use (a failed migrate import restores the caller's session; a
+  2FA stop intentionally keeps the home-DC session). Constructor ids are
+  pinned against BOTH installed frameworks' generated layers (Telethon
+  1.45.0 and kurigram 2.2.26, both layer 229) in
+  `tests/test_wire_golden.py`, byte-for-byte. The terminal QR comes from
+  tgmint's own pure-Python ISO/IEC 18004 encoder (`tgmint.qrrender`:
+  byte mode, L/M, versions 1-10, all eight masks) — no new dependency
+  and no `[qr]` extra: correctness is pinned offline by golden matrices
+  recorded from the `qrcode` library (with `segno` second-checking
+  version assignment) via `scripts/regen_qr_golden.py` into
+  `tests/golden/qr/qr_vectors.json`; the suite imports neither. QR login
+  itself is parity, not novelty (opentele2, Telethon's `client.qr_login`
+  and kurigram's `pyrogram.qrlogin` ship it); tgmint's addition is the
+  neutral ceremony, the shared rollback and the zero-dep renderer.
+- **`tgmint verify <path>`**: open one session
+  file, saved session string, tdata folder or `.tgmint` envelope
+  completely offline and report the format (detected — a directory is
+  tdata, `*.tgmint` an envelope, else a reader chain; `--from-format`
+  overrides), `dc_id`, `user_id`/`api_id` when stored, the auth-key
+  fingerprint as two hashes only (the MTProto `auth_key_id`
+  `sha1(key)[-8:]` and a full SHA-256 — the key itself is never
+  printed), codec placeholder values (user_id 777000 / api_id 2040), and
+  file permissions (warns when group/other can access the credential —
+  files should be 0600, a tdata tree 0700/0600; a stricter mode stays
+  quiet, and the check is POSIX-only). A tdata passcode arrives via
+  `--passcode-env` and a sealed envelope's passphrase via
+  `--passphrase-env`/`--passphrase-stdin` — never argv. Exit codes
+  (documented in `--help`): 0 ok | 1 unreadable | 2 readable, with
+  warnings. `--json` failures print a machine-readable error object.
+  String-format detection guards against the Telethon/GramJS shared
+  `"1"` prefix: a GramJS body with a 14-byte hostname is structurally
+  Telethon-IPv6-shaped, and the discriminator (the hostname-length
+  field) keeps verify from reporting a wrong key hash for it.
+
+- **Official Android app session import** —
+  `tgmint convert --from-format android-dir DIR` reads a dump of your own
+  rooted/emulated device's official Telegram storage
+  (`tgnet.dat` + `userconfing.xml`; `src/tgmint/codec/android.py`) and
+  converts the selected account to every destination of the matrix
+  (Telethon SQLite + string, Pyrogram-family SQLite both variants +
+  string, GramJS string, tdata, and the `.tgmint` envelope via
+  `profile seal`). The binary layout is verified field-by-field against
+  the official client source (DrKLO/Telegram pinned commit, cited per
+  field in the module) and cross-checked against AndroidTelePorter (MIT,
+  PyPI — prior art, credited in ACKNOWLEDGMENTS.md; tgmint claims no
+  "first"). Details: `--account-index` selects one of the discovered
+  account slots (no "convert all", own-account tooling only);
+  `tgnet.dat.bak` is honored the way the app's own crash recovery
+  promotes it; the user id is parsed best-effort from the prefs XML
+  (three known `TL_user` constructors; unknown → unset, never guessed);
+  truncated/garbage input raises the codec's typed
+  `tgmint.codec.CodecError`, never a raw `struct.error`/`IndexError`.
+  Pyrogram-family outputs carry the official app's own `api_id` (4,
+  mirrored from `API.TelegramAndroid`) with the source recorded in the
+  conversion report, instead of the demo placeholder. Tests: 38 new
+  offline tests against fixtures synthesized by an independent in-test
+  encoder (no real account data anywhere); acquisition recipes updated
+  in `docs/android-acquisition.md`.
+
+### Changed
+- README rewritten as a short landing page (pitch, 3-command demo,
+  feature table, framework matrix, docs index); the per-feature detail
+  lives in the docs.
+- Docs theme: stock Material (light/dark) replaces the `theme/` overrides
+  copied from another project, which included that project's
+  announcement banner and its own CSS/JS bundle. The stale 2022
+  hand-written upstream API pages (`docs/documentation/`, duplicated in
+  `docs-github/`) and the pydoc build scripts are removed; the examples
+  link to the generated reference instead.
+- CI (`package.yml`) runs `pytest` instead of `unittest discover`
+  (which skipped the plain-function tests) and installs `kurigram`, so
+  the Pyrogram-family passkey, cadence, QR and adapter tests run instead
+  of silently skipping. It also triggers on `pyproject.toml` changes.
+- Lint ratchet: CI lint is no longer smoke-only. `[tool.ruff]` in
+  pyproject.toml (target py39, line-length 120) now selects
+  E9/F63/F7 plus F401, F811, F841, B006, B008 and the UP (pyupgrade)
+  rules, and `.github/workflows/pylint.yml` runs `ruff check src tests`
+  off that config. UP007/UP045 (`Optional[X]`/`Union` → `X | Y`) are
+  deliberately excluded: PEP 604 annotations raise TypeError when
+  evaluated on Python 3.9, which we still support. All fixes are
+  behavior-preserving: deprecated `typing.List`/`Dict`/`Tuple`/`Type`
+  annotations became builtin generics (PEP 585, fine at runtime on
+  3.9), mutable default arguments (`B006`) and call-in-default
+  arguments (`B008`) got `None` sentinels, unused bindings and imports
+  were dropped (import hubs like `td/configs.py` keep their re-export
+  surface via per-file ignores), and stacked `@typing.overload`
+  redefinitions now resolve because the three files that use them got
+  an explicit `import typing` (ruff cannot see `typing` through
+  star-imports).
+- pyproject: `maintainers` is now `drshta0` (`authors` stays
+  `thedemons` for MIT lineage); the `[project.scripts]` comment now
+  lists all twelve CLI commands (mint | inspect | audit | freshness |
+  parity | convert | login-passkey | profile | heal | bootstrap |
+  cadence | doctor).
+- Deduplicated the triple-copied examples: `docs/examples/` is the
+  single canonical copy (it is what mkdocs / Read the Docs serves —
+  `docs_dir: docs` in `mkdocs.yml`); the stale `examples/` and
+  `docs-github/examples/` copies are deleted, and the surviving copy
+  now uses `tgmint.*` imports instead of leftover `opentele.*` ones.
+  `mkdocs build --strict` passes.
+
+### Fixed
+- **`API.TelegramAndroid` could not log in new sessions.** The pair it
+  was rotated to in 1.18.x (`api_id` 4 / `014b35b6...`, what the shipped
+  APK carries) is also in the public DrKLO source, and Telegram refuses it
+  for new logins from anything but the real app: `auth.sendCode` and
+  `auth.exportLoginToken` return `API_ID_PUBLISHED_FLOOD` (verified live
+  2026-11-04), so `login-qr`, `login-passkey` and `heal` failed with
+  `--preset android`. The preset is back on the official `6` /
+  `eb06d4abfb49dc3eeb1aeb98ae0f581e`, which Telegram still accepts. The
+  Android-app import (`android-dir`) still records 4, the id those
+  sessions were really created under, now pinned in
+  `tgmint.codec.android.OFFICIAL_APP_API_ID` instead of mirrored from the
+  preset. `login-qr`, `login-passkey` and `heal` now say so when Telegram
+  refuses an app id, and point at `--preset`.
+- The 2040 placeholder app id is described as Telegram Desktop's official
+  id (it was mislabelled "public web-demo") in `convert`/`verify`
+  messages; `login-passkey --help` no longer claims to be the only
+  network command.
+- **Python 3.13: the Telethon layer failed at import** with
+  `extend_class: attribute '__firstlineno__' already exists`. 3.13 adds
+  `__firstlineno__` / `__static_attributes__` to every class `__dict__`;
+  `extend_class` now skips them like `__module__` (`utils.py`), with a
+  regression test that fails without the fix.
+- Python 3.9 test suite (21 failures, pre-existing since v1.18.0): an
+  autouse fixture (`tests/conftest.py`) guarantees a current event loop
+  for the sync Telethon/Pyrogram constructors after an `asyncio.run()`;
+  the QR wire-golden test no longer pins the installed kurigram layer
+  (3.9 resolves 2.2.25 = layer 228).
+- `mkdocs.yml` no longer loads `polyfill.io` (a domain that served
+  malware after its 2024 sale), nor unused MathJax / Mermaid 8.13.
+
 ## [1.18.1] - 2026-11-03
 
 The code-review fix release. A 6-way parallel review of all 26.7k lines
@@ -234,7 +403,8 @@ place.
   `014b35b6184100b085b0d0572f9b5103`), verified 2026-11-01 by
   disassembling the shipped official APK (13.1.1, telegram.org/dl/android/apk,
   `BuildVars.<clinit>` in classes.dex): the 2022 pair `6`/`eb06d4...`
-  appears nowhere in the current APK.
+  appears nowhere in the current APK. (Reverted to 6 — see [Unreleased]
+  Fixed: Telegram refuses 4 for new logins.)
 - `API.TelegramDesktopFlatpak` — the second, current official Desktop
   credential pair (`api_id` 611335 / `d524b414d21f4d37f08684c1df41ac9c`)
   extracted from the shipped flathub build (stable `7444df4f`, tdesktop

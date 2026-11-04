@@ -5,7 +5,7 @@ import typing as t
 
 def test_random_api():
 
-    API_TYPE = t.Union[APIData, t.Type[APIData]]
+    API_TYPE = t.Union[APIData, type[APIData]]
 
     def cmp(src: API_TYPE, dst: API_TYPE) -> bool:
         return (
@@ -19,7 +19,7 @@ def test_random_api():
             and src.lang_pack == dst.lang_pack
         )
 
-    apis: t.List[API_TYPE] = [
+    apis: list[API_TYPE] = [
         API.TelegramDesktop,
         API.TelegramAndroid,
         API.TelegramAndroidX,

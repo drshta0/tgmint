@@ -45,7 +45,7 @@ does, and only when the caller asks for it.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any, Optional, Union
 
 from .api import APIData, API
 from .layers import ANDROID_LAYERS, IOS_LAYERS, TD_LAYERS
@@ -55,7 +55,7 @@ __all__ = ["PING_PRESETS", "describe_envelope"]
 # Keys map to presets; values are SUGGESTED TelegramClient kwargs.
 # Inert data — see module docstring. Values are Telethon's baseline,
 # not measured official cadences: the verified ones are tgmint.cadence.
-PING_PRESETS: Dict[str, Dict[str, float]] = {
+PING_PRESETS: dict[str, dict[str, float]] = {
     "tdesktop": {"ping_interval": 60.0},
     "android": {"ping_interval": 60.0},
     "android_x": {"ping_interval": 60.0},
@@ -87,7 +87,7 @@ def _tz_offset_seconds(zone: str) -> int:
     return int(datetime.now(ZoneInfo(zone)).utcoffset().total_seconds())
 
 
-def _bootstrap_summary(target: Any) -> Dict[str, Any]:
+def _bootstrap_summary(target: Any) -> dict[str, Any]:
     """The ``bootstrap`` block of the envelope: platform + step counts.
 
     Pure and defensive: importing :mod:`tgmint.bootstrap` or deriving the
@@ -96,7 +96,7 @@ def _bootstrap_summary(target: Any) -> Dict[str, Any]:
     "cosmetic_steps": 0}`` (an identity whose family has no verified
     sequence, e.g. iOS, reports zero steps rather than guessing).
     """
-    empty: Dict[str, Any] = {"platform": None, "steps": 0, "cosmetic_steps": 0}
+    empty: dict[str, Any] = {"platform": None, "steps": 0, "cosmetic_steps": 0}
     try:
         from .bootstrap import BootstrapError, describe, platform_for
     except Exception:  # pragma: no cover - defensive, bootstrap is stdlib-only
@@ -116,8 +116,8 @@ def _bootstrap_summary(target: Any) -> Dict[str, Any]:
 
 
 def describe_envelope(
-    target: Union[str, Type[APIData], APIData], layer: Optional[int] = None
-) -> Dict[str, Any]:
+    target: Union[str, type[APIData], APIData], layer: Optional[int] = None
+) -> dict[str, Any]:
     """The exact initConnection envelope a preset or minted identity sends.
 
     ``target`` is either a preset key (``"tdesktop"``, ``"android"``,
@@ -164,7 +164,7 @@ def describe_envelope(
     else:
         resolved_layer = _REVERSE.get(target.app_version)
 
-    params: Dict[str, Any] = {}
+    params: dict[str, Any] = {}
     zone = getattr(target, "tz_zone", None)
     if zone:
         params["tz_offset"] = _tz_offset_seconds(zone)

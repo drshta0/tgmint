@@ -27,7 +27,7 @@ precise measurements. Do not treat them as census data.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .devices import SystemInfo
@@ -68,7 +68,7 @@ _FORMAT_NOTE = (
 
 # ~12 entries covering the largest slices of Telegram's public userbase.
 # Weights are INDICATIVE (see module docstring) and sum to ~0.99.
-_RAW_LOCALES: Tuple[LocaleTriple, ...] = (
+_RAW_LOCALES: tuple[LocaleTriple, ...] = (
     LocaleTriple("en", "en-US", "America/New_York", 0.31, _FORMAT_NOTE),
     LocaleTriple("ru", "ru-RU", "Europe/Moscow", 0.13, _FORMAT_NOTE),
     LocaleTriple("es", "es-ES", "Europe/Madrid", 0.07, _FORMAT_NOTE),
@@ -104,7 +104,7 @@ def _check_zone(zone: str) -> bool:
 # a locale pool with a dead zone would mint fingerprints whose tz_offset()
 # silently returns None. All zones below load on a normal system tzdata
 # (verified 2026-10-24); the drop path is defense for minimal containers.
-LOCALES: Tuple[LocaleTriple, ...] = tuple(
+LOCALES: tuple[LocaleTriple, ...] = tuple(
     triple for triple in _RAW_LOCALES if _check_zone(triple.tz_zone)
 )
 
@@ -117,7 +117,7 @@ _FALLBACK_LOCALE = LocaleTriple(
 )
 
 
-def _weighted_pick(hash_id: int, triples: List[LocaleTriple]) -> LocaleTriple:
+def _weighted_pick(hash_id: int, triples: list[LocaleTriple]) -> LocaleTriple:
     """Weighted counterpart of SystemInfo._hashtovalue.
 
     Uses the same deterministic hash id, but walks cumulative weight buckets

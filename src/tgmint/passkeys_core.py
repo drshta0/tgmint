@@ -87,7 +87,7 @@ import json
 import os
 import re
 import struct
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Optional, Protocol
 
 __all__ = [
     # credential layer (copied from tgmint.passkeys)
@@ -121,6 +121,7 @@ __all__ = [
     "register_passkey_core",
     "login_passkey_assertion",
     "finish_login",
+    "check_finish_identity",
     "list_passkeys_core",
     "delete_passkey_core",
     # private helpers, exported for parity tests and port-side auditing
@@ -267,7 +268,7 @@ _FLAG_UV = 0x04  # user verified
 _FLAG_AT = 0x40  # attested credential data present
 
 
-def _new_keypair(alg: int) -> Tuple[Any, bytes]:
+def _new_keypair(alg: int) -> tuple[Any, bytes]:
     """Returns (private_key, cose_public_key_bytes)."""
     if alg == ALG_ES256:
         from cryptography.hazmat.primitives.asymmetric import ec
@@ -341,7 +342,7 @@ def _authenticator_data(
     rp_id: str,
     flags: int,
     sign_count: int,
-    attested: Optional[Tuple[bytes, bytes]] = None,
+    attested: Optional[tuple[bytes, bytes]] = None,
 ) -> bytes:
     data = _sha256(rp_id.encode("ascii")) + bytes([flags]) + _pack_sign_count(sign_count)
     if attested is not None:
@@ -375,7 +376,7 @@ class SoftwareAuthenticator:
     """
 
     @staticmethod
-    def pick_algorithm(options: Dict[str, Any]) -> int:
+    def pick_algorithm(options: dict[str, Any]) -> int:
         offered = [p.get("alg") for p in options.get("pubKeyCredParams") or []]
         for alg in offered:
             if alg in _SUPPORTED_ALGS:
@@ -386,7 +387,7 @@ class SoftwareAuthenticator:
         )
 
     @staticmethod
-    def validate_override_algorithm(options: Dict[str, Any], alg: Any) -> int:
+    def validate_override_algorithm(options: dict[str, Any], alg: Any) -> int:
         """Check an explicit ``alg`` override against the server's offer.
 
         The server's ``pubKeyCredParams`` is the set of signature algorithms
@@ -470,11 +471,11 @@ class SoftwareAuthenticator:
 
     @staticmethod
     def produce_assertion(
-        store: "PasskeyStore",
+        store: PasskeyStore,
         options: Any,
         *,
         origin: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Sign a login challenge with a stored credential.
 
         Returns the fields needed for ``inputPasskeyResponseLogin`` and
@@ -632,7 +633,7 @@ class PasskeyStore:
     def user_id(self) -> int:
         return int(self.user_handle.split(":")[1])
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.VERSION,
             "credential_id": _b64u_encode(self.credential_id),
@@ -695,8 +696,8 @@ class PasskeyStore:
         return path
 
     @classmethod
-    def load(cls, path: str) -> "PasskeyStore":
-        with open(path, "r", encoding="utf-8") as fp:
+    def load(cls, path: str) -> PasskeyStore:
+        with open(path, encoding="utf-8") as fp:
             data = json.load(fp)
         if data.get("version") != cls.VERSION:
             raise PasskeyError(f"unsupported passkey store version {data.get('version')!r}")
@@ -715,7 +716,7 @@ class PasskeyStore:
         )
 
     @classmethod
-    def from_credential(cls, cred: CreatedCredential, path: Optional[str] = None) -> "PasskeyStore":
+    def from_credential(cls, cred: CreatedCredential, path: Optional[str] = None) -> PasskeyStore:
         return cls(
             credential_id=cred.credential_id,
             rp_id=cred.rp_id,
@@ -727,7 +728,7 @@ class PasskeyStore:
             path=path,
         )
 
-    def produce_assertion(self, options: Any, *, origin: Optional[str] = None) -> Dict[str, Any]:
+    def produce_assertion(self, options: Any, *, origin: Optional[str] = None) -> dict[str, Any]:
         return SoftwareAuthenticator.produce_assertion(self, options, origin=origin)
 
 
@@ -757,7 +758,7 @@ _CTOR_AUTH_SIGNUP_REQUIRED = 0x44747E9A
 # unset rather than guessing a layout.
 _USER_FLAG_WORDS = {0x31774388: 2, 0xB1B8CC83: 2}  # user#31774388 (L224), user#B1B8CC83 (L229)
 
-PASSKEY_TL_SPEC: Dict[str, Any] = {
+PASSKEY_TL_SPEC: dict[str, Any] = {
     "about": (
         "Telegram passkey TL wire spec as implemented by the hand-written "
         "classes in tgmint.passkeys (DrKLO/Telegram 12.10.6, TL layer 230). "
@@ -946,7 +947,7 @@ PASSKEY_TL_SPEC: Dict[str, Any] = {
     },
 }
 
-PASSKEY_MESSAGE_NAMES: Tuple[str, ...] = tuple(PASSKEY_TL_SPEC["messages"])
+PASSKEY_MESSAGE_NAMES: tuple[str, ...] = tuple(PASSKEY_TL_SPEC["messages"])
 
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1014,7 @@ def _normalize_name(name: str) -> str:
     return name.replace("_", "").replace("#", "").lower()
 
 
-def _resolve_message(name: str) -> Tuple[str, Dict[str, Any]]:
+def _resolve_message(name: str) -> tuple[str, dict[str, Any]]:
     messages = PASSKEY_TL_SPEC["messages"]
     if name in messages:
         return name, messages[name]
@@ -1027,7 +1028,7 @@ def _resolve_message(name: str) -> Tuple[str, Dict[str, Any]]:
     )
 
 
-def _resolve_object(name: str) -> Tuple[Optional[str], Dict[str, Any]]:
+def _resolve_object(name: str) -> tuple[Optional[str], dict[str, Any]]:
     """Returns ``(object key, spec)``; key is None for a union."""
     objects = PASSKEY_TL_SPEC["objects"]
     if name in objects:
@@ -1049,7 +1050,7 @@ def _resolve_object(name: str) -> Tuple[Optional[str], Dict[str, Any]]:
     )
 
 
-def _match_constructor(name: str, candidates: List[str], what: str) -> str:
+def _match_constructor(name: str, candidates: list[str], what: str) -> str:
     objects = PASSKEY_TL_SPEC["objects"]
     wanted = _normalize_name(name)
     for key in candidates:
@@ -1119,7 +1120,7 @@ def _encode_object(type_name: str, value: Any) -> bytes:
     return _encode_construct(spec, fields, what=key)
 
 
-def _encode_construct(spec: Dict[str, Any], fields: Dict[str, Any], what: str) -> bytes:
+def _encode_construct(spec: dict[str, Any], fields: dict[str, Any], what: str) -> bytes:
     declared = [f["name"] for f in spec["fields"]]
     unknown = sorted(set(fields) - set(declared))
     if unknown:
@@ -1154,7 +1155,7 @@ def _encode_construct(spec: Dict[str, Any], fields: Dict[str, Any], what: str) -
     return bytes(out)
 
 
-def encode_request(message_name: str, fields: Optional[Dict[str, Any]] = None) -> bytes:
+def encode_request(message_name: str, fields: Optional[dict[str, Any]] = None) -> bytes:
     """Serialize a passkey request exactly as the Telethon classes do.
 
     ``message_name`` is the spec name (``"registerPasskey"``) or its TL or
@@ -1290,7 +1291,7 @@ class TLReader:
         return _read_object(self, type_name)
 
 
-def _decode_value(reader: TLReader, field: Dict[str, Any]) -> Any:
+def _decode_value(reader: TLReader, field: dict[str, Any]) -> Any:
     """Read one value described by a spec field dict (``{"type": ...}``).
 
     The inverse of :func:`_encode_value`; a field dict is used rather than a
@@ -1345,8 +1346,8 @@ def _read_vector_head(reader: TLReader) -> int:
     return reader.read_int()
 
 
-def _read_fields(reader: TLReader, spec: Dict[str, Any], what: str) -> Dict[str, Any]:
-    values: Dict[str, Any] = {}
+def _read_fields(reader: TLReader, spec: dict[str, Any], what: str) -> dict[str, Any]:
+    values: dict[str, Any] = {}
     flags: Optional[int] = None
     for field in spec["fields"]:
         if field["type"] == "flags":
@@ -1366,7 +1367,7 @@ def _read_fields(reader: TLReader, spec: Dict[str, Any], what: str) -> Dict[str,
     return values
 
 
-def _read_object(reader: TLReader, type_name: str) -> Dict[str, Any]:
+def _read_object(reader: TLReader, type_name: str) -> dict[str, Any]:
     key, spec = _resolve_object(type_name)
     constructor = reader.read_uint()
     if key is None:  # union: dispatch on the constructor id
@@ -1391,7 +1392,7 @@ def _read_object(reader: TLReader, type_name: str) -> Dict[str, Any]:
     return values
 
 
-def _passkey_info(values: Dict[str, Any]) -> PasskeyInfo:
+def _passkey_info(values: dict[str, Any]) -> PasskeyInfo:
     return PasskeyInfo(
         id=values["id"],
         name=values["name"],
@@ -1401,7 +1402,7 @@ def _passkey_info(values: Dict[str, Any]) -> PasskeyInfo:
     )
 
 
-def _read_options(reader: TLReader, result: Dict[str, Any]) -> str:
+def _read_options(reader: TLReader, result: dict[str, Any]) -> str:
     wrapper_name, wrapper_constructor = result["wrapper"]
     constructor = reader.read_uint()
     if constructor != wrapper_constructor:
@@ -1623,11 +1624,11 @@ class PasskeyInvoker(Protocol):
     message must return on each path.
     """
 
-    async def request_bytes(self, name: str, fields: Dict[str, Any]) -> bytes:
+    async def request_bytes(self, name: str, fields: dict[str, Any]) -> bytes:
         """Send ``name`` and return the server's raw response bytes."""
         ...
 
-    async def native(self, name: str, fields: Dict[str, Any]) -> Any:
+    async def native(self, name: str, fields: dict[str, Any]) -> Any:
         """Send ``name`` and return the framework's parsed result."""
         ...
 
@@ -1658,7 +1659,7 @@ def to_signed_int64(value: Optional[int], *, what: str = "auth_key_id") -> Optio
     return value
 
 
-def _resolve_invoker(invoker: Any) -> Tuple[Any, bool]:
+def _resolve_invoker(invoker: Any) -> tuple[Any, bool]:
     """Returns ``(callable, is_native_path)`` for a driver object."""
     if invoker is None:
         raise PasskeyError(
@@ -1747,7 +1748,7 @@ def _adopt_result(message_name: str, value: Any) -> Any:
     raise PasskeyError(f"{key}: unhandled result kind {kind!r}")
 
 
-async def _invoke(invoker: Any, message_name: str, fields: Optional[Dict[str, Any]]) -> Any:
+async def _invoke(invoker: Any, message_name: str, fields: Optional[dict[str, Any]]) -> Any:
     """One ceremony step: validate the field dict, invoke, normalize the result.
 
     The field dict is serialized with :func:`encode_request` *first*, so a
@@ -1772,7 +1773,7 @@ async def _invoke(invoker: Any, message_name: str, fields: Optional[Dict[str, An
 
 # --- field-dict builders (pure, spec-validated, no I/O) --------------------
 
-def registration_fields(cred: CreatedCredential) -> Dict[str, Any]:
+def registration_fields(cred: CreatedCredential) -> dict[str, Any]:
     """The ``registerPasskey`` field dict for a freshly created credential.
 
     ``id`` and ``raw_id`` are both the base64url credential id (the official
@@ -1799,11 +1800,11 @@ def registration_fields(cred: CreatedCredential) -> Dict[str, Any]:
 
 
 def finish_login_fields(
-    assertion: Dict[str, Any],
+    assertion: dict[str, Any],
     *,
     from_dc_id: Optional[int] = None,
     from_auth_key_id: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The ``finishPasskeyLogin`` field dict for a produced assertion.
 
     ``assertion`` is what :meth:`SoftwareAuthenticator.produce_assertion`
@@ -1824,7 +1825,7 @@ def finish_login_fields(
             f"assertion is missing {missing}; pass the dict returned by "
             "SoftwareAuthenticator.produce_assertion / PasskeyStore.produce_assertion"
         )
-    fields: Dict[str, Any] = {
+    fields: dict[str, Any] = {
         "credential": {
             "id": assertion["id"],
             "raw_id": assertion["id"],
@@ -1845,12 +1846,12 @@ def finish_login_fields(
     return fields
 
 
-def get_passkeys_fields() -> Dict[str, Any]:
+def get_passkeys_fields() -> dict[str, Any]:
     """``account.getPasskeys`` takes no arguments."""
     return {}
 
 
-def delete_passkey_fields(passkey_id: str) -> Dict[str, Any]:
+def delete_passkey_fields(passkey_id: str) -> dict[str, Any]:
     """``account.deletePasskey id:string``."""
     if not isinstance(passkey_id, str):
         raise PasskeyError(f"passkey_id must be a str, got {type(passkey_id)!r}")
@@ -1928,7 +1929,7 @@ async def register_passkey_core(
     origin: str = DEFAULT_ORIGIN,
     name: str = DEFAULT_PASSKEY_NAME,
     alg: Optional[int] = None,
-) -> Tuple[PasskeyInfo, PasskeyStore]:
+) -> tuple[PasskeyInfo, PasskeyStore]:
     """Register a passkey on the account the driver is authorized as.
 
     Mirrors :func:`tgmint.passkeys.register_passkey` step for step: fetch the
@@ -1992,7 +1993,7 @@ async def login_passkey_assertion(
     connection_auth_key_id: Optional[int] = None,
     home_dc: Optional[int] = None,
     persist: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Sign the login challenge and plan the ``finishPasskeyLogin`` call.
 
     This is the pure part of login: no invoker, no network. It signs
@@ -2060,7 +2061,61 @@ async def login_passkey_assertion(
     }
 
 
-async def finish_login(invoker: PasskeyInvoker, fields: Dict[str, Any]) -> AuthorizationResult:
+def check_finish_identity(
+    store: PasskeyStore,
+    result: Optional[AuthorizationResult] = None,
+    *,
+    user_id: Optional[int] = None,
+    what: str = "finishPasskeyLogin",
+) -> None:
+    """Account-mixup guard: the finish result must name the store's account.
+
+    The signed assertion carries the passkey's user handle (``"<dc>:<user_id>"``,
+    :attr:`PasskeyStore.user_id`) and the server answers with the account it
+    logged in, but nothing else compares the two. Without the check a swapped
+    credential, a store file copied from another account or a server-side
+    mismatch silently writes one account's passkey file into another account's
+    session — and ``heal``/``profile`` then trust that pairing.
+
+    ``user_id`` lets a driver pass the id *its own* TL layer parsed, which wins
+    over the neutral :attr:`AuthorizationResult.user_id` (the neutral parser
+    only knows the User constructors in ``_USER_FLAG_WORDS``). When neither is
+    known the check is skipped: an id we never read cannot be compared, and
+    refusing there would break forward compatibility with a new User
+    constructor.
+
+    ``auth.authorizationSignUpRequired`` carries no user at all, so it is not
+    an identity — the driver raises its own "no account" error for it.
+    ``result`` may be omitted when the caller only has a user id (the 2FA
+    password path finishes with the framework's own ``sign_in``).
+    """
+    if result is not None and result.sign_up_required:
+        return
+    expected = store.user_id
+    actual = user_id if user_id is not None else getattr(result, "user_id", None)
+    if actual is None:
+        return
+    if not isinstance(actual, int) or isinstance(actual, bool):
+        raise PasskeyError(
+            f"{what}: the authorization user id {actual!r} is not an integer, "
+            "so it cannot be checked against the passkey store"
+        )
+    if actual != expected:
+        raise PasskeyError(
+            f"{what}: the server logged in user {actual}, but this passkey "
+            f"belongs to user {expected} (its user handle is "
+            f"{store.user_handle!r}) — refusing to continue: that would write "
+            "one account's passkey into another account's session"
+        )
+
+
+async def finish_login(
+    invoker: PasskeyInvoker,
+    fields: dict[str, Any],
+    *,
+    store: Optional[PasskeyStore] = None,
+    user_id: Optional[int] = None,
+) -> AuthorizationResult:
     """Last step of login: ``finishPasskeyLogin`` -> the login state.
 
     ``fields`` is ``plan["finish_fields"]`` from
@@ -2070,6 +2125,12 @@ async def finish_login(invoker: PasskeyInvoker, fields: Dict[str, Any]) -> Autho
     If the account has a 2FA cloud password the invoker raises
     :class:`TwoFactorRequired` and that propagates unchanged — this module
     has no password entry point by design.
+
+    Passing ``store`` turns on the account-mixup guard
+    (:func:`check_finish_identity`); pass ``user_id`` too when your framework's
+    own parse of the authorization user is available (it is more authoritative
+    than the neutral one, and a driver that only learns the id after this call
+    must call the guard itself).
 
     The result's ``raw`` field keeps the response bytes, so a driver can still
     feed its own TL layer (Telethon needs the real ``auth.Authorization``
@@ -2082,10 +2143,12 @@ async def finish_login(invoker: PasskeyInvoker, fields: Dict[str, Any]) -> Autho
         raise PasskeyError(
             f"finishPasskeyLogin returned {type(result).__name__}, not AuthorizationResult"
         )
+    if store is not None:
+        check_finish_identity(store, result, user_id=user_id)
     return result
 
 
-async def list_passkeys_core(invoker: PasskeyInvoker) -> List[PasskeyInfo]:
+async def list_passkeys_core(invoker: PasskeyInvoker) -> list[PasskeyInfo]:
     """``account.getPasskeys`` for the authorized account."""
     result = await _invoke(invoker, "getPasskeys", get_passkeys_fields())
     return list(result)

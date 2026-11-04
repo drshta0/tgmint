@@ -38,11 +38,11 @@ Sources:
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Optional
 
 # layer -> (newest tdesktop release speaking it, bump commit sha).
 # Every entry verified 2026-10-24 with the method in the module docstring.
-_TD_LAYERS: Dict[int, tuple] = {
+_TD_LAYERS: dict[int, tuple] = {
     210: ("5.16.6", "9b990728f64f142f7ca3ce8e45c147c1680f0733"),
     211: ("6.0.3", "043bc754ae72ba660936f6a0439df1a0e4d94710"),
     214: ("6.1.4", "d51944e6a5fa42cfaddbf948fe3777e1b226f6e5"),
@@ -59,10 +59,10 @@ _TD_LAYERS: Dict[int, tuple] = {
     232: ("7.3.3", "850fb90eb6db96c124b6da1349060f9ed00f4fe4"),
 }
 
-TD_LAYERS: Dict[int, str] = {layer: version for layer, (version, _) in _TD_LAYERS.items()}
+TD_LAYERS: dict[int, str] = {layer: version for layer, (version, _) in _TD_LAYERS.items()}
 
 # layer -> the bump commit that introduced it (for docs/audit).
-LAYER_SOURCES: Dict[int, str] = {
+LAYER_SOURCES: dict[int, str] = {
     layer: (
         f"https://github.com/telegramdesktop/tdesktop/commit/{sha} "
         f"(layer {layer} bump; release mapping via GitHub releases, verified 2026-10-24)"
@@ -150,7 +150,7 @@ def pick_app_version(origin: str, layer: int, fallback: str) -> str:
 # string for an X api_id is a documented approximation.
 #
 # layer -> (app_version, provenance).
-_ANDROID_LAYERS: Dict[int, tuple] = {
+_ANDROID_LAYERS: dict[int, tuple] = {
     214: ("12.0.0 (6163)", "aa5fe2ee8c9711e0a615cc955fba0ca040896144"),
     216: ("12.1.1 (6211)", "9cbf03332a5a68fce3e616852d7dc929022c8441"),
     221: ("12.3.0 (6377)", "28e25a4ca767b1fadc3c5ad8ba09acbe37ba6af3"),
@@ -158,11 +158,11 @@ _ANDROID_LAYERS: Dict[int, tuple] = {
     232: ("13.1.0 (7229)", "4de548e79fed27f1a66fbdff84223321838fe925"),
 }
 
-ANDROID_LAYERS: Dict[int, str] = {
+ANDROID_LAYERS: dict[int, str] = {
     layer: version for layer, (version, _) in _ANDROID_LAYERS.items()
 }
 
-ANDROID_LAYER_SOURCES: Dict[int, str] = {
+ANDROID_LAYER_SOURCES: dict[int, str] = {
     layer: (
         f"https://github.com/DrKLO/Telegram/commit/{sha} "
         f"(TLRPC.java at this sha: LAYER = {layer}; "
@@ -183,15 +183,15 @@ ANDROID_LAYER_SOURCES: Dict[int, str] = {
 # iTunes lookup 2026-09/10 — master >= 2026-10-13 is what 13.1.1
 # shipped from). Fewer rows with solid provenance beat guesses; layers
 # below the floor are refused rather than estimated.
-_IOS_LAYERS_TABLE: Dict[int, tuple] = {
+_IOS_LAYERS_TABLE: dict[int, tuple] = {
     232: ("13.1.1", "0d88328885dc5a99abe6ea69348bf2bd37a93ab6"),
 }
 
-IOS_LAYERS: Dict[int, str] = {
+IOS_LAYERS: dict[int, str] = {
     layer: version for layer, (version, _) in _IOS_LAYERS_TABLE.items()
 }
 
-IOS_LAYER_SOURCES: Dict[int, str] = {
+IOS_LAYER_SOURCES: dict[int, str] = {
     layer: (
         f"https://github.com/TelegramMessenger/Telegram-iOS/commit/{sha} "
         f"(\"API layer {layer}\" schema bump; version joined via the "

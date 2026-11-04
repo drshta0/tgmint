@@ -1,11 +1,11 @@
 """tgmint command line — mint, inspect, audit, freshness, parity, convert,
-login-passkey, profile, heal, bootstrap, cadence, doctor.
+verify, login-passkey, login-qr, profile, heal, bootstrap, cadence, doctor.
 
 CLI v1. Zero new dependencies: argparse +
 stdlib only, everything offline-safe except ``login-passkey``,
-``heal --live`` and ``bootstrap`` without ``--dry-run``, the commands that
-talk to Telegram (``convert``, ``profile`` and ``heal --force`` without
-``--live`` stay offline).
+``login-qr``, ``heal --live`` and ``bootstrap`` without ``--dry-run``,
+the commands that talk to Telegram (``convert``, ``profile`` and
+``heal --force`` without ``--live`` stay offline).
 Every command takes ``--json`` for machine-readable output; the human
 format is stable but not a contract.
 
@@ -15,6 +15,9 @@ Exit codes (also shown in ``--help``)::
     1  `audit` found problems in the fingerprint
     2  error: bad usage, unreadable sidecar, unknown preset/locale,
        or an optional module missing from this build (e.g. codec)
+
+``verify`` overrides that trio with its own (documented in its
+``--help``): 0 ok | 1 unreadable | 2 readable, with warnings.
 
 Optional modules are imported lazily and probed defensively:
 ``tgmint.parity.describe_envelope`` (envelope builder, parallel work),
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import json as _json
 import os
@@ -36,21 +40,21 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 from . import __version__
 from .audit import audit_fingerprint
 from .fingerprint import Fingerprint
 
 EXIT_OK = 0
-#: exit 1 belongs to `audit` alone ("problems found in the fingerprint");
-#: every runtime failure is EXIT_ERROR so a shell script can tell the two
-#: apart without parsing text
+#: exit 1 belongs to `audit` ("problems found in the fingerprint") and to
+#: `verify` ("unreadable" — its own trio); every other runtime failure is
+#: EXIT_ERROR so a shell script can tell them apart without parsing text
 EXIT_PROBLEMS = 1
 EXIT_ERROR = 2
 
 # preset name -> API.<class> (tgmint.api)
-_PRESETS: Dict[str, str] = {
+_PRESETS: dict[str, str] = {
     "desktop": "TelegramDesktop",
     "android": "TelegramAndroid",
     "android-x": "TelegramAndroidX",
@@ -78,9 +82,11 @@ _CONVERT_FORMATS = [
     "tdata",
 ]
 
-#: source formats additionally accept a `.tgmint` envelope ("profile");
-#: it is readable, never written by `convert`
-_CONVERT_SOURCE_FORMATS = _CONVERT_FORMATS + ["profile"]
+#: source formats additionally accept a `.tgmint` envelope ("profile")
+#: and an official Android app data dump
+#: ("android-dir"); both are readable, never
+#: written by `convert`
+_CONVERT_SOURCE_FORMATS = _CONVERT_FORMATS + ["profile", "android-dir"]
 
 #: what `tgmint heal` may rewrite the session into, in place
 _HEAL_FORMATS = [
@@ -92,6 +98,10 @@ _HEAL_FORMATS = [
 ]
 
 _EXIT_EPILOG = "exit codes: 0 success | 1 audit found problems | 2 error"
+
+#: `verify` documents its own exit trio in its --help: a readable session
+#: with advisories is a *warning*, not the global "error" 2
+_VERIFY_EPILOG = "exit codes: 0 ok | 1 unreadable | 2 readable, with warnings"
 
 # fingerprint fields in canonical print order (all of them, incl.
 # tz_zone/origin — an operator must see the whole identity)
@@ -120,7 +130,7 @@ def _print_json(payload: Any) -> None:
     print(_json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
-def _print_fields(payload: Dict[str, Any], order: List[str]) -> None:
+def _print_fields(payload: dict[str, Any], order: list[str]) -> None:
     for key in order:
         if key in payload:
             print(f"  {key}: {payload[key]}")
@@ -129,6 +139,33 @@ def _print_fields(payload: Dict[str, Any], order: List[str]) -> None:
 def _fail(message: str) -> int:
     print(f"tgmint: {message}", file=sys.stderr)
     return EXIT_ERROR
+
+
+def _is_api_id_published(exc: BaseException) -> bool:
+    """True when Telegram refused the app id as published (anywhere in the chain)."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ == "ApiIdPublishedFloodError" or any(
+            marker in str(exc)
+            for marker in ("API_ID_PUBLISHED_FLOOD", "API id was published")
+        ):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _login_error(what: str, exc: BaseException, preset: Optional[str] = None) -> str:
+    """A login failure message, with a hint when the app id was refused."""
+    message = f"{what} failed: {exc}"
+    if _is_api_id_published(exc):
+        message += (
+            " — Telegram refuses this official app id for new logins from "
+            "anything but the real app"
+            + (f" (preset {preset!r})" if preset else "")
+            + "; retry with a different --preset (e.g. desktop)"
+        )
+    return message
 
 
 def _fail_json(
@@ -350,7 +387,7 @@ def _cmd_mint(args: argparse.Namespace) -> int:
         except OSError as exc:
             return _fail(f"--save {args.save} failed: {exc}")
 
-    payload: Dict[str, Any] = dict(fp.to_dict())
+    payload: dict[str, Any] = dict(fp.to_dict())
     payload["tz_offset"] = fp.tz_offset()
     payload["preset"] = args.preset
     if saved_to is not None:
@@ -374,7 +411,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     if fp is None:
         return EXIT_ERROR
 
-    payload: Dict[str, Any] = dict(fp.to_dict())
+    payload: dict[str, Any] = dict(fp.to_dict())
     payload["tz_offset"] = fp.tz_offset()
     payload["path"] = args.path
 
@@ -421,7 +458,7 @@ def _cmd_freshness(args: argparse.Namespace) -> int:
 
     cache_path = "<unknown>"
     cache_exists = False
-    entries: Dict[str, Any] = {}
+    entries: dict[str, Any] = {}
     try:
         # versions-module helpers only: _load_cache reads a JSON file
         # (returning {} on any failure) — no fetch, no socket
@@ -452,7 +489,7 @@ def _cmd_freshness(args: argparse.Namespace) -> int:
     except Exception:  # defensive: freshness must never fail the CLI
         entries = {}
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "offline": True,
         "pinned": dict(versions.PINNED),
         "cache_ttl_seconds": versions.CACHE_TTL_SECONDS,
@@ -482,7 +519,7 @@ def _cmd_freshness(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _envelope_inline(api: Any, layer: Optional[int]) -> Dict[str, Any]:
+def _envelope_inline(api: Any, layer: Optional[int]) -> dict[str, Any]:
     """Build the initConnection envelope from a minted APIData.
 
     The 8 identity fields (api_id, api_hash, device_model,
@@ -510,7 +547,7 @@ def _envelope_inline(api: Any, layer: Optional[int]) -> Dict[str, Any]:
 
 def _envelope_via_parity_module(
     api: Any, layer: Optional[int]
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Use tgmint.parity.describe_envelope if that module exists.
 
     Probe defensively and fall back to the
@@ -669,6 +706,257 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# verify — offline sanity check of one session / tdata folder / envelope
+# ---------------------------------------------------------------------------
+
+#: `verify` exit codes — its own trio (see the module docstring): 1 is the
+#: file could not be read, 2 is "readable, with warnings" (not the global
+#: "error" 2 the rest of the CLI uses)
+EXIT_VERIFY_UNREADABLE = 1
+EXIT_VERIFY_WARNINGS = 2
+
+#: the SQLite half of format detection, tried before the string formats:
+#: their required-column sets disambiguate them (kurigram's superset
+#: schema is claimed by the pyrogram reader, which auto-detects the
+#: variant; a vanilla telethon file lacks pyrogram's columns and vice
+#: versa)
+_VERIFY_SQLITE_ORDER = ["pyrogram-session", "telethon-session"]
+
+
+def _verify_string_candidates(path: str) -> list[str]:
+    """Order the string formats for a saved session-string file.
+
+    Telethon and GramJS strings share the ``"1"`` version prefix, and a
+    GramJS body whose hostname is 14 bytes long is structurally
+    telethon-IPv6-shaped — the telethon reader would claim it and report
+    a *wrong* auth key (the bytes it reads as the key start where the
+    hostname ends).  The hostname-length field decides: in a GramJS body
+    ``raw[1:3]`` equals the body length minus 261 (1 dc + 2 len + host +
+    2 port + 256 key) and is 4..100.  Everything else keeps the full
+    order — Telethon first (a real Telethon body's length is 263/275,
+    which as a GramJS length prefix would mean a hostname of 2/14 bytes,
+    and 2 is unwritable while 14 means an IPv6 starting ``::e:``, which
+    no Telegram DC has).  Binary (non-UTF-8) files keep the full order
+    too: every string reader refuses them quickly.
+    """
+    try:
+        with open(path, encoding="utf-8") as fp:
+            text = fp.read().strip()
+        if text and text[0] == "1":
+            from tgmint.codec.data import decode_b64
+
+            raw = decode_b64(text[1:])
+            host_len = int.from_bytes(raw[1:3], "big")
+            if 4 <= host_len <= 100 and len(raw) == 261 + host_len:
+                return ["gramjs-string"]
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return ["telethon-string", "gramjs-string", "pyrogram-string"]
+
+
+def _verify_permissions(path: str) -> tuple[dict[str, Any], list[str]]:
+    """Mode report + warnings for one credential path (file or tdata tree).
+
+    A session file is a credential, so the whole path must be private:
+    files 0600, a tdata directory 0700 — the modes the codec's own
+    writers publish.  Only group/other access warns (``mode & 0o077``); a
+    mode *stricter* than 0600 (e.g. 0400) is still private and stays
+    quiet.  The chmod bits are a POSIX concept, so on other platforms the
+    mode is reported but never warned about.
+    """
+    warnings: list[str] = []
+    mode = os.stat(path).st_mode & 0o777
+    if os.path.isdir(path):
+        files = files_open = 0
+        for root, _directories, filenames in os.walk(path):
+            for name in filenames:
+                member = os.path.join(root, name)
+                if os.path.islink(member):
+                    continue
+                files += 1
+                if os.name == "posix" and os.stat(member).st_mode & 0o077:
+                    files_open += 1
+        report: dict[str, Any] = {
+            "kind": "tdata-directory",
+            "mode": f"{mode:04o}",
+            "files": files,
+            "files_group_or_other_accessible": files_open,
+        }
+        if os.name == "posix":
+            if mode & 0o077:
+                warnings.append(
+                    f"directory mode {mode:04o}: group/other can enter the "
+                    f"tdata folder (chmod 700 {path})"
+                )
+            if files_open:
+                warnings.append(
+                    f"{files_open} of {files} files in the tdata folder are "
+                    "group/other-accessible — the auth key sits in key_datas "
+                    "(chmod 600 the files)"
+                )
+        return report, warnings
+    report = {"kind": "file", "mode": f"{mode:04o}"}
+    if os.name == "posix" and mode & 0o077:
+        warnings.append(
+            f"file mode {mode:04o}: group/other can access this session "
+            f"file (chmod 600 {path})"
+        )
+    return report, warnings
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Open one session/tdata/envelope OFFLINE and report what it holds.
+
+    Never touches the network and never prints the auth key — only two
+    hashes of it (the MTProto ``auth_key_id``, ``sha1(key)[-8:]``, and a
+    full SHA-256), so a report can be filed and compared without
+    exposing the credential.  Exit codes: 0 ok | 1 unreadable |
+    2 readable, with warnings (codec placeholder identity fields,
+    group/world-accessible file permissions).
+    """
+    try:
+        import tgmint.codec as codec
+    except ImportError as exc:
+        return _fail_json(
+            args,
+            f"verify needs the codec module ({exc})",
+            EXIT_VERIFY_UNREADABLE,
+        )
+
+    path = args.path
+    if not os.path.exists(path):
+        return _fail_json(
+            args, f"{path}: no such file or directory", EXIT_VERIFY_UNREADABLE
+        )
+
+    # format: an explicit --from-format wins; else detect — a directory
+    # is a tdata folder, a *.tgmint name an envelope, anything else runs
+    # the reader chain (SQLite pair first, then the sniffed string order)
+    explicit = args.from_format
+    if explicit:
+        candidates = [explicit]
+    elif os.path.isdir(path):
+        candidates = ["tdata"]
+    elif str(path).endswith(".tgmint"):
+        candidates = ["profile"]
+    else:
+        candidates = _VERIFY_SQLITE_ORDER + _verify_string_candidates(path)
+    detected = explicit is None
+
+    # secrets are validated whenever their flag is given (a typo'd
+    # variable name must not look like "none given") and resolved only
+    # when a reader may want them — the same policy as `convert`
+    passcode = ""
+    if getattr(args, "passcode_env", None) or "tdata" in candidates:
+        try:
+            passcode = _resolve_passcode(args) or ""
+        except ValueError as exc:
+            return _fail_json(args, str(exc), EXIT_VERIFY_UNREADABLE)
+
+    passphrase = ""
+    asked_for_one = bool(
+        getattr(args, "passphrase_env", None)
+        or getattr(args, "passphrase_stdin", False)
+    )
+    if "profile" in candidates or asked_for_one:
+        try:
+            passphrase = _resolve_passphrase(args, purpose="profile") or ""
+        except ValueError as exc:
+            return _fail_json(args, str(exc), EXIT_VERIFY_UNREADABLE)
+
+    data = None
+    used_format: Optional[str] = None
+    last_error: Optional[BaseException] = None
+    for fmt in candidates:
+        try:
+            data = codec.read_session(
+                path, fmt, passcode=passcode, passphrase=passphrase
+            )
+            used_format = fmt
+            break
+        except Exception as exc:  # any reader failure means "unreadable"
+            last_error = exc
+    if data is None:
+        if len(candidates) == 1:
+            detail = f"not readable as {candidates[0]} ({last_error})"
+            if candidates[0] == "tdata" and not passcode:
+                detail += (
+                    " — if the folder has a local passcode, pass "
+                    "--passcode-env VAR"
+                )
+        else:
+            detail = (
+                f"could not read this as any known session format "
+                f"({last_error})"
+            )
+        return _fail_json(
+            args, f"{path}: {detail}", EXIT_VERIFY_UNREADABLE
+        )
+
+    # hashes only — the key itself never reaches the output
+    auth_key_id = hashlib.sha1(data.auth_key).digest()[-8:].hex()
+    auth_key_sha256 = hashlib.sha256(data.auth_key).hexdigest()
+
+    warnings: list[str] = []
+    placeholders: list[str] = []
+    if data.user_id == codec._PLACEHOLDER_USER_ID:
+        placeholders.append("user_id")
+        warnings.append(
+            f"user_id {data.user_id} is the codec's placeholder (Telegram's "
+            "service account), not this account's id — the source format "
+            "stored none"
+        )
+    if data.api_id == codec._PLACEHOLDER_API_ID:
+        placeholders.append("api_id")
+        warnings.append(
+            f"api_id {data.api_id} is Telegram Desktop's official app id — "
+            "the codec's placeholder, not the account's real api_id"
+        )
+    permissions, permission_warnings = _verify_permissions(path)
+    warnings.extend(permission_warnings)
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "command": "verify",
+        "path": path,
+        "format": used_format,
+        "detected": detected,
+        "dc_id": data.dc_id,
+        "user_id": data.user_id,
+        "api_id": data.api_id,
+        "test_mode": bool(data.test_mode),
+        "auth_key_id": auth_key_id,
+        "auth_key_sha256": auth_key_sha256,
+        "placeholders": placeholders,
+        "permissions": permissions,
+        "warnings": warnings,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        suffix = " (detected)" if detected else ""
+        print(f"{path}: {used_format}{suffix}")
+        print(f"  dc_id: {data.dc_id}")
+        user_text = "not stored" if data.user_id is None else data.user_id
+        api_text = "not stored" if data.api_id is None else data.api_id
+        print(f"  user_id: {user_text}")
+        print(f"  api_id: {api_text}")
+        print(f"  test_mode: {bool(data.test_mode)}")
+        print(f"  auth_key_id: {auth_key_id}")
+        print(f"  auth_key_sha256: {auth_key_sha256}")
+        mode_text = permissions["mode"]
+        if permissions["kind"] == "tdata-directory":
+            mode_text += f", {permissions['files']} files"
+        print(f"  permissions: {mode_text}")
+        for warning in warnings:
+            print(f"warning: {warning}")
+        print("ok" if not warnings else f"ok, {len(warnings)} warning(s)")
+    if warnings:
+        return EXIT_VERIFY_WARNINGS
+    return EXIT_OK
+
+
 class _LoginPasskeyRefusal(Exception):
     """A refusal inside ``login-passkey`` (exit 2), not a runtime failure.
 
@@ -680,7 +968,7 @@ class _LoginPasskeyRefusal(Exception):
 
 async def _login_passkey_flow(
     api: Any, args: argparse.Namespace, passkey_path: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Sign in over the network, then write the session in ``args.to_format``.
 
     Everything here is network-bound (``asyncio.run`` calls it from the
@@ -826,10 +1114,12 @@ def _cmd_login_passkey(args: argparse.Namespace) -> int:
             "passkeys dependencies",
         )
     except Exception as exc:  # login/convert failure -> runtime error (2)
-        return _fail_json(args, f"login-passkey failed: {exc}", EXIT_ERROR)
+        return _fail_json(
+            args, _login_error("login-passkey", exc, args.preset), EXIT_ERROR
+        )
 
     converted = result["converted"]
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "target": args.to_path,
         "to_format": args.to_format,
         "user_id": result["user_id"],
@@ -844,6 +1134,191 @@ def _cmd_login_passkey(args: argparse.Namespace) -> int:
     else:
         print(
             f"logged in with passkey {passkey_path} "
+            f"(user_id {result['user_id']}, dc_id {result['dc_id']})"
+        )
+        print(f"wrote {args.to_path} ({args.to_format})")
+        for note in converted.get("notes", ()):
+            print(f"  note: {note}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# login-qr — mint a session by confirming a QR from your own logged-in device
+# ---------------------------------------------------------------------------
+
+class _LoginQrRefusal(Exception):
+    """A refusal inside ``login-qr`` (exit 2), not a runtime failure."""
+
+
+def _prompt_2fa_password() -> str:
+    """Ask for the 2FA cloud password on a real terminal, refuse otherwise."""
+    if not sys.stdin.isatty():
+        raise _LoginQrRefusal(
+            "the account has a 2FA cloud password and none was given: pass "
+            "--password (the interactive prompt needs a terminal; stdin is "
+            "not a tty here)"
+        )
+    import getpass
+
+    password = getpass.getpass("2FA cloud password: ")
+    if not password:
+        raise _LoginQrRefusal("no password entered")
+    return password
+
+
+def _qr_render_callback(args: argparse.Namespace) -> Callable[[Any], None]:
+    """What ``login-qr`` shows for every fresh token: the QR, then the URL."""
+    from . import qrrender
+
+    def render(token) -> None:
+        print("Scan with the Telegram app on your phone:")
+        print("  Settings > Devices > Link Desktop Device")
+        print(f"(or open {token.url})")
+        try:
+            qr = qrrender.encode(token.url, error="M")
+        except qrrender.QrTooLongError:
+            print("  (URL too long for the built-in encoder; open the link)")
+            return
+        print(qrrender.render_text(qr.matrix, invert=args.invert))
+        print(f"(valid for {token.expires_in}s; a fresh code follows expiry)")
+
+    return render
+
+
+async def _login_qr_flow(api: Any, args: argparse.Namespace) -> Dict[str, Any]:
+    """Show the QR, wait for the scan, then write the session like login-passkey."""
+    import inspect
+
+    import tgmint.codec as codec
+
+    from . import qrlogin
+    from . import tl as tgmint_tl
+    from .passkeys_core import TwoFactorRequired
+
+    tmpdir = tempfile.mkdtemp(prefix="tgmint-login-qr-")
+    try:
+        session_path = os.path.join(tmpdir, "login.session")
+        # born with the minted fingerprint, unauthorized, one connection
+        client = tgmint_tl.TelegramClient(session_path, api=api)
+        try:
+            await client.connect()
+            try:
+                me = await qrlogin.login_with_qr(
+                    client,
+                    render=_qr_render_callback(args),
+                    timeout=args.timeout,
+                )
+            except TwoFactorRequired:
+                # the ceremony stopped on the connection it ended on (after
+                # a migrate, the account's home DC): finish there
+                password = args.password or _prompt_2fa_password()
+                me = await qrlogin.finish_with_password(client, password)
+            user_id = getattr(me, "id", None)
+            dc_id = getattr(client.session, "dc_id", None)
+            # flush the auth key to the sqlite file BEFORE converting: the
+            # conversion reads that file, not the live session
+            saved = client.session.save()
+            if inspect.isawaitable(saved):
+                await saved
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:  # already closed / never connected
+                pass
+
+        try:
+            converted = codec.convert_session(
+                session_path,
+                "telethon-session",
+                args.to_path,
+                args.to_format,
+                user_id=user_id,
+                api_id=getattr(api, "api_id", None),
+            )
+        except FileExistsError as exc:
+            raise _LoginQrRefusal(
+                f"--to {args.to_path}: output already exists — "
+                "convert_session never overwrites an existing session "
+                f"({exc}); the login succeeded, re-run with a new --to path"
+            ) from None
+
+        if not isinstance(converted, dict):
+            raise RuntimeError(
+                f"codec returned {type(converted).__name__}, "
+                "expected a result dict"
+            )
+        return {
+            "user_id": user_id,
+            "dc_id": dc_id,
+            "converted": converted,
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cmd_login_qr(args: argparse.Namespace) -> int:
+    """Log in with the QR code and write the session in any supported format."""
+    # --- refusals first: never open a socket for a request we can reject
+    if os.path.exists(args.to_path):
+        return _fail_json(
+            args,
+            f"--to {args.to_path}: output already exists — refusing to "
+            "overwrite it (session conversion never overwrites; pick a new "
+            "path or move the old one away)",
+        )
+
+    # --- the identity the new session is born with
+    try:
+        api = _mint_api(
+            args.preset,
+            system=args.system,
+            layer=args.layer,
+            unique_id=args.unique_id,
+            locale=args.locale,
+        )
+    except (ValueError, NotImplementedError) as exc:
+        return _fail_json(args, f"login-qr failed: {exc}")
+
+    # --- optional modules: a build without telethon must fail cleanly
+    try:
+        import tgmint.tl  # noqa: F401
+        from . import qrlogin  # noqa: F401
+        from . import qrrender  # noqa: F401
+    except ImportError as exc:
+        return _fail_json(
+            args,
+            "login-qr needs the telethon extra (tgmint.tl / tgmint.qrlogin "
+            f"are not importable: {exc}); install tgmint together with "
+            "telethon to use this command",
+        )
+
+    # --- the network part (interactive: the QR must be scanned)
+    try:
+        result = asyncio.run(_login_qr_flow(api, args))
+    except _LoginQrRefusal as exc:
+        return _fail_json(args, str(exc), EXIT_ERROR)
+    except TimeoutError as exc:
+        return _fail_json(args, f"login-qr: {exc}", EXIT_ERROR)
+    except Exception as exc:  # login/convert failure -> runtime error (2)
+        return _fail_json(
+            args, _login_error("login-qr", exc, args.preset), EXIT_ERROR
+        )
+
+    converted = result["converted"]
+    payload: Dict[str, Any] = {
+        "target": args.to_path,
+        "to_format": args.to_format,
+        "user_id": result["user_id"],
+        "dc_id": result["dc_id"],
+        "preset": args.preset,
+        "api_id": api.api_id,
+        "conversion": converted,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print(
+            f"logged in with the scanned QR "
             f"(user_id {result['user_id']}, dc_id {result['dc_id']})"
         )
         print(f"wrote {args.to_path} ({args.to_format})")
@@ -931,7 +1406,7 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
         if not os.path.isfile(args.passkey):
             return _fail_json(args, f"--passkey {args.passkey}: no such file")
         try:
-            with open(args.passkey, "r", encoding="utf-8") as fp:
+            with open(args.passkey, encoding="utf-8") as fp:
                 passkey = _json.load(fp)
         except (OSError, ValueError) as exc:
             return _fail_json(
@@ -963,7 +1438,7 @@ def _cmd_profile_seal(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "ok": True,
         "command": "profile seal",
         "out": out,
@@ -1032,7 +1507,7 @@ def _cmd_profile_open(args: argparse.Namespace) -> int:
     except Exception as exc:
         return _fail_json(args, f"profile open failed: {exc}")
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "ok": True,
         "command": "profile open",
         "profile": args.profile,
@@ -1145,7 +1620,7 @@ def _heal_source_format(args: argparse.Namespace) -> str:
 
 def _cmd_heal(args: argparse.Namespace) -> int:
     """Probe one session and, when its auth key is dead, re-login + rewrite."""
-    from .heal import HealError, HealRefusal, heal_session
+    from .heal import HealRefusal, heal_session
 
     if not os.path.exists(args.session):
         return _fail_json(args, f"SESSION {args.session}: no such file")
@@ -1194,12 +1669,10 @@ def _cmd_heal(args: argparse.Namespace) -> int:
         return _fail_json(args, str(exc))
     except HealRefusal as exc:
         return _fail_json(args, str(exc), EXIT_ERROR)
-    except HealError as exc:
-        return _fail_json(args, f"heal failed: {exc}", EXIT_ERROR)
-    except Exception as exc:
-        return _fail_json(args, f"heal failed: {exc}", EXIT_ERROR)
+    except Exception as exc:  # HealError included
+        return _fail_json(args, _login_error("heal", exc), EXIT_ERROR)
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "ok": True,
         "command": "heal",
         "session": report["session"],
@@ -1298,7 +1771,7 @@ def _bootstrap_platform(args: argparse.Namespace) -> str:
 #: which ``--api-preset`` values are consistent with each replay platform
 #: (an android replay presenting a desktop identity is exactly the kind of
 #: incoherence tgmint exists to avoid)
-_PLATFORM_API_PRESETS: Dict[str, tuple] = {
+_PLATFORM_API_PRESETS: dict[str, tuple] = {
     "android": ("android", "android-x"),
     "desktop": ("desktop",),
 }
@@ -1382,7 +1855,7 @@ def _bootstrap_api(platform: str, api_preset: Optional[str], session: Optional[s
     return getattr(API, name).Generate(), {"source": "minted", "path": None}
 
 
-def _bootstrap_failure(args: argparse.Namespace, exc: "BootstrapError") -> int:
+def _bootstrap_failure(args: argparse.Namespace, exc: BootstrapError) -> int:
     """Report a fatal replay failure *and* what actually got sent.
 
     The replay attaches its partial report to the error
@@ -1407,7 +1880,7 @@ def _bootstrap_failure(args: argparse.Namespace, exc: "BootstrapError") -> int:
     return EXIT_ERROR
 
 
-async def _bootstrap_replay(client, *, platform: str, include_cosmetic: bool) -> Dict[str, Any]:
+async def _bootstrap_replay(client, *, platform: str, include_cosmetic: bool) -> dict[str, Any]:
     """Connect, replay the startup batch, disconnect (always)."""
     from .bootstrap import replay_startup
 
@@ -1525,7 +1998,7 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
             )
         except BootstrapError as exc:
             return _fail_json(args, str(exc), EXIT_ERROR)
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "ok": True,
             "command": "bootstrap",
             "dry_run": True,
@@ -1646,7 +2119,7 @@ def _module_version(name: str) -> Optional[str]:
     return str(version) if version else "present (no __version__)"
 
 
-def _environment_report() -> Dict[str, Any]:
+def _environment_report() -> dict[str, Any]:
     from .versions import PINNED
 
     telethon = _module_version("telethon")
@@ -1861,7 +2334,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Convert a session file/string you own between telethon, "
             "pyrogram, gramjs and tdata formats — offline, no login, no "
-            "network; the auth_key is the only secret moved. Requires the "
+            "network; the auth_key is the only secret moved. Sources may "
+            "also be a .tgmint envelope ('profile') or an official "
+            "Android app data dump ('android-dir'). Requires the "
             "optional codec module; when it is absent this command exits 2. "
             "Secrets never come from argv: a sealed profile's passphrase "
             "arrives via --passphrase-env/--passphrase-stdin and a tdata "
@@ -1881,7 +2356,9 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="from_format",
         required=True,
         choices=_CONVERT_SOURCE_FORMATS,
-        help="source format ('profile' reads a .tgmint envelope)",
+        help="source format ('profile' reads a .tgmint envelope; "
+        "'android-dir' reads an official Android app data dump — "
+        "see docs/android-acquisition.md)",
     )
     p.add_argument(
         "--to",
@@ -1908,8 +2385,8 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="account_index",
         type=int,
         metavar="N",
-        help="tdata source only: which account of a multi-account folder to "
-        "read (default: its main account)",
+        help="tdata/android-dir sources only: which account of a "
+        "multi-account folder/dump to read (default: its main account)",
     )
     p.add_argument(
         "--variant",
@@ -1917,6 +2394,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default="pyrogram",
         help="pyrogram-session destinations only: which fork's SQLite schema "
         "to write (default: pyrogram)",
+    )
+    _add_passphrase_options(p)
+    _add_json(p)
+
+    p = sub.add_parser(
+        "verify",
+        help="offline check of one session file, tdata folder or .tgmint",
+        description=(
+            "Open ONE session you own — a session file, a saved session "
+            "string, a tdata folder or a .tgmint envelope — completely "
+            "offline and report what it holds: the format, dc_id, user_id "
+            "and api_id when stored, the auth-key fingerprint as two "
+            "hashes (the MTProto auth_key_id and a full SHA-256 — the key "
+            "itself is never printed), codec placeholder values (user_id "
+            "777000 / api_id 2040), and the file permissions. Without "
+            "--from-format the format is detected: a directory is read as "
+            "tdata, a *.tgmint name as an envelope, anything else runs "
+            "the reader chain. Secrets never come from argv: a tdata "
+            "passcode arrives via --passcode-env, a sealed envelope's "
+            "passphrase via --passphrase-env/--passphrase-stdin. Exit "
+            "codes: 0 ok | 1 unreadable | 2 readable, with warnings "
+            "(placeholders, or group/world-accessible permissions)."
+        ),
+        epilog=_VERIFY_EPILOG,
+    )
+    p.add_argument(
+        "path",
+        help="the session file, saved session-string file, tdata folder "
+        "or .tgmint envelope to check",
+    )
+    p.add_argument(
+        "--from-format",
+        dest="from_format",
+        choices=_CONVERT_SOURCE_FORMATS,
+        help="the format to read PATH as (default: detected — a directory "
+        "is tdata, *.tgmint an envelope, else the reader chain)",
+    )
+    p.add_argument(
+        "--passcode-env",
+        metavar="VAR",
+        help="tdata only: read the folder's local passcode from environment "
+        "variable VAR (a passcode is a secret, so it never comes from argv)",
     )
     _add_passphrase_options(p)
     _add_json(p)
@@ -1930,8 +2449,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "format (telethon, pyrogram, gramjs, tdata). The client is "
             "created with a freshly minted fingerprint, so the new session "
             "is born with a coherent tgmint identity instead of stock "
-            "python-telethon's. This is the ONLY command that touches the "
-            "network (the passkey sign-in); the conversion afterwards is "
+            "python-telethon's. It touches the network only for the "
+            "passkey sign-in; the conversion afterwards is "
             "offline. Needs telethon (the telethon extra); when tgmint.tl "
             "or telethon is missing this command exits 2. The output path "
             "is never overwritten — an existing file is refused with exit 2."
@@ -1955,6 +2474,67 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="ORIGIN",
         help="WebAuthn origin the passkey was registered under "
         "(default: the store's own origin)",
+    )
+    _add_mint_options(p, preset_required=False, preset_default="desktop")
+    p.add_argument(
+        "--to",
+        dest="to_path",
+        required=True,
+        metavar="PATH",
+        help="destination session file (or tdata folder) to write",
+    )
+    p.add_argument(
+        "--to-format",
+        dest="to_format",
+        required=True,
+        choices=_CONVERT_FORMATS,
+        help="destination format of the logged-in session",
+    )
+    _add_json(p)
+
+    p = sub.add_parser(
+        "login-qr",
+        help="log in by scanning a QR and write the session in any format",
+        description=(
+            "Acquire: show a tg://login QR, wait until YOU confirm it from "
+            "your own logged-in Telegram app (Settings > Devices > Link "
+            "Desktop Device), then write the resulting session in any "
+            "supported format (telethon, pyrogram, gramjs, tdata). The "
+            "client is created with a freshly minted fingerprint, so the "
+            "new session is born with a coherent tgmint identity. The QR "
+            "is rendered by tgmint's own pure-Python encoder (no extra "
+            "dependency; the URL is printed too). Handles the "
+            "loginTokenMigrateTo DC switch (with rollback) and 2FA "
+            "(--password, or an interactive prompt). This is an "
+            "interactive, single-account command: nothing here ever "
+            "touches an account but the one that scanned. One of the two "
+            "network commands (login-passkey is the other); the "
+            "conversion afterwards is offline. Needs telethon (the "
+            "telethon extra); when tgmint.tl or telethon is missing this "
+            "command exits 2. The output path is never overwritten — an "
+            "existing file is refused with exit 2."
+        ),
+        epilog=_EXIT_EPILOG,
+    )
+    p.add_argument(
+        "--password",
+        metavar="2FA",
+        help="the account's 2FA cloud password, when it has one "
+        "(default: prompt when needed on a terminal)",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="overall budget to wait for the scan; an expired code is "
+        "refreshed inside it (default: 300)",
+    )
+    p.add_argument(
+        "--invert",
+        action="store_true",
+        help="render the QR light-on-dark (some terminals scan better "
+        "inverted)",
     )
     _add_mint_options(p, preset_required=False, preset_default="desktop")
     p.add_argument(
@@ -2269,7 +2849,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_PROFILE_HANDLERS: Dict[str, Callable[[argparse.Namespace], int]] = {
+_PROFILE_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "seal": _cmd_profile_seal,
     "open": _cmd_profile_open,
     "inspect": _cmd_profile_inspect,
@@ -2291,14 +2871,16 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     return handler(args)
 
 
-_HANDLERS: Dict[str, Callable[[argparse.Namespace], int]] = {
+_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "mint": _cmd_mint,
     "inspect": _cmd_inspect,
     "audit": _cmd_audit,
     "freshness": _cmd_freshness,
     "parity": _cmd_parity,
     "convert": _cmd_convert,
+    "verify": _cmd_verify,
     "login-passkey": _cmd_login_passkey,
+    "login-qr": _cmd_login_qr,
     "profile": _cmd_profile,
     "heal": _cmd_heal,
     "bootstrap": _cmd_bootstrap,
@@ -2307,7 +2889,7 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace], int]] = {
 }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry point. `argv` defaults to ``sys.argv[1:]``.
 
     Returns the process exit code (see the module docstring for the

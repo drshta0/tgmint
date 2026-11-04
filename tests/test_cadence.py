@@ -21,6 +21,13 @@ What is pinned here, and why:
   not look like the one tgmint knows, and a Pyrogram client with no Session
   object yet all raise `CadenceError` (or report `unsupported`) instead of
   guessing.
+* **the send wrapper is fork-name agnostic, and apply() is idempotent** — the
+  `PingDelayDisconnect` rewrite resolves the class from the client's own
+  package (a fake framework package installed under a non-`pyrogram` name
+  still gets its ping rewritten; an unresolvable one sends the ping
+  unrewritten instead of crashing), and `apply` → `apply` → `restore` leaves
+  the framework's own `send` / `connection_factory` in place with the *last*
+  platform's numbers on the wire while applied.
 
 No test in this file opens a socket: the "real" client is
 `TelegramClient(MemorySession(), ...)`, which constructs offline, and the
@@ -34,8 +41,10 @@ import json
 import os
 import subprocess
 import sys
+import types
 import unittest
 from dataclasses import FrozenInstanceError
+from unittest import mock
 
 import tgmint.cadence as cadence
 from tgmint import cli
@@ -642,6 +651,138 @@ class PyrogramApply(unittest.TestCase):
         self.assertEqual(
             PyrogramSession.WAIT_TIMEOUT + 10, PYROGRAM_DISCONNECT_DELAY
         )
+
+
+# ---------------------------------------------------------------------------
+# the send wrapper across fork names, and double apply()
+# ---------------------------------------------------------------------------
+
+
+def fake_family(name):
+    """A minimal framework package `name` in `sys.modules` shape.
+
+    Hydrogram-shaped: the fork installs under its own top-level name while
+    mirroring pyrogram's ``<name>.raw.functions.PingDelayDisconnect`` layout
+    (verified in the hydrogram 0.2.0 wheel on PyPI), which is what the send
+    wrapper must resolve the rewrite class from.  Returns
+    ``(sys.modules patch dict, the PingDelayDisconnect class)``.
+    """
+    root = types.ModuleType(name)
+    raw = types.ModuleType(name + ".raw")
+    functions = types.ModuleType(name + ".raw.functions")
+
+    class PingDelayDisconnect:
+        def __init__(self, ping_id, disconnect_delay):
+            self.ping_id = ping_id
+            self.disconnect_delay = disconnect_delay
+
+    functions.PingDelayDisconnect = PingDelayDisconnect
+    raw.functions = functions
+    root.raw = raw
+    return (
+        {name: root, name + ".raw": raw, name + ".raw.functions": functions},
+        PingDelayDisconnect,
+    )
+
+
+def fake_family_client(name):
+    """A `FakePyrogramClient` whose classes claim to live in `name`."""
+    session_cls = type("Session", (FakePyrogramSession,), {})
+    session_cls.__module__ = name
+    client_cls = type("Client", (FakePyrogramClient,), {})
+    client_cls.__module__ = name
+    return client_cls()
+
+
+class SendWrapperFamily(unittest.TestCase):
+    """`raw` must come from the client's package, not a hardcoded import."""
+
+    def test_a_fork_under_another_name_still_rewrites_the_ping(self):
+        modules, PingDelayDisconnect = fake_family("hydrogram")
+        with mock.patch.dict(sys.modules, modules):
+            client = fake_family_client("hydrogram")
+            report = apply(client, "android")
+            self.assertIn("send", vars(client.session))
+            self.assertNotIn("disconnect_delay", report["unsupported"])
+
+            rewritten = asyncio.run(
+                client.session.send(
+                    PingDelayDisconnect(ping_id=7, disconnect_delay=25)
+                )
+            )
+            self.assertEqual(rewritten.disconnect_delay, 35)
+            self.assertEqual(rewritten.ping_id, 7)
+
+            # a non-ping flies through untouched, and an already-official
+            # ping is not rebuilt either
+            marker = object()
+            self.assertIs(asyncio.run(client.session.send(marker)), marker)
+            official = PingDelayDisconnect(ping_id=9, disconnect_delay=35)
+            self.assertIs(asyncio.run(client.session.send(official)), official)
+
+            # a second apply() puts the NEW platform's delay on the wire —
+            # it must re-wrap the framework's send, not chain onto the first
+            # wrapper (the inner rewrite would undo the outer one)
+            apply(client, "desktop")
+            again = asyncio.run(
+                client.session.send(
+                    PingDelayDisconnect(ping_id=11, disconnect_delay=25)
+                )
+            )
+            self.assertEqual(again.disconnect_delay, 60)
+
+            # and after restore() the framework's own send is back: the
+            # ping goes out exactly as the worker built it
+            self.assertTrue(restore(client)["restored"])
+            self.assertNotIn("send", vars(client.session))
+            untouched = asyncio.run(
+                client.session.send(
+                    PingDelayDisconnect(ping_id=13, disconnect_delay=25)
+                )
+            )
+            self.assertEqual(untouched.disconnect_delay, 25)
+            self.assertEqual(untouched.ping_id, 13)
+
+    def test_an_unresolvable_family_still_sends_the_ping_unrewritten(self):
+        # this client's classes live in *this* module, so no <root>.raw can
+        # resolve: the wrapper must let the ping through unrewritten rather
+        # than kill the worker with an ImportError (the old behaviour)
+        client = FakePyrogramClient()
+        apply(client, "android")
+
+        class PingDelayDisconnect:
+            def __init__(self, ping_id, disconnect_delay):
+                self.ping_id = ping_id
+                self.disconnect_delay = disconnect_delay
+
+        out = asyncio.run(
+            client.session.send(
+                PingDelayDisconnect(ping_id=1, disconnect_delay=25)
+            )
+        )
+        self.assertEqual(out.disconnect_delay, 25)
+        self.assertEqual(out.ping_id, 1)
+
+    def test_double_apply_then_restore_leaves_the_original_send(self):
+        client = FakePyrogramClient()
+        apply(client, "android")
+        apply(client, "desktop")
+        # the installed wrapper is tgmint's, and it works (passthrough)
+        marker = object()
+        self.assertIs(asyncio.run(client.session.send(marker)), marker)
+        self.assertTrue(restore(client)["restored"])
+        self.assertNotIn("send", vars(client.session))
+        self.assertNotIn("_tgmint_send_original", vars(client.session))
+        # the Session answers with the class method again — no wrapper beneath
+        self.assertIs(client.session.send.__func__, FakePyrogramSession.send)
+
+    def test_double_apply_then_restore_unwraps_the_connection_factory(self):
+        client = FakePyrogramClient()
+        apply(client, "android")
+        self.assertIsNot(client.connection_factory, FakeConnection)
+        apply(client, "desktop")
+        self.assertTrue(restore(client)["restored"])
+        self.assertIs(client.connection_factory, FakeConnection)
 
 
 # ---------------------------------------------------------------------------

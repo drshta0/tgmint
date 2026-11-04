@@ -51,7 +51,7 @@ This module is dependency-free: stdlib + ``tgmint.fingerprint`` only.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Union
+from typing import Any, Union
 
 from ..fingerprint import Fingerprint
 
@@ -117,7 +117,7 @@ def pyrogram_kwargs(
     identity: _Identity,
     *,
     system_lang_code: bool = False,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """The five presentation kwargs every Pyrogram-family ``Client`` takes.
 
     Returns ``device_model``, ``system_version``, ``app_version``,
@@ -128,7 +128,7 @@ def pyrogram_kwargs(
     vanilla pyrogram's ``Client`` does not, hence the opt-in.
     """
     fp = _coerce(identity)
-    kwargs: Dict[str, str] = {name: getattr(fp, name) for name in PYROGRAM_KWARGS_FIELDS}
+    kwargs: dict[str, str] = {name: getattr(fp, name) for name in PYROGRAM_KWARGS_FIELDS}
     if system_lang_code:
         kwargs["system_lang_code"] = fp.system_lang_code
     return kwargs
@@ -140,7 +140,7 @@ def client_kwargs(
     system_lang_code: bool = False,
     tz_params: bool = False,
     **overrides: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Full constructor kwargs: :func:`pyrogram_kwargs` + ``api_id``/``api_hash``.
 
     Everything in the returned dict is accepted natively by every
@@ -172,7 +172,7 @@ def client_kwargs(
     has no client-fingerprint surface.
     """
     fp = _coerce(identity)
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "api_id": fp.api_id,
         "api_hash": fp.api_hash,
         **pyrogram_kwargs(fp, system_lang_code=system_lang_code),
@@ -201,7 +201,7 @@ def client_kwargs(
     return kwargs
 
 
-def tdlib_params(identity: _Identity, **overrides: str) -> Dict[str, str]:
+def tdlib_params(identity: _Identity, **overrides: str) -> dict[str, str]:
     """TDLib parameter bundle: device_model / system_version / app_version.
 
     For `TDLib <https://core.telegram.org/tdlib>`_ bindings
@@ -212,7 +212,7 @@ def tdlib_params(identity: _Identity, **overrides: str) -> Dict[str, str]:
     ``td_api.tdlibParameters(...)``-style constructor.
     """
     fp = _coerce(identity)
-    params: Dict[str, str] = {name: getattr(fp, name) for name in TDLIB_PARAMS}
+    params: dict[str, str] = {name: getattr(fp, name) for name in TDLIB_PARAMS}
     unknown = set(overrides) - set(TDLIB_PARAMS)
     if unknown:
         raise TypeError(
@@ -223,7 +223,7 @@ def tdlib_params(identity: _Identity, **overrides: str) -> Dict[str, str]:
     return params
 
 
-def installed_layer() -> "int | None":
+def installed_layer() -> int | None:
     """MTProto layer of the importable ``pyrogram`` distribution, or ``None``.
 
     Mirrors opentele-ng's ``pyrogram_layer()``: Pyrogram ships its own

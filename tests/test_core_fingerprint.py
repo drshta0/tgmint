@@ -200,7 +200,6 @@ class LayersTest(unittest.TestCase):
         self.assertGreaterEqual(installed_layer, 200)
 
     def test_every_version_wellformed(self):
-        import re
 
         for layer, version in TD_LAYERS.items():
             self.assertRegex(version, r"^\d+\.\d+(\.\d+)?$")

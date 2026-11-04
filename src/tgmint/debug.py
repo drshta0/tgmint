@@ -1,5 +1,3 @@
-import inspect
-import os
 
 import time
 import atexit
@@ -16,9 +14,9 @@ if IS_DEBUG_MODE:
     _T = t.TypeVar("_T")
     _R = t.TypeVar("_R")
 
-    class DebugInfo(object):
+    class DebugInfo:
         def __init__(self) -> None:
-            self.list: t.List[t.List[str, int, int, int]] = []
+            self.list: list[list[str, int, int, int]] = []
 
         def add(self, name, total_called, total_time) -> None:
             self.list.append(
@@ -37,7 +35,6 @@ if IS_DEBUG_MODE:
 
                 name = item[0]
                 total_called = item[1]
-                total_time = item[2]
                 avg_time = item[3]
 
                 text = name.ljust(40)

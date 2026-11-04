@@ -6,8 +6,10 @@ Telethon / kurigram / GramJS / tdata without a new login."*
 This page documents what is actually possible, what is not, and the exact steps for
 each working path. Everything here is for **your own device and your own account**.
 
-> Status note, 2026-10-31: `tgmint import --from android-dir` is planned, not shipped
-> yet. The file formats and the recipes below are verified.
+> Status note: `--from-format android-dir` **is shipped** — see
+> [Using the dump with tgmint](#using-the-dump-with-tgmint) below. The file
+> formats and the recipes were verified first; the reader followed them.
+> QR login is `tgmint login-qr`.
 
 ## What is on the phone
 
@@ -56,10 +58,43 @@ redroid (Docker): `docker run --privileged redroid/redroid`, `adb connect …`,
 `adb root`, then the same `adb pull`s. Telegram does not need Play Services to log in
 (push notifications are separate), so a GMS-less image is fine.
 
-Then: `tgmint import --from android-dir /tmp/android-dump --to out.session --to-format telethon-session`
+Then see [Using the dump with tgmint](#using-the-dump-with-tgmint) below.
 
 Cost: one login (SMS/2FA) inside the container; no bootloader unlock, no root on your
 daily phone. This is the same "log in once, use it anywhere" trade the QR path makes.
+
+## Using the dump with tgmint
+
+`--from-format android-dir` is shipped. Point `tgmint convert` at the
+dump directory — the whole app data dir (what the `adb pull`s above
+produce), the `files/` directory alone, or a flat folder holding a
+pulled `tgnet.dat` and prefs XML side by side all work:
+
+```sh
+tgmint convert --from /tmp/android-dump --from-format android-dir \
+    --to out.session --to-format telethon-session
+```
+
+What the reader does:
+
+* reads `tgnet.dat` (falling back to `tgnet.dat.bak`, exactly like the
+  app's own crash recovery) and takes the **current DC's** permanent
+  auth key, DC id and first endpoint — no crypto is involved anywhere;
+* reads the account's user id from `userconfing.xml` /
+  `userconfig<N>.xml` best-effort: an unreadable or future-format pref
+  never fails the import, the id just comes out unset;
+* writes any destination of the matrix (Telethon, Pyrogram-family,
+  GramJS, tdata; or seal a `.tgmint` envelope via `tgmint profile seal`
+  afterwards). Pyrogram-family outputs carry the official app's own
+  `api_id` (4 today) as provenance — recorded in the conversion report —
+  instead of the 2040 placeholder;
+* one account at a time: `--account-index N` picks slot N (account 0 is
+  the app's first account; accounts 1+ live in `files/account<N>/`).
+  There is deliberately no "convert all".
+
+Converting from a *forked* client's dump (not the official app)? Call
+`convert_session(..., api_id=<the fork's id>)` from Python so the
+destination records the right provenance.
 
 ## Path 2: own phone with an unlocked bootloader (root)
 
@@ -120,8 +155,10 @@ them rooted; docs only.
   "downgrade to an old APK, then `adb backup`" does not work.
 * **Third-party stealer/malware tooling** is out of scope by this project's guardrails.
 
-## What tgmint will ship
+## What tgmint ships
 
-1. `--from android-dir DIR` reader for `tgnet.dat` + `userconfig*.xml` .
-2. `tgmint login --qr` as the default no-file-access path.
-3. Optional: a `.ab` reader for self-built/patched builds and third-party backups.
+* The `--from-format android-dir DIR` reader for `tgnet.dat` +
+  `userconfig*.xml` (`tgmint.codec.android`), cross-checked against the
+  official client source and AndroidTelePorter.
+* `tgmint login-qr` as the no-file-access path (see [QR login](qr-login.md)).
+* Not supported: `.ab` backups from self-built or patched builds.

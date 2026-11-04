@@ -1,46 +1,94 @@
+---
+hide:
+  - navigation
+---
+
 # tgmint
 
-A **Python Telegram API library** for converting between **tdata** and
-**Telethon** sessions — plus the **Pyrogram-family session codec**, a
-**CLI**, and **official-client fingerprints** minted from real, current data.
+**Make your Telegram scripts connect as the real Telegram app, and avoid bot detection.**
 
-tgmint continues [thedemons/opentele](https://github.com/thedemons/opentele)
-(MIT, 2022), whose author announced they can no longer maintain it. The git
-history is preserved on purpose; see the repo's
-[FORK.md](https://github.com/drshta0/tgmint/blob/main/FORK.md) and
-[ACKNOWLEDGMENTS.md](https://github.com/drshta0/tgmint/blob/main/ACKNOWLEDGMENTS.md).
+Telegram's terms say accounts using unofficial API clients are
+[automatically put under observation](https://core.telegram.org/api/obtaining_api_id#using-the-api-id),
+and Telethon and Pyrogram identify themselves on every connection, as
+`PC 64bit` or `CPython 3.12.3` running `Pyrogram 2.2.26`. tgmint makes them connect with
+the same device, system, app version and language the official Telegram
+Desktop, Android or iOS app sends. It also adds passkey login, which no
+other library has, and converts sessions between every major library.
+
+```bash
+pip install "tgmint[passkeys]"
+```
+
+<div class="grid cards" markdown>
+
+-   :material-cellphone-check: **Connects as the real app**
+
+    ---
+
+    Official app identity, current versions checked weekly, and no
+    impossible combinations. The same device is reused on every login.
+
+    [:octicons-arrow-right-24: How it works](concepts.md)
+
+-   :material-key-variant: **Passkey login**
+
+    ---
+
+    Register once, then log in with just a file. No phone number, no SMS.
+    Telethon and Pyrogram don't support this; tgmint does, for both.
+
+    [:octicons-arrow-right-24: Passkeys](passkeys.md)
+
+-   :material-swap-horizontal: **Move sessions anywhere**
+
+    ---
+
+    Telegram Desktop `tdata`, Telethon, Pyrogram, GramJS, and the official
+    Android app's data folder. Any direction, offline.
+
+    [:octicons-arrow-right-24: Getting started](getting-started.md)
+
+-   :material-qrcode: **QR login**
+
+    ---
+
+    Scan a code from your phone and get a session in any format, already
+    using an official identity.
+
+    [:octicons-arrow-right-24: QR login](qr-login.md)
+
+-   :material-backup-restore: **One-file backup, self-repair**
+
+    ---
+
+    Pack a session, its identity and its passkey into one optionally
+    password-protected file. `tgmint heal` signs a logged-out session back
+    in.
+
+    [:octicons-arrow-right-24: Account backup](reference/profile.md)
+
+-   :material-console: **A CLI for everything**
+
+    ---
+
+    14 commands with `--json` output. Node, PHP and shell scripts can use
+    tgmint without writing any Python.
+
+    [:octicons-arrow-right-24: CLI reference](cli.md)
+
+</div>
 
 ## Where to start
 
-- **Using another framework?** Start with [Frameworks](frameworks.md) — it
-  says exactly what "supported" means per library (Telethon, the Pyrogram
-  family, TDLib, the Bot API, GramJS, MadelineProto).
-- **Coming from opentele?** [Migration from opentele](migration-from-opentele.md)
-  covers the import renames, the Qt-free tdata change, the extras, the
-  sidecar pattern, and the API changes (web presets were removed).
-- **Make a session behave like the app it claims to be:**
-  [Post-auth bootstrap](bootstrap.md) replays the official startup batch
-  (read-only only) for the Android or Desktop preset.
-- **Log in without a phone number:** [Passkeys](passkeys.md) — register a
-  passkey on an account you hold a session for, then log back in with just
-  the passkey file.
-- **Hands-on first:** [Examples](examples/README.md) — tdata ↔ Telethon
-  conversion and official APIs.
+- **New here?** [Getting started](getting-started.md) has three short
+  recipes.
+- **Which library?** [Frameworks](frameworks.md) shows exactly what works
+  where.
+- **Coming from opentele?** See [Migration from opentele](migration-from-opentele.md).
 
-## The library in one paragraph
+!!! note "Your own accounts only"
+    tgmint makes your client accurate. It has no tools for running many
+    accounts at once, and it can't promise how Telegram treats an account.
 
-A fingerprint is a handful of strings — `api_id`, `api_hash`,
-`device_model`, `system_version`, `app_version`, a language triple, maybe a
-timezone. tgmint mints them from **current, cited data** (a resolver keeps
-the pins from rotting; a CI job re-checks them), keeps them **coherent**
-(the claimed app version genuinely spoke the wire layer in use; the platform
-suffixes match the hardware), and keeps them **sticky** (minted once per
-account, then reloaded from a sidecar ever after). Thin adapters then carry
-the same identity into Telethon (patched client), the Pyrogram family
-(`Client` kwargs, no monkey-patching), TDLib (parameter bundle), or anything
-else via the CLI's `--json` output. Session files convert between Telethon,
-the Pyrogram family, GramJS and tdata — offline, seeded by the `auth_key`.
-
-Use tgmint only on accounts you own or are entitled to hold a session for:
-it keeps a session **consistent and current**, and it makes no anti-ban
-claims.
+tgmint continues [thedemons/opentele](https://github.com/thedemons/opentele)
+(MIT, 2022) with its full history.

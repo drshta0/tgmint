@@ -27,3 +27,5 @@ tests/test_profile*/
 .worktrees/
 .pytestbox/
 
+.coverage
+

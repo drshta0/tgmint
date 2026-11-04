@@ -59,7 +59,7 @@ from tgmint.api import API
 # mint once (sidecar = sticky identity; Telegram remembers the device
 # a session signed in with)
 api = API.TelegramAndroid.Generate(unique_id="my-helper", layer=224)
-api_fingerprint = api  # see PASSKEYS.md / fingerprint sidecars for storage
+api_fingerprint = api  # see the Passkeys page / fingerprint sidecars for storage
 
 # convert an existing session you already hold between formats
 # (telethon <-> pyrogram-family <-> tdata <-> string sessions)

@@ -35,7 +35,7 @@ from unittest import mock
 from types import SimpleNamespace
 
 from tgmint import codec
-from tgmint.codec import gramjs, pyrogram, telethon
+from tgmint.codec import gramjs, pyrogram
 from tgmint.codec.data import SessionData
 from tgmint.heal import (
     HealError,

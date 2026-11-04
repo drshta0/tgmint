@@ -4,7 +4,7 @@ import os
 import platform
 
 from collections import OrderedDict
-from typing import Any, List, Dict, Set, Type, TypeVar, Union, Optional
+from typing import Any, TypeVar, Union, Optional
 from .devices import *
 from .exception import *
 from .utils import *
@@ -22,7 +22,7 @@ class BaseAPIMetaClass(BaseMetaClass):
     """Super high level tactic metaclass"""
 
     def __new__(
-        cls: Type[_T], clsName: str, bases: Tuple[type], attrs: Dict[str, Any]
+        cls: type[_T], clsName: str, bases: Tuple[type], attrs: dict[str, Any]
     ) -> _T:
 
         result = super().__new__(cls, clsName, bases, attrs)
@@ -58,7 +58,7 @@ class BaseAPIMetaClass(BaseMetaClass):
         return result + "}"
 
 
-class APIData(object, metaclass=BaseAPIMetaClass):
+class APIData(metaclass=BaseAPIMetaClass):
     """
     API configuration to connect to `TelegramClient` and `TDesktop`
 
@@ -98,14 +98,14 @@ class APIData(object, metaclass=BaseAPIMetaClass):
     # with O(1) lookup, plus a set of pinned CLASS pids: classes are few
     # and must always resolve, so they are never evicted. Instance entries
     # are FIFO-evicted (insertion order) once they exceed _kMaxInstanceEntries.
-    _pidRegistry: "OrderedDict[int, Union[Type[APIData], APIData]]" = OrderedDict()
-    _pinnedClassPids: Set[int] = set()
+    _pidRegistry: OrderedDict[int, Union[type[APIData], APIData]] = OrderedDict()
+    _pinnedClassPids: set[int] = set()
     _instanceEntryCount: int = 0
 
     _kMaxInstanceEntries: int = 4096
 
     @classmethod
-    def CustomInitConnectionList(cls) -> List[Union[Type[APIData], APIData]]:
+    def CustomInitConnectionList(cls) -> list[Union[type[APIData], APIData]]:
         """
         Backward-compat accessor: upstream exposed this NAME as a plain
         list attribute; it is now a classmethod returning a snapshot of
@@ -233,7 +233,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         self._makePID()
 
     @sharemethod
-    def copy(glob: Union[Type[_T], _T] = _T) -> _T:  # type: ignore
+    def copy(glob: Union[type[_T], _T] = _T) -> _T:  # type: ignore
 
         cls = glob if isinstance(glob, type) else glob.__class__
 
@@ -250,11 +250,11 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         )  # type: ignore
 
     @sharemethod
-    def get_cls(glob: Union[Type[_T], _T]) -> Type[_T]:  # type: ignore
+    def get_cls(glob: Union[type[_T], _T]) -> type[_T]:  # type: ignore
         return glob if isinstance(glob, type) else glob.__class__
 
     @sharemethod
-    def destroy(glob: Union[Type[_T], _T]):  # type: ignore
+    def destroy(glob: Union[type[_T], _T]):  # type: ignore
         if isinstance(glob, type):
             return
 
@@ -325,7 +325,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         return pid
 
     @classmethod
-    def _clsMakePID(cls: Type[APIData]):
+    def _clsMakePID(cls: type[APIData]):
         cls.pid = cls._makePIDEnsure()
         cls._pidRegistry[cls.pid] = cls
         # classes are few and looked up constantly — never evict them
@@ -348,7 +348,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
                     break
 
     @classmethod
-    def Generate(cls: Type[_T], unique_id: str = None, locale="auto") -> _T:
+    def Generate(cls: type[_T], unique_id: str = None, locale="auto") -> _T:
         """
         Generate random device model and system version
 
@@ -389,7 +389,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
             deviceInfo = macOSDevice.RandomDevice(unique_id)
 
         else:
-            # (the web browser presets were removed outright :
+            # (the web browser presets were removed outright:
             # their versions were unverifiable from public source by design)
             raise NotImplementedError(
                 f"{cls.__name__} device not supported for randomize yet"
@@ -399,7 +399,7 @@ class APIData(object, metaclass=BaseAPIMetaClass):
         return _applyLocale(result, locale, unique_id)
 
     @classmethod
-    def findData(cls: Type[_T], pid: int) -> Optional[_T]:
+    def findData(cls: type[_T], pid: int) -> Optional[_T]:
         # O(1) dict lookup; the entry can be a class or an instance
         return cls._pidRegistry.get(pid)
 
@@ -445,9 +445,9 @@ def _applyLocale(
 
 
 def _mobileGenerate(
-    cls: Type[_T],
+    cls: type[_T],
     platform: str,
-    device_pool: Type,
+    device_pool: type,
     unique_id: Optional[str],
     layer: Optional[int],
     locale,
@@ -548,7 +548,7 @@ class API(BaseObject):
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             system: str = None,
             unique_id: str = None,
             layer: int = None,
@@ -614,21 +614,21 @@ class API(BaseObject):
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T], system: str = "macos", unique_id: str = None, layer: int = None, locale="auto"
+            cls: type[_T], system: str = "macos", unique_id: str = None, layer: int = None, locale="auto"
         ) -> _T:
             pass
 
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T], system: str = "linux", unique_id: str = None, layer: int = None, locale="auto"
+            cls: type[_T], system: str = "linux", unique_id: str = None, layer: int = None, locale="auto"
         ) -> _T:
             pass
 
         @typing.overload
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             system: str = "random",
             unique_id: str = None,
             layer: int = None,
@@ -638,7 +638,7 @@ class API(BaseObject):
 
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             system: str = None,
             unique_id: str = None,
             layer: int = None,
@@ -739,8 +739,8 @@ class API(BaseObject):
         [View on GitHub](https://github.com/DrKLO/Telegram)
 
         ### Attributes:
-            api_id (`int`)           : `4`
-            api_hash (`str`)         : `"014b35b6184100b085b0d0572f9b5103"`
+            api_id (`int`)           : `6`
+            api_hash (`str`)         : `"eb06d4abfb49dc3eeb1aeb98ae0f581e"`
             device_model (`str`)     : `"Samsung SM-S928B"`
             system_version (`str`)   : `"SDK 35"`
             app_version (`str`)      : `"13.1.0 (7229)"`
@@ -749,12 +749,18 @@ class API(BaseObject):
             lang_pack (`str`)        : `"android"`
         """
 
-        api_id = 4
-        api_hash = "014b35b6184100b085b0d0572f9b5103"
-        # refreshed 2026-11-01 from the shipped official APK (13.1.1,
-        # telegram.org/dl/android/apk): BuildVars disassembled from
-        # classes.dex. The 2022 pair 6/"eb06d4ab..." appears nowhere in
-        # the current APK (rotated).
+        api_id = 6
+        api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+        # NOT the pair the current APK ships. The shipped official APK
+        # (13.1.1, telegram.org/dl/android/apk, BuildVars in classes.dex)
+        # carries 4/"014b35b6...", but that pair is also in the public
+        # DrKLO/Telegram source, and Telegram refuses it for new logins
+        # from anything but the real app: auth.sendCode and
+        # auth.exportLoginToken both return API_ID_PUBLISHED_FLOOD
+        # (verified live 2026-11-04). The official 6/"eb06d4ab..." pair is
+        # still accepted for both, so the preset uses it. Sessions the
+        # real app created stay on 4 — see
+        # tgmint.codec.android.OFFICIAL_APP_API_ID.
         device_model = "Samsung SM-S928B"
         system_version = "SDK 35"
         app_version = "13.1.0 (7229)"  # DrKLO wire string; "72291" is the split versionCode, not the printed build
@@ -764,7 +770,7 @@ class API(BaseObject):
 
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             unique_id: str = None,
             layer: int = None,
             locale="auto",
@@ -827,7 +833,7 @@ class API(BaseObject):
 
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             unique_id: str = None,
             layer: int = None,
             locale="auto",
@@ -872,7 +878,7 @@ class API(BaseObject):
 
         @classmethod
         def Generate(
-            cls: Type[_T],
+            cls: type[_T],
             unique_id: str = None,
             layer: int = None,
             locale="auto",

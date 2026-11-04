@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .versions import PINNED
 
@@ -68,7 +68,7 @@ _FAMILY_BY_ORIGIN = {
 _BASE_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)")
 
 
-def app_family(fp: "Fingerprint") -> Optional[str]:
+def app_family(fp: Fingerprint) -> Optional[str]:
     """The :data:`~tgmint.versions.PINNED` app family this identity
     belongs to, or ``None`` when it cannot be determined.
 
@@ -105,8 +105,8 @@ def _version_key(version: str):
 
 
 def staleness_report(
-    fp: "Fingerprint", pinned: Optional[Dict[str, str]] = None
-) -> Dict[str, Any]:
+    fp: Fingerprint, pinned: Optional[dict[str, str]] = None
+) -> dict[str, Any]:
     """Compare ``fp.app_version`` against the pinned release of its family.
 
     Pure and offline: the default pin table is the compiled-in
@@ -183,7 +183,7 @@ def staleness_report(
     }
 
 
-def tz_report(fp: "Fingerprint", at: Optional[datetime] = None) -> Dict[str, Any]:
+def tz_report(fp: Fingerprint, at: Optional[datetime] = None) -> dict[str, Any]:
     """Timezone sanity for one fingerprint.
 
     ``at`` (default: now, resolved inside :meth:`Fingerprint.tz_offset`)
@@ -224,10 +224,10 @@ def tz_report(fp: "Fingerprint", at: Optional[datetime] = None) -> Dict[str, Any
 
 
 def audit_fingerprint(
-    fp: "Fingerprint",
-    pinned: Optional[Dict[str, str]] = None,
+    fp: Fingerprint,
+    pinned: Optional[dict[str, str]] = None,
     at: Optional[datetime] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Full audit: coherence problems, tz sanity and staleness.
 
     Returns a dict with::

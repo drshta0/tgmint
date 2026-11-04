@@ -79,7 +79,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Union
 
 from . import __version__ as _tgmint_version
 from .codec import gramjs as _gramjs
@@ -140,7 +140,7 @@ class ProfileError(CodecError):
 #: session-format label -> (writer, reader).  ``*-session`` labels ride the
 #: family's string form (see the module docstring); ``tdata`` rides the
 #: Telethon string because tdesktop's own storage has no string form.
-_SESSION_CODECS: Dict[str, Tuple[Callable[[SessionData], str], Callable[[str], SessionData]]] = {
+_SESSION_CODECS: dict[str, tuple[Callable[[SessionData], str], Callable[[str], SessionData]]] = {
     "telethon-session": (_telethon.write_string, _telethon.read_string),
     "telethon-string": (_telethon.write_string, _telethon.read_string),
     "pyrogram-session": (_pyrogram.write_string, _pyrogram.read_string),
@@ -222,7 +222,7 @@ def _derive_key(passphrase: str, salt: bytes, iterations: int) -> bytes:
     ).derive(passphrase.encode("utf-8"))
 
 
-def _fingerprint_dict(fingerprint: Any) -> Optional[Dict[str, Any]]:
+def _fingerprint_dict(fingerprint: Any) -> Optional[dict[str, Any]]:
     """Normalize a Fingerprint | dict | None into a plain dict.
 
     A *dict* is validated the same way :func:`open_profile` validates it:
@@ -251,7 +251,7 @@ def _fingerprint_dict(fingerprint: Any) -> Optional[Dict[str, Any]]:
     )
 
 
-def _passkey_dict(passkey: Any) -> Optional[Dict[str, Any]]:
+def _passkey_dict(passkey: Any) -> Optional[dict[str, Any]]:
     """Normalize a passkey store payload (the JSON of ``PasskeyStore``)."""
     if passkey is None:
         return None
@@ -275,7 +275,7 @@ def _passkey_dict(passkey: Any) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _seal_container(container: Dict[str, Any], passphrase: str) -> Dict[str, Any]:
+def _seal_container(container: dict[str, Any], passphrase: str) -> dict[str, Any]:
     """Encrypt a plaintext container into the sealed JSON tree."""
     if not isinstance(passphrase, str) or not passphrase:
         raise ProfileError("a passphrase must be a non-empty string")
@@ -297,7 +297,7 @@ def _seal_container(container: Dict[str, Any], passphrase: str) -> Dict[str, Any
     }
 
 
-def _open_sealed(raw: Dict[str, Any], passphrase: Optional[str], where: str) -> Dict[str, Any]:
+def _open_sealed(raw: dict[str, Any], passphrase: Optional[str], where: str) -> dict[str, Any]:
     """Decrypt the sealed block of ``raw`` into a plaintext container."""
     sealed = raw.get("sealed")
     if not isinstance(sealed, dict):
@@ -362,7 +362,7 @@ def seal(
     passkey: Any = None,
     passphrase: Optional[str] = None,
     note: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the profile container for one authorization.
 
     Args:
@@ -458,7 +458,7 @@ def seal(
         passkey=passkey_data,
     )
 
-    container: Dict[str, Any] = {
+    container: dict[str, Any] = {
         "format": FORMAT,
         "session": {
             "format": session_format,
@@ -494,8 +494,8 @@ class OpenedProfile:
 
     session: SessionData
     fingerprint: Optional[Fingerprint] = None
-    passkey: Optional[Dict[str, Any]] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
+    passkey: Optional[dict[str, Any]] = None
+    meta: dict[str, Any] = field(default_factory=dict)
     session_format: str = ""
     sealed: bool = False
     path: Optional[str] = None
@@ -590,7 +590,7 @@ def _decode_container(
     )
 
 
-def _passkey_user_id(passkey: Dict[str, Any]) -> Optional[int]:
+def _passkey_user_id(passkey: dict[str, Any]) -> Optional[int]:
     """The user id encoded in a passkey store's ``"dc:user"`` handle."""
     handle = passkey.get("user_handle")
     if not isinstance(handle, str) or ":" not in handle:
@@ -630,7 +630,7 @@ def _cross_validate(
     *,
     recorded_user_id: Any,
     recorded_dc_id: Any,
-    passkey: Optional[Dict[str, Any]],
+    passkey: Optional[dict[str, Any]],
 ) -> None:
     """Refuse a container whose parts describe different accounts.
 
@@ -677,13 +677,13 @@ def _cross_validate(
 
 def _read_container(
     path: Union[str, Path], passphrase: Optional[str]
-) -> Tuple[Dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool]:
     """Read + (when sealed) decrypt a profile file -> (container, sealed)."""
     profile_path = Path(path)
     if not profile_path.is_file():
         raise FileNotFoundError(f"Profile file does not exist: {profile_path}")
     try:
-        with open(profile_path, "r", encoding="utf-8") as fp:
+        with open(profile_path, encoding="utf-8") as fp:
             raw = json.load(fp)
     except (OSError, ValueError) as exc:
         raise ProfileError(f"{profile_path}: not a tgmint profile ({exc})") from None
@@ -699,7 +699,7 @@ def _read_container(
     return raw, False
 
 
-def read_profile(path: Union[str, Path], *, passphrase: Optional[str] = None) -> Dict[str, Any]:
+def read_profile(path: Union[str, Path], *, passphrase: Optional[str] = None) -> dict[str, Any]:
     """Read a profile file and return its **plaintext** container dict.
 
     Detects the sealed form by the presence of the top-level ``"sealed"``
@@ -715,7 +715,7 @@ def read_profile(path: Union[str, Path], *, passphrase: Optional[str] = None) ->
 
 
 def open_profile(
-    path_or_dict: Union[str, Path, Dict[str, Any]],
+    path_or_dict: Union[str, Path, dict[str, Any]],
     *,
     passphrase: Optional[str] = None,
 ) -> OpenedProfile:
@@ -744,7 +744,7 @@ def open_profile(
     return _decode_container(container, sealed=sealed, where=str(path_or_dict))
 
 
-def write_profile(container: Dict[str, Any], path: Union[str, Path]) -> None:
+def write_profile(container: dict[str, Any], path: Union[str, Path]) -> None:
     """Write a container as a private profile file; never overwrites.
 
     Same publish discipline as the codec's writers: the JSON is written to
@@ -799,7 +799,7 @@ def write_profile(container: Dict[str, Any], path: Union[str, Path]) -> None:
 
 def inspect_profile(
     path: Union[str, Path], *, passphrase: Optional[str] = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Summarize a profile without exposing any secret.
 
     Reports the container format, whether it is sealed (and with which KDF
@@ -817,7 +817,7 @@ def inspect_profile(
     if not profile_path.is_file():
         raise FileNotFoundError(f"Profile file does not exist: {profile_path}")
     try:
-        with open(profile_path, "r", encoding="utf-8") as fp:
+        with open(profile_path, encoding="utf-8") as fp:
             raw = json.load(fp)
     except (OSError, ValueError) as exc:
         raise ProfileError(f"{profile_path}: not a tgmint profile ({exc})") from None
@@ -831,7 +831,7 @@ def inspect_profile(
 
     sealed_block = raw.get("sealed")
     sealed = isinstance(sealed_block, dict)
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "path": str(profile_path),
         "format": FORMAT,
         "sealed": sealed,

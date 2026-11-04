@@ -160,7 +160,6 @@ def cose_to_public_key(cose):
             ec.SECP256R1(),
         ).public_key()
     if alg == ALG_ED25519:
-        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import ed25519
 
         return ed25519.Ed25519PublicKey.from_public_bytes(cose[-1])
@@ -297,7 +296,7 @@ class TelethonFreeImportTest(unittest.TestCase):
     }
 
     def _imported_roots(self):
-        with open(core.__file__, "r", encoding="utf-8") as fp:
+        with open(core.__file__, encoding="utf-8") as fp:
             tree = ast.parse(fp.read(), filename=core.__file__)
         roots = set()
         for node in ast.walk(tree):
@@ -2136,3 +2135,130 @@ class AlgorithmOverrideRegressionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Account-mixup guard (review finding #61)
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402 - local to the guard tests below
+
+
+class FinishIdentityGuardTest(unittest.TestCase):
+    """The finish result must name the account the passkey store belongs to.
+
+    The signed assertion carries the user handle (``"<dc>:<user_id>"``), but
+    nothing compared it to the account ``auth.finishPasskeyLogin`` answers
+    with — a swapped credential or a store file copied from another account
+    would have produced a session for one account from another's passkey.
+    """
+
+    def _store(self, tmpdir, user_id=123456789, home_dc=2):
+        options = json.loads(REGISTRATION_OPTIONS)
+        options["user"]["id"] = core._b64u_encode(f"{home_dc}:{user_id}".encode())
+        credential = core.SoftwareAuthenticator.create_credential(
+            json.dumps(options), alg=core.ALG_ES256
+        )
+        store = core.PasskeyStore.from_credential(
+            credential, path=os.path.join(tmpdir, "k.json")
+        )
+        store.save()
+        return store
+
+    class _Driver:
+        """An invoker that answers auth.authorization with a chosen user id."""
+
+        def __init__(self, user_id, user_constructor=0x31774388):
+            self.user_id = user_id
+            self.user_constructor = user_constructor
+            self.calls = []
+
+        async def request_bytes(self, name, fields):
+            self.calls.append(name)
+            return (
+                struct.pack("<I", 0x2EA2C0D4)  # auth.authorization
+                + struct.pack("<I", 0)  # flags
+                + struct.pack("<I", self.user_constructor)
+                + struct.pack("<I", 0)
+                + struct.pack("<I", 0)
+                + struct.pack("<q", self.user_id)
+            )
+
+    def test_a_finish_naming_another_account_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            with self.assertRaises(core.PasskeyError) as ctx:
+                asyncio.run(
+                    core.finish_login(
+                        self._Driver(987654321), _login_fields(), store=store
+                    )
+                )
+            message = str(ctx.exception)
+            self.assertIn("123456789", message)
+            self.assertIn("987654321", message)
+            self.assertIn("passkey belongs to user", message)
+            self.assertIn(store.user_handle, message)
+
+    def test_a_finish_naming_the_same_account_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            result = asyncio.run(
+                core.finish_login(self._Driver(123456789), _login_fields(), store=store)
+            )
+            self.assertEqual(result.user_id, store.user_id)
+
+    def test_without_a_store_the_guard_does_not_run(self):
+        # the parameter is opt-in: a caller that never had a store keeps the
+        # old behaviour (no silent signature change for existing callers)
+        result = asyncio.run(core.finish_login(self._Driver(987654321), _login_fields()))
+        self.assertEqual(result.user_id, 987654321)
+
+    def test_the_framework_id_wins_over_the_neutral_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            # neutral parse says the right account...
+            with self.assertRaises(core.PasskeyError):
+                # ...but the driver's own TL layer says another one
+                asyncio.run(
+                    core.finish_login(
+                        self._Driver(123456789),
+                        _login_fields(),
+                        store=store,
+                        user_id=987654321,
+                    )
+                )
+
+    def test_an_unknown_user_constructor_leaves_nothing_to_compare(self):
+        # forward compatibility: a new User constructor means no id was read,
+        # and refusing on a value we never saw would break every layer bump
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            driver = self._Driver(0, user_constructor=0x12345678)
+            result = asyncio.run(
+                core.finish_login(driver, _login_fields(), store=store)
+            )
+            self.assertIsNone(result.user_id)
+            core.check_finish_identity(store, result)  # no raise
+
+    def test_sign_up_required_is_not_an_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            account = self._store(tmp)
+            result = core.AuthorizationResult(constructor=0x44747E9A, sign_up_required=True)
+            core.check_finish_identity(account, result)  # no raise
+
+    def test_a_non_integer_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            result = core.AuthorizationResult(constructor=0x2EA2C0D4)
+            for bogus in (True, "123456789", 1234.5):
+                with self.subTest(bogus=bogus):
+                    with self.assertRaises(core.PasskeyError) as ctx:
+                        core.check_finish_identity(store, result, user_id=bogus)
+                    self.assertIn("not an integer", str(ctx.exception))
+
+    def test_the_two_factor_password_path_can_check_without_a_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            core.check_finish_identity(store, user_id=123456789)
+            with self.assertRaises(core.PasskeyError):
+                core.check_finish_identity(store, user_id=987654321)

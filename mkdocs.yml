@@ -1,123 +1,131 @@
-copyright: <a href="https://github.com/drshta0/tgmint/" target="_blank" rel="noopener">tgmint authors</a> — continuing <a href="https://github.com/thedemons/opentele/" target="_blank" rel="noopener">thedemons/opentele</a> (MIT)
-docs_dir: docs
-edit_uri: https://github.com/drshta0/tgmint/edit/main/docs/
-extra_css:
-- assets/pymdownx-extras/extra-c12baed3e0.css
-extra_javascript:
-- https://unpkg.com/mermaid@8.13.3/dist/mermaid.min.js
-- https://polyfill.io/v3/polyfill.min.js?features=es6
-- https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
-- assets/pymdownx-extras/extra-loader-9e2c67b9.js
-markdown_extensions:
-- toc:
-    permalink: true
-- admonition: null
-- smarty:
-    smart_quotes: false
-- pymdownx.betterem: null
-- attr_list: null
-- def_list: null
-- tables: null
-- abbr: null
-- footnotes: null
-- md_in_html: null
-- pymdownx.superfences:
-    preserve_tabs: true
-- pymdownx.snippets:
-    base_path: docs
-    restrict_base_path: false
-- pymdownx.highlight:
-    extend_pygments_lang:
-    - lang: python
-      name: python
-      options:
-        python3: true
-    - lang: python
-      name: pyinline
-      options:
-        python3: true
-        startinline: true
-    linenums_style: pymdownx-inline
-    pygments_style: material
-    use_pygments: true
-- pymdownx.inlinehilite: null
-- pymdownx.magiclink:
-    normalize_issue_symbols: true
-    repo: tgmint
-    repo_url_shortener: true
-    repo_url_shorthand: true
-    social_url_shortener: true
-    social_url_shorthand: true
-    user: drshta0
-- pymdownx.tilde: null
-- pymdownx.caret: null
-- pymdownx.smartsymbols: null
-- pymdownx.emoji: null
-- pymdownx.escapeall:
-    hardbreak: true
-    nbsp: true
-- pymdownx.tasklist:
-    custom_checkbox: true
-- pymdownx.progressbar: null
-- pymdownx.arithmatex:
-    block_tag: pre
-    generic: true
-- pymdownx.mark: null
-- pymdownx.striphtml: null
-- pymdownx.details: null
-- pymdownx.tabbed:
-    alternate_style: true
-- pymdownx.saneheaders: null
-nav:
-- Home: README.md
-- Frameworks: frameworks.md
-- Bot API recipes: bot-api.md
-- Migration from opentele: migration-from-opentele.md
-- Passkeys: passkeys.md
-- Android import: android-acquisition.md
-- Post-auth bootstrap: bootstrap.md
-- Keepalive cadence: cadence.md
-- Examples:
-  - Home: examples/README.md
-  - Convert tdata to Telethon: examples/convert-tdata-to-telethon.md
-  - Convert Telethon to tdata: examples/convert-telethon-to-tdata.md
-  - Using official APIs: examples/using-official-apis.md
-- Documentation:
-  - Home: documentation/README.md
-  - Telegram Desktop:
-    - Home: documentation/telegram-desktop/README.md
-    - TDesktop: documentation/telegram-desktop/tdesktop.md
-    - Account: documentation/telegram-desktop/account.md
-    - AuthKey: documentation/telegram-desktop/authkey.md
-    - MTP: documentation/telegram-desktop/mtp.md
-  - Telethon:
-    - Home: documentation/telethon/README.md
-    - TelegramClient: documentation/telethon/telegramclient.md
-  - Authorization:
-    - Home: documentation/authorization/README.md
-    - API: documentation/authorization/api.md
-    - LoginFlag: documentation/authorization/loginflag.md
-  - Exceptions:
-    - Home: documentation/exceptions/README.md
-repo_url: https://github.com/drshta0/tgmint
-site_author: "tgmint authors (upstream: thedemons)"
-site_description: Telegram session conversion, official-client fingerprints and software passkeys — the opentele lineage, continued.
 site_name: tgmint
+site_description: >-
+  Telegram identity toolkit: convert sessions between tdata, Telethon, the
+  Pyrogram family and GramJS; mint official-client fingerprints from live,
+  verified data; log in with software passkeys.
+site_author: "tgmint authors (upstream: thedemons)"
+repo_url: https://github.com/drshta0/tgmint
+repo_name: drshta0/tgmint
+edit_uri: edit/main/docs/
+copyright: >-
+  MIT · tgmint authors, continuing
+  <a href="https://github.com/thedemons/opentele/">thedemons/opentele</a>
+
+docs_dir: docs
+exclude_docs: |
+  build/
+  hooks/
+
 theme:
-  custom_dir: theme
-  features:
-  - navigation.tabs
-  - navigation.instant
-  - navigation.tracking
-  - navigation.expand
-  - navigation.indexes
-  font:
-    code: Monaco Mono
-    text: Roboto
-  icon:
-    logo: material/book-open-page-variant
   name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  icon:
+    repo: fontawesome/brands/github
   palette:
-    accent: deep purple
-    primary: light blue
-    scheme: vsdark
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+hooks:
+  - docs/hooks/cli_reference.py
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            docstring_style: google
+            filters: ["!^_"]
+            show_if_no_docstring: false
+            merge_init_into_class: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: README.md
+  - Getting started: getting-started.md
+  - How it works: concepts.md
+  - Guides:
+      - Frameworks: frameworks.md
+      - Passkeys: passkeys.md
+      - QR login: qr-login.md
+      - Android import: android-acquisition.md
+      - Startup like the real app: bootstrap.md
+      - Ping timing like the real app: cadence.md
+      - Bot API recipes: bot-api.md
+      - Migration from opentele: migration-from-opentele.md
+      - Examples:
+          - examples/README.md
+          - Convert tdata to Telethon: examples/convert-tdata-to-telethon.md
+          - Convert Telethon to tdata: examples/convert-telethon-to-tdata.md
+          - Using official APIs: examples/using-official-apis.md
+  - CLI reference: cli.md
+  - API reference:
+      - reference/index.md
+      - Presets & devices: reference/api.md
+      - Device identity: reference/fingerprint.md
+      - Session codec: reference/codec.md
+      - Telegram Desktop (tdata): reference/td.md
+      - Telethon client: reference/tl.md
+      - Pyrogram adapter: reference/adapters.md
+      - Passkeys: reference/passkeys.md
+      - QR login: reference/qrlogin.md
+      - Account backup & heal: reference/profile.md
+      - Ping timing & startup: reference/cadence.md
+      - Versions, layers & parity: reference/versions.md
+      - Exceptions: reference/exceptions.md

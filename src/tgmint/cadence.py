@@ -68,8 +68,13 @@ Verification status (honest)
   their sources, the alias/platform errors, :func:`describe` purity and JSON
   shape, ``apply`` against a real ``TelegramClient`` (instance shadowing only,
   class untouched, :func:`restore` puts it back), a fake Pyrogram-family client
-  with ``_session`` / ``session`` / ``sessions``, ``dry_run`` mutating nothing,
-  and the refusal paths (unknown platform, undetectable family, an
+  with ``_session`` / ``session`` / ``sessions``, a fake framework package
+  installed under a non-``pyrogram`` name (the send wrapper resolves
+  ``raw.functions.PingDelayDisconnect`` from the client's own package, so
+  hydrogram-shaped installs get the rewrite instead of an ImportError),
+  ``apply`` → ``apply`` → ``restore`` leaving the original ``send`` /
+  ``connection_factory`` in place, ``dry_run`` mutating nothing, and the
+  refusal paths (unknown platform, undetectable family, an
   unrecognised Telethon loop, a Pyrogram client that is not connected yet).
 * **Verified live** (2026-11-01, own test accounts): Telethon at 19 s keeps a connection
   open with pings at 19.0 / 38.0 s. The Pyrogram family at the official 19 s
@@ -90,7 +95,8 @@ Verification status (honest)
   honest test is an owner's own account over time.
 
 The module is stdlib-only (``typing`` / ``dataclasses`` / ``inspect`` /
-``re`` / ``asyncio`` / ``random``), imports Telethon and Pyrogram nowhere, and
+``re`` / ``asyncio`` / ``random`` / ``importlib``), imports Telethon and
+Pyrogram nowhere at module scope, and
 takes the pinned client
 versions from :data:`tgmint.bootstrap.CLIENT_VERSIONS` so there is one version
 table in the package rather than two.
@@ -99,6 +105,7 @@ table in the package rather than two.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import random
 import re
@@ -136,10 +143,10 @@ class CadenceError(Exception):
 #: Platforms with a source-verified cadence.  iOS, macOS and the web clients
 #: are named in :data:`_UNSUPPORTED` with the reason instead of being silently
 #: treated as "like Android".
-PLATFORMS: typing.Tuple[str, ...] = ("android", "desktop")
+PLATFORMS: tuple[str, ...] = ("android", "desktop")
 
 #: The client families :func:`apply` knows how to drive.
-FRAMEWORKS: typing.Tuple[str, ...] = ("telethon", "pyrogram")
+FRAMEWORKS: tuple[str, ...] = ("telethon", "pyrogram")
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +171,7 @@ class PingCadence:
     disconnect_delay: int
     source: str
 
-    def as_dict(self) -> typing.Dict[str, typing.Any]:
+    def as_dict(self) -> dict[str, typing.Any]:
         """Plain-data form (JSON friendly, used by :func:`describe`)."""
         return {
             "ping_interval": self.ping_interval,
@@ -173,7 +180,7 @@ class PingCadence:
         }
 
 
-PING_CADENCE: typing.Dict[str, PingCadence] = {
+PING_CADENCE: dict[str, PingCadence] = {
     "android": PingCadence(
         ping_interval=19.0,
         disconnect_delay=35,
@@ -221,7 +228,7 @@ def pyrogram_read_timeout(ping_interval: float) -> float:
 
 
 #: spelling -> platform key (the same aliases :mod:`tgmint.bootstrap` accepts)
-_ALIASES: typing.Dict[str, str] = {
+_ALIASES: dict[str, str] = {
     "android": "android",
     "android_x": "android",
     "androidx": "android",
@@ -230,7 +237,7 @@ _ALIASES: typing.Dict[str, str] = {
 }
 
 #: platform -> why there is no number (asked for by name, never invented)
-_UNSUPPORTED: typing.Dict[str, str] = {
+_UNSUPPORTED: dict[str, str] = {
     "ios": (
         "no keepalive cadence has been read out of the iOS tree yet (the "
         "Android and Desktop numbers are file:line verified, the Apple ones "
@@ -300,7 +307,7 @@ class _Knob:
     reason: str
     source: str
 
-    def as_dict(self) -> typing.Dict[str, typing.Any]:
+    def as_dict(self) -> dict[str, typing.Any]:
         """Plain-data form (JSON friendly, used by :func:`describe`)."""
         return {
             "settable": self.settable,
@@ -379,18 +386,22 @@ _PYROGRAM_DISCONNECT = _Knob(
         "ping_worker hardcodes disconnect_delay=self.WAIT_TIMEOUT + 10, and "
         "WAIT_TIMEOUT also gates request timeouts, so tgmint does not touch it: "
         "it wraps Session.send and rewrites the outgoing PingDelayDisconnect's "
-        "disconnect_delay to the official value instead. The server enforces "
+        "disconnect_delay to the official value instead. The class is resolved "
+        "from the client's own package, so forks installed under another name "
+        "(hydrogram) are rewritten too, not ImportError'd. The server enforces "
         "that delay (a FIN lands delay seconds after the last packet), so it "
         "must be >= the ping interval."
     ),
     source=(
         ".pytestbox/pyrogram/session/session.py:89 (WAIT_TIMEOUT = 15), :476 "
-        "(the hardcoded +10)"
+        "(the hardcoded +10); fork layout verified in the hydrogram 0.2.0 "
+        "wheel on PyPI (github.com/hydrogram/hydrogram): "
+        "hydrogram/raw/functions/__init__.py re-exports PingDelayDisconnect"
     ),
 )
 
 #: every knob the module knows about, in reporting order
-_KNOBS: typing.Tuple[_Knob, ...] = (
+_KNOBS: tuple[_Knob, ...] = (
     _TELETHON_PING,
     _TELETHON_DISCONNECT,
     _PYROGRAM_PING,
@@ -412,7 +423,7 @@ def _refused(
     knob: _Knob,
     official: typing.Union[float, int],
     reason: typing.Optional[str] = None,
-) -> typing.Dict[str, typing.Any]:
+) -> dict[str, typing.Any]:
     """The ``unsupported`` entry for a knob: describe's fields plus the target.
 
     Same shape as a :func:`describe` knob entry (``settable`` / ``attribute`` /
@@ -426,7 +437,7 @@ def _refused(
     return entry
 
 
-def describe(platform: str) -> typing.Dict[str, typing.Any]:
+def describe(platform: str) -> dict[str, typing.Any]:
     """The official cadence next to what each framework can be told (pure).
 
     Returns a JSON-friendly dict: ``platform``, ``client_version``,
@@ -439,7 +450,7 @@ def describe(platform: str) -> typing.Dict[str, typing.Any]:
     :func:`apply` change".
     """
     key = _normalize_platform(platform)
-    frameworks: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+    frameworks: dict[str, dict[str, typing.Any]] = {}
     for name in FRAMEWORKS:
         frameworks[name] = {
             entry.knob: entry.as_dict() for entry in _KNOBS if entry.framework == name
@@ -469,7 +480,7 @@ def describe(platform: str) -> typing.Dict[str, typing.Any]:
 #: every marker :func:`_make_telethon_loop` relies on.  If telethon's loop no
 #: longer contains them, the copy would be a different loop with the same name
 #: — that is a refuse, not a guess.
-_TELETHON_LOOP_MARKERS: typing.Tuple[str, ...] = (
+_TELETHON_LOOP_MARKERS: tuple[str, ...] = (
     "asyncio.wait_for",
     "self.disconnected",
     "_clean_exported_senders",
@@ -489,7 +500,7 @@ _MARK = "_tgmint_cadence"
 #: does not attach one itself (``heal``/``bootstrap`` build clients from a
 #: sidecar), so this is a convenience for callers that do — and a clear error
 #: when nobody does.
-_FINGERPRINT_ATTRS: typing.Tuple[str, ...] = (
+_FINGERPRINT_ATTRS: tuple[str, ...] = (
     "_tgmint_fingerprint",
     "tgmint_fingerprint",
     "fingerprint",
@@ -511,7 +522,7 @@ def _is_pyrogram_session(obj: typing.Any) -> bool:
         return False
 
 
-def _pyrogram_sessions(client: typing.Any) -> typing.List[typing.Any]:
+def _pyrogram_sessions(client: typing.Any) -> list[typing.Any]:
     """Every Pyrogram ``Session`` object reachable from `client`.
 
     Kurigram 2.2.26 keeps the main-DC session in ``client.session`` (and
@@ -519,8 +530,8 @@ def _pyrogram_sessions(client: typing.Any) -> typing.List[typing.Any]:
     ``client.sessions`` and media sessions in ``client.media_sessions``.  Each
     object owns its own ``ping_worker``, so each one is patched.
     """
-    found: typing.List[typing.Any] = []
-    seen: typing.Set[int] = set()
+    found: list[typing.Any] = []
+    seen: set[int] = set()
 
     def add(obj: typing.Any) -> None:
         if not _is_pyrogram_session(obj) or id(obj) in seen:
@@ -539,7 +550,7 @@ def _pyrogram_sessions(client: typing.Any) -> typing.List[typing.Any]:
     return found
 
 
-def _detect(client: typing.Any) -> typing.Tuple[str, typing.List[typing.Any]]:
+def _detect(client: typing.Any) -> tuple[str, list[typing.Any]]:
     """``(family, pyrogram_sessions)`` for `client`, or raise :class:`CadenceError`."""
     if client is None:
         raise CadenceError(
@@ -675,11 +686,11 @@ def _make_telethon_loop(
 
 def _apply_telethon(
     client: typing.Any, platform: str, cadence: PingCadence, dry_run: bool,
-    notes: typing.List[str],
-) -> typing.Dict[str, typing.Any]:
+    notes: list[str],
+) -> dict[str, typing.Any]:
     """Set what Telethon allows, report what it does not."""
-    applied: typing.Dict[str, typing.Any] = {}
-    unsupported: typing.Dict[str, typing.Any] = {}
+    applied: dict[str, typing.Any] = {}
+    unsupported: dict[str, typing.Any] = {}
 
     original = getattr(type(client), "_keepalive_loop", None)
     was = _telethon_loop_interval(original)
@@ -763,7 +774,7 @@ def _apply_telethon(
 
 def _pyrogram_plan(
     cadence: PingCadence,
-) -> typing.Dict[str, float]:
+) -> dict[str, float]:
     """The three numbers :func:`_apply_pyrogram` writes, and the cap they imply."""
     read_timeout = pyrogram_read_timeout(cadence.ping_interval)
     pdd_delay = float(cadence.disconnect_delay)
@@ -835,23 +846,81 @@ def _unbind_patient_recv(session: typing.Any) -> None:
         proto._recv_from_socket = original
 
 
-def _make_send_wrapper(session: typing.Any, original, pdd_delay: float):
+def _family_ping_class(*anchors: typing.Any) -> typing.Optional[typing.Any]:
+    """``raw.functions.PingDelayDisconnect`` from the anchors' own package.
+
+    Every Pyrogram-family fork mirrors the same raw layout under its own
+    top-level package name — kurigram, pyrofork and vanilla install as
+    ``pyrogram``; hydrogram installs as ``hydrogram`` (verified against the
+    hydrogram 0.2.0 wheel on PyPI: ``hydrogram/raw/__init__.py`` does
+    ``from . import ... functions ...`` and ``raw/functions/__init__.py``
+    re-exports ``PingDelayDisconnect``,
+    github.com/hydrogram/hydrogram) — so the class is resolved from the
+    anchor objects themselves: the top-level package of ``type(x).__module__``,
+    tried for every anchor (Session objects are framework-made and name the
+    family even when the caller subclassed ``Client`` in their own module).
+    The ``pyrogram`` name three of the four forks share is the last
+    candidate, so duck-typed stand-ins in a pyrogram-equipped environment
+    keep resolving exactly as before.
+
+    Returns ``None`` when nothing resolves; callers treat that as "the
+    rewrite is unavailable", never as an error.
+    """
+    roots: list[str] = []
+    for anchor in anchors:
+        module = getattr(type(anchor), "__module__", None) or ""
+        root = module.split(".", 1)[0]
+        if root and root not in roots:
+            roots.append(root)
+    if "pyrogram" not in roots:  # kurigram / pyrofork / vanilla share the name
+        roots.append("pyrogram")
+    for root in roots:
+        try:
+            raw = importlib.import_module(root + ".raw")
+        except ImportError:
+            continue
+        functions = getattr(raw, "functions", None)
+        ping_cls = getattr(functions, "PingDelayDisconnect", None)
+        if ping_cls is not None:
+            return ping_cls
+    return None
+
+
+def _make_send_wrapper(
+    anchors: tuple[typing.Any, ...],
+    original: typing.Any,
+    pdd_delay: float,
+):
     """Rewrite the outgoing ``PingDelayDisconnect``'s delay, touch nothing else.
 
-    The raw module is imported *inside* the wrapper, so apply() never needs the
-    framework importable and a client that never pings pays nothing.
+    ``PingDelayDisconnect`` is resolved once, here — i.e. at :func:`apply`
+    time — from the anchor objects' package (see :func:`_family_ping_class`)
+    instead of a hardcoded ``from pyrogram import raw``, which raised
+    ``ImportError`` on the first ping of every fork installed under another
+    name (hydrogram).
+
+    Why resolving at apply() time does not break "apply() needs no framework
+    import": apply() is handed a live framework object whose class module is
+    by definition already imported, and no Pyrogram-family Session can exist
+    without its raw package, so the lookup is a ``sys.modules`` hit rather
+    than a new importability requirement. For the one case where it still
+    fails — a duck-typed stand-in that is not a real package — the wrapper
+    retries on each ping and, still unresolved, sends the ping *unrewritten*
+    rather than killing the worker with an ``ImportError`` (the old code
+    crashed).
     """
 
-    async def send(data, *args, **kwargs):
-        from pyrogram import raw
+    ping_cls = _family_ping_class(*anchors)
 
-        if isinstance(data, raw.functions.PingDelayDisconnect):
+    async def send(data, *args, **kwargs):
+        nonlocal ping_cls
+        if ping_cls is None:  # a duck-typed client: retry; it may appear later
+            ping_cls = _family_ping_class(*anchors)
+        if ping_cls is not None and isinstance(data, ping_cls):
             # the TL field is an int; a float breaks the serializer
             delay = int(pdd_delay)
             if getattr(data, "disconnect_delay", None) != delay:
-                data = raw.functions.PingDelayDisconnect(
-                    ping_id=data.ping_id, disconnect_delay=delay
-                )
+                data = ping_cls(ping_id=data.ping_id, disconnect_delay=delay)
         return await original(data, *args, **kwargs)
 
     return send
@@ -891,12 +960,12 @@ def _session_client(session: typing.Any) -> typing.Any:
 
 def _apply_pyrogram(
     client: typing.Any,
-    sessions: typing.List[typing.Any],
+    sessions: list[typing.Any],
     platform: str,
     cadence: PingCadence,
     dry_run: bool,
-    notes: typing.List[str],
-) -> typing.Dict[str, typing.Any]:
+    notes: list[str],
+) -> dict[str, typing.Any]:
     """Apply the official cadence to a Pyrogram-family client.
 
     Three writes per Session, each instance-scoped:
@@ -911,8 +980,8 @@ def _apply_pyrogram(
       60 s, because ``ping_worker`` hardcodes ``WAIT_TIMEOUT + 10`` and the
       server enforces it.
     """
-    applied: typing.Dict[str, typing.Any] = {}
-    unsupported: typing.Dict[str, typing.Any] = {}
+    applied: dict[str, typing.Any] = {}
+    unsupported: dict[str, typing.Any] = {}
 
     # a second apply() must restore the *framework* value, not the first patch
     previous_mark = getattr(client, _MARK, None)
@@ -930,6 +999,11 @@ def _apply_pyrogram(
 
     if not dry_run:
         previous_factory = getattr(client, "connection_factory", None)
+        if foreign and previous_mark.get("connection_factory") is not None:
+            # the factory installed right now is tgmint's own wrapper from the
+            # first apply(); restore() needs the one from *before* that, or a
+            # double apply() would leave a wrapper behind after restore()
+            previous_factory = previous_mark["connection_factory"]
         original_factory = previous_factory
         if callable(original_factory):
             timeout = plan["socket_read_timeout"]
@@ -945,9 +1019,32 @@ def _apply_pyrogram(
             dictionary = getattr(session, "__dict__", None)
             if dictionary is not None:
                 if hasattr(session, "send"):
-                    dictionary["_tgmint_send_original"] = dictionary.get("send")
+                    # setdefault, not assignment: a second apply() must keep
+                    # the backup from *before* any tgmint wrapper (exactly
+                    # like _bind_patient_recv below), or restore() would
+                    # reinstall the first wrapper as if it were the original
+                    dictionary.setdefault(
+                        "_tgmint_send_original", dictionary.get("send")
+                    )
+                    original = dictionary["_tgmint_send_original"]
+                    if original is None:
+                        # `send` lives on the class (the normal case): bind
+                        # the pristine class method, so a second apply()
+                        # re-wraps the framework's own send rather than the
+                        # installed wrapper — a wrapper chain would put the
+                        # *first* platform's delay on the wire, because the
+                        # inner rewrite would undo the outer one
+                        class_send = getattr(type(session), "send", None)
+                        original = (
+                            class_send.__get__(session)
+                            if class_send is not None
+                            and hasattr(class_send, "__get__")
+                            else session.send
+                        )
                     dictionary["send"] = _make_send_wrapper(
-                        session, session.send, plan["disconnect_delay"]
+                        (session, client),
+                        original,
+                        plan["disconnect_delay"],
                     )
             _bind_patient_recv(session, plan["socket_read_timeout"])
         setattr(
@@ -1049,7 +1146,7 @@ def apply(
     platform: typing.Optional[str] = None,
     *,
     dry_run: bool = False,
-) -> typing.Dict[str, typing.Any]:
+) -> dict[str, typing.Any]:
     """Point `client`'s keepalive at the official cadence for `platform`.
 
     The client family is detected from the object itself (Telethon by its
@@ -1078,7 +1175,7 @@ def apply(
         CadenceError: unknown/unsupported platform, a client family this
             module does not drive, a Pyrogram client with no Session yet.
     """
-    notes: typing.List[str] = []
+    notes: list[str] = []
 
     if platform is None:
         derived = _platform_from_client(client)
@@ -1102,7 +1199,7 @@ def apply(
     else:
         result = _apply_pyrogram(client, sessions, key, cadence, dry_run, notes)
 
-    report: typing.Dict[str, typing.Any] = {
+    report: dict[str, typing.Any] = {
         "framework": family,
         "platform": key,
         "applied": result["applied"],
@@ -1113,7 +1210,7 @@ def apply(
     return report
 
 
-def restore(client: typing.Any) -> typing.Dict[str, typing.Any]:
+def restore(client: typing.Any) -> dict[str, typing.Any]:
     """Undo :func:`apply` on `client` (put the framework's own cadence back).
 
     Returns ``{"restored": bool, "platform": ...}``; a client tgmint never

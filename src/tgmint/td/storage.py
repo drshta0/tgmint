@@ -20,8 +20,20 @@ class Serialize(BaseObject):
         return sizeof(uint32) + len(arr)
 
     @staticmethod
-    def stringSize(arr: str):
-        return sizeof(uint32) + len(arr) + sizeof(ushort)
+    def stringSize(arr: Optional[str]):
+        """Byte size :meth:`QDataStream.writeQString` emits for ``arr``.
+
+        QString is a uint32 byte-length prefix plus a UTF-16-BE payload, so
+        the size is ``4 + len(arr.encode("utf-16-be"))`` — twice the
+        character count only for BMP text (an astral character takes two
+        UTF-16 code units). The old form (``4 + len + 2``) was wrong for
+        every string (review finding #42); it survived because its only
+        caller summed it into a value nobody read. ``None``/``""`` are the
+        four-byte null/empty markers.
+        """
+        if not arr:
+            return sizeof(uint32)
+        return sizeof(uint32) + len(arr.encode("utf-16-be"))
 
 
 class Storage(BaseObject):
@@ -36,7 +48,7 @@ class Storage(BaseObject):
             self.fallbackConfigLegacyStickersRecentLimit = 0
             self.fallbackConfigLegacyStickersFavedLimit = 0
             self.fallbackConfigLegacyMegagroupSizeMax = 0
-            self.fallbackConfigLegacyTxtDomainString = str()
+            self.fallbackConfigLegacyTxtDomainString = ""
             self.fallbackConfig = QByteArray()
 
             self.cacheTotalSizeLimit = 0
@@ -169,7 +181,7 @@ class Storage(BaseObject):
             self.stream = QDataStream()
             self.stream.setDevice(self.buffer)
 
-            self.md5 = bytes()
+            self.md5 = b""
             self.fullSize = 0
 
         def writeData(self, data: QByteArray):
@@ -412,13 +424,13 @@ class Storage(BaseObject):
 
         if blockId == dbi.DcOptionOldOld:
             dcId = DcId(stream.readUInt32())
-            host = stream.readQString()
+            stream.readQString()
             ip = stream.readQString()
             port = stream.readUInt32()
             ExpectStreamStatus(stream)
 
             context.fallbackConfigLegacyDcOptions.constructAddOne(
-                dcId, td.MTP.DcOptions.Flag(0), ip, port, bytes()
+                dcId, td.MTP.DcOptions.Flag(0), ip, port, b""
             )
             context.legacyRead = True
 
@@ -431,7 +443,7 @@ class Storage(BaseObject):
             ExpectStreamStatus(stream)
 
             context.fallbackConfigLegacyDcOptions.constructAddOne(
-                dcIdWithShift, flags, ip, port, bytes()
+                dcIdWithShift, flags, ip, port, b""
             )
             context.legacyRead = True
 
@@ -513,8 +525,10 @@ class Storage(BaseObject):
 
     @staticmethod
     def CreateLocalKey(
-        salt: QByteArray, passcode: QByteArray = QByteArray()
+        salt: QByteArray, passcode: QByteArray = None
     ) -> td.AuthKey:
+        if passcode is None:
+            passcode = QByteArray()
         hashKey = hashlib.sha512(salt)
         hashKey.update(passcode)
         hashKey.update(salt)
@@ -526,8 +540,10 @@ class Storage(BaseObject):
 
     @staticmethod
     def CreateLegacyLocalKey(
-        salt: QByteArray, passcode: QByteArray = QByteArray()
+        salt: QByteArray, passcode: QByteArray = None
     ) -> td.AuthKey:
+        if passcode is None:
+            passcode = QByteArray()
         # tdesktop's CreateLegacyLocalKey (storage/details/
         # storage_file_utilities.cpp):
         #
@@ -627,7 +643,7 @@ class Storage(BaseObject):
 
     @staticmethod
     def ToFilePart(val: int):
-        result = str()
+        result = ""
         for i in range(0, 0x10):
             v = val & 0xF
             if v < 0x0A:

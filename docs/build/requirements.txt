@@ -1,3 +1,2 @@
-mkdocs-material
-pydoc-markdown
-readthedocs-custom-steps
+mkdocs-material>=9.5
+mkdocstrings[python]>=0.26

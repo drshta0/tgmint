@@ -99,13 +99,14 @@ from __future__ import annotations
 
 import re
 import struct
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from telethon import utils as tl_utils
 from telethon.errors import RPCError, SessionPasswordNeededError
 from telethon.extensions import BinaryReader
 from telethon.tl.tlobject import TLObject, TLRequest
 
+from . import dcswitch as _dcswitch
 from . import passkeys_core as _core
 
 __all__ = [
@@ -229,7 +230,7 @@ class InputPasskeyResponseRegister(TLObject):
 
     CONSTRUCTOR_ID = _CTOR_INPUT_RESPONSE_REGISTER
 
-    def __init__(self, client_data: "_DataJSONObject", attestation_data: bytes):
+    def __init__(self, client_data: _DataJSONObject, attestation_data: bytes):
         self.client_data = client_data
         self.attestation_data = attestation_data
 
@@ -255,7 +256,7 @@ class InputPasskeyResponseLogin(TLObject):
 
     def __init__(
         self,
-        client_data: "_DataJSONObject",
+        client_data: _DataJSONObject,
         authenticator_data: bytes,
         signature: bytes,
         user_handle: str,
@@ -363,7 +364,7 @@ class GetPasskeysRequest(TLRequest):
         return _pack_uint32(0xEA1F0C52)
 
     @staticmethod
-    def read_result(reader: BinaryReader) -> List[PasskeyInfo]:
+    def read_result(reader: BinaryReader) -> list[PasskeyInfo]:
         if reader.read_int(signed=False) != _CTOR_ACCOUNT_PASSKEYS:
             raise PasskeyError("unexpected constructor, expected account.passkeys")
         if reader.read_int(signed=False) != _CTOR_VECTOR:
@@ -472,14 +473,14 @@ class FinishPasskeyLoginRequest(TLRequest):
 
 _SCALAR_TL_TYPES = frozenset({"int", "long", "flags", "bytes", "string", "Bool"})
 
-_SPEC: Dict[str, Any] = _core.PASSKEY_TL_SPEC
+_SPEC: dict[str, Any] = _core.PASSKEY_TL_SPEC
 
 
 def _normalize(name: str) -> str:
     return name.replace("_", "").replace("#", "").lower()
 
 
-def _message_spec(name: str) -> Tuple[str, Dict[str, Any]]:
+def _message_spec(name: str) -> tuple[str, dict[str, Any]]:
     """Resolve a message name (spec key, TL name or class name) to its spec."""
     messages = _SPEC["messages"]
     if name in messages:
@@ -559,7 +560,7 @@ def _construct_object(object_key: str, values: Any, *, what: str):
     return _construct(class_name, spec, values, what=what)
 
 
-def _construct(class_name: str, spec: Dict[str, Any], values: Any, *, what: str):
+def _construct(class_name: str, spec: dict[str, Any], values: Any, *, what: str):
     """Instantiate one hand-written TL class from a spec field dict.
 
     ``flags`` fields are never passed (the classes derive them from the flag
@@ -583,8 +584,8 @@ def _construct(class_name: str, spec: Dict[str, Any], values: Any, *, what: str)
         )
 
     declared = [field["name"] for field in spec["fields"]]
-    args: List[Any] = []
-    kwargs: Dict[str, Any] = {}
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
     for field in spec["fields"]:
         if field["type"] == "flags":
             continue  # derived by the class (see FinishPasskeyLoginRequest.flags)
@@ -600,7 +601,7 @@ def _construct(class_name: str, spec: Dict[str, Any], values: Any, *, what: str)
     return cls(*args, **kwargs)
 
 
-def _build_request(message_key: str, spec: Dict[str, Any], fields: Optional[Dict[str, Any]]):
+def _build_request(message_key: str, spec: dict[str, Any], fields: Optional[dict[str, Any]]):
     """The Telethon request instance for one ceremony step."""
     if fields is None:
         fields = {}
@@ -704,7 +705,7 @@ class TelethonInvoker:
         self.client = client
         self.last_response: Any = None
 
-    async def native(self, name: str, fields: Dict[str, Any]) -> Any:
+    async def native(self, name: str, fields: dict[str, Any]) -> Any:
         key, spec = _message_spec(name)
         request = _build_request(key, spec, fields)
         try:
@@ -729,68 +730,17 @@ class TelethonInvoker:
 # ---------------------------------------------------------------------------
 # Datacenter handoff rollback (Telethon's _switch_dc has no undo)
 # ---------------------------------------------------------------------------
+#
+# The implementation lives in tgmint.dcswitch since the QR-login driver
+# (tgmint.qrlogin) needs the identical snapshot/rollback around the same
+# destructive client._switch_dc; these spellings keep this module's internal
+# imports (and the tests that patch them by name) working unchanged.
 
-def _session_snapshot(client) -> Dict[str, Any]:
-    """Everything ``client._switch_dc`` overwrites, captured before it runs.
-
-    ``_switch_dc`` (telethon/client/telegrambaseclient.py:770-784) rewrites
-    ``session.set_dc(...)``, sets ``session.auth_key`` **and** the sender's
-    key to ``None``, saves the session, then reconnects — i.e. it permanently
-    moves the caller's persistent session and erases its auth key. A failed
-    ``finishPasskeyLogin`` after that point would leave the caller's session
-    file pointing at another DC with no key at all, so the pre-switch state
-    is captured here and put back by :func:`_restore_session`.
-    """
-    session = getattr(client, "session", None)
-    return {
-        "session": session,
-        "dc_id": getattr(session, "dc_id", None),
-        "server_address": getattr(session, "server_address", None),
-        "port": getattr(session, "port", None),
-        "auth_key": getattr(session, "auth_key", None),
-    }
+_session_snapshot = _dcswitch.session_snapshot
+_restore_session = _dcswitch.restore_session
 
 
-async def _restore_session(client, snapshot: Optional[Dict[str, Any]]) -> None:
-    """Best-effort rollback of :meth:`TelethonClient._switch_dc`.
-
-    Best effort by design: the login error is what the caller needs to see,
-    so a rollback that also fails is swallowed (the client keeps the
-    switched-to session — the same state a failed passkey login leaves in any
-    client). The session file is written back and the connection re-opened on
-    the restored DC, because ``_switch_dc`` reconnected to the new one.
-    """
-    if not snapshot:
-        return
-    session = snapshot["session"]
-    try:
-        if session is not None and snapshot["dc_id"] is not None:
-            await tl_utils.maybe_async(
-                session.set_dc(
-                    snapshot["dc_id"], snapshot["server_address"], snapshot["port"]
-                )
-            )
-            session.auth_key = snapshot["auth_key"]
-            # the sender holds its own copy of the key; put it back before
-            # reconnecting so connect() does not mint a brand new one
-            sender_key = getattr(getattr(client, "_sender", None), "auth_key", None)
-            old_key = snapshot["auth_key"]
-            if sender_key is not None and old_key is not None:
-                try:
-                    sender_key.key = getattr(old_key, "key", old_key)
-                except Exception:  # nocov - a sender that does not allow it
-                    pass
-            await tl_utils.maybe_async(session.save())
-        disconnect = getattr(client, "_disconnect", None)
-        connect = getattr(client, "connect", None)
-        if callable(disconnect) and callable(connect):
-            await disconnect()
-            await connect()
-    except Exception:  # nocov - a rollback that cannot complete
-        pass
-
-
-def _auth_user(invoker: TelethonInvoker, result: "_core.AuthorizationResult"):
+def _auth_user(invoker: TelethonInvoker, result: _core.AuthorizationResult):
     """The Telethon ``User`` behind a finished passkey login.
 
     The invoker keeps the framework object; if a caller replaced it (or only
@@ -828,7 +778,7 @@ async def register_passkey(
     origin: str = DEFAULT_ORIGIN,
     name: str = "tgmint software passkey",
     alg: Optional[int] = None,
-) -> Tuple[PasskeyInfo, PasskeyStore]:
+) -> tuple[PasskeyInfo, PasskeyStore]:
     """Register a new passkey on the account this client is logged into.
 
     The credential is generated locally (ES256 or Ed25519, whatever the
@@ -918,7 +868,9 @@ async def login_with_passkey(
 
     # 4. Finish on the home DC.
     try:
-        result = await _core.finish_login(invoker, plan["finish_fields"])
+        result = await _core.finish_login(
+            invoker, plan["finish_fields"], store=store
+        )
     except _core.TwoFactorRequired:
         if password is None:
             # nothing can be finished without the password, so put the
@@ -930,19 +882,25 @@ async def login_with_passkey(
         # switch is intentionally kept: a wrong password stays retryable with
         # ``client.sign_in(password=...)`` on that DC.
         me = await client.sign_in(password=password)
+        _core.check_finish_identity(store, result=None, user_id=getattr(me, "id", None))
         store.save()
         return me
     except BaseException:
         await _restore_session(client, snapshot)
         raise
 
+    # 5. The finish response must name the account the store belongs to: the
+    #    neutral parse reads the id when it knows the User constructor, and
+    #    Telethon's own object is authoritative when it does not.
+    user = _auth_user(invoker, result)
+    _core.check_finish_identity(store, result, user_id=getattr(user, "id", None))
     store.save()
-    me = await client._on_login(_auth_user(invoker, result))
+    me = await client._on_login(user)
     await tl_utils.maybe_async(session.save())
     return me
 
 
-async def list_passkeys(client) -> List[PasskeyInfo]:
+async def list_passkeys(client) -> list[PasskeyInfo]:
     """Passkeys currently registered on the logged-in account."""
     return await _core.list_passkeys_core(TelethonInvoker(client))
 

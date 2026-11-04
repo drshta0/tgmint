@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .configs import *
-from . import shared as td
 
 
 class MTP(BaseObject):  # nocov
@@ -85,7 +84,7 @@ class MTP(BaseObject):  # nocov
             def addToData(dcs: List[BuiltInDc], flags: MTP.DcOptions.Flag):
 
                 for dc in dcs:
-                    self.applyOneGuarded(dc.id, flags, dc.ip, dc.port, bytes())
+                    self.applyOneGuarded(dc.id, flags, dc.ip, dc.port, b"")
 
             if self.isTestMode():
                 addToData(BuiltInDc.kBuiltInDcsTest, MTP.DcOptions.Flag.f_static | 0)  # type: ignore
@@ -120,7 +119,7 @@ class MTP(BaseObject):  # nocov
                 ip = stream.readRawData(ipSize).decode("ascii")
 
                 kMaxSecretSize = 32
-                secret = bytes()
+                secret = b""
                 if version > 0:
                     secretSize = stream.readInt32()
 
@@ -330,7 +329,7 @@ class MTP(BaseObject):  # nocov
             self.callConnectTimeoutMs = 30000
             self.callPacketTimeoutMs = 10000
             self.webFileDcId = 4
-            self.txtDomainString = str()
+            self.txtDomainString = ""
             self.phoneCallsEnabled = True
             self.blockedMode = False
             self.captionLengthMax = 1024
@@ -385,11 +384,12 @@ class MTP(BaseObject):  # nocov
 
         def Serialize(self) -> QByteArray:
             options = self._dcOptions.Serialize()
-            size = sizeof(int32) * 2
-            size += td.Serialize.bytearraySize(options)
-            size += 28 * sizeof(int32)
-            size += td.Serialize.stringSize(self._fields.internalLinksDomain)
-            size += td.Serialize.stringSize(self._fields.txtDomainString)
+            # fork note: the five-line size prefetch that used to sit here
+            # (size = ...; size += td.Serialize.bytearraySize(options); ...)
+            # was dead — the sum was computed and never read, and its
+            # stringSize() helper was wrong on top of that (review finding
+            # #42). The stream below is the only writer; nothing sizes it up
+            # front, so the lines are gone rather than kept in sync.
 
             result = QByteArray()
             stream = QDataStream(result, QIODevice.OpenModeFlag.WriteOnly)

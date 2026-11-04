@@ -1,7 +1,7 @@
 # Frameworks — what "supported" means
 
 tgmint's core is framework-neutral: a minted identity is a
-[`Fingerprint`](./documentation/authorization/api.md) — a handful of strings
+[`Fingerprint`](reference/fingerprint.md) — a handful of strings
 (`api_id`, `api_hash`, `device_model`, `system_version`, `app_version`, the
 language triple, optionally a timezone). Everything else is adapters: thin,
 honest glue between that object and whatever client library you already use.
@@ -27,7 +27,7 @@ cannot send — reaches the wire. The override is **scoped to this client
 class**: upstream opentele patched Telethon's `InitConnectionRequest`
 constructor process-wide, which is why two extended clients could not coexist
 in one process. On top of the client you get tdata ↔ Telethon conversion and
-[`tgmint.passkeys`](https://github.com/drshta0/tgmint/blob/main/PASSKEYS.md).
+[`tgmint.passkeys`](passkeys.md).
 
 Passkeys are shared with the Pyrogram family through
 `tgmint.passkeys_core`: the credential handling, the TL wire spec and the

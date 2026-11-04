@@ -508,7 +508,6 @@ class SealedRoundTrip(unittest.TestCase):
         self.assertEqual(len(base64.b64decode(sealed["nonce"])), 12)
 
     def test_sealing_is_randomized(self):
-        tmp = tempfile.mkdtemp()
         first = seal(session(), "telethon-string", passphrase=self.PASSPHRASE)
         second = seal(session(), "telethon-string", passphrase=self.PASSPHRASE)
         self.assertNotEqual(first["sealed"]["salt"], second["sealed"]["salt"])

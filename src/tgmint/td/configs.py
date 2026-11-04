@@ -136,7 +136,7 @@ class PeerId(int):  # nocov
         if not legacy:
             return PeerId(serialized & (~flag))
 
-        PeerIdMask = int(0xFFFFFFFF)
+        PeerIdMask = 0xFFFFFFFF
         PeerIdTypeMask = 0xF00000000
         PeerIdUserShift = 0x000000000
         PeerIdChatShift = 0x100000000

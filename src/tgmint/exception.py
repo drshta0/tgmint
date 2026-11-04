@@ -331,7 +331,7 @@ def Expects(
         raise exception
 
 
-def ExpectStreamStatus(stream: "QDataStream", message: str = "Could not stream data"):
+def ExpectStreamStatus(stream: QDataStream, message: str = "Could not stream data"):
     # fork note: lazy import — this helper is only reached during tdata
     # streaming; the rest of the library must import without Qt installed
     from PyQt5.QtCore import QDataStream

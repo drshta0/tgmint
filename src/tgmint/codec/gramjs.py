@@ -31,7 +31,6 @@ import base64
 import ipaddress
 import re
 import struct
-import typing
 
 from .data import CodecError, SessionData, decode_b64, validate
 from .dcs import TEST_ADDRESSES, data_center
@@ -46,7 +45,7 @@ CURRENT_VERSION = "1"
 _HOSTNAME_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?")
 
 
-def _normalize_address(data: SessionData) -> typing.Tuple[str, int]:
+def _normalize_address(data: SessionData) -> tuple[str, int]:
     """Resolve (address, port) with GramJS defaults and validations."""
     if data.server_address is None:
         address, default_port = data_center(data.dc_id, data.test_mode, ipv6=False)

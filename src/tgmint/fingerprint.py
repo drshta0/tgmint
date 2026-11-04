@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import MISSING, dataclass, asdict, fields
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 SCHEMA_VERSION = 1
 
@@ -115,16 +115,16 @@ class Fingerprint:
 
     # -- locale ---------------------------------------------------------
 
-    def locale_pair(self) -> Tuple[str, str]:
+    def locale_pair(self) -> tuple[str, str]:
         return (self.lang_code, self.system_lang_code)
 
     # -- serialization ----------------------------------------------------
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Fingerprint":
+    def from_dict(cls, data: dict[str, Any]) -> Fingerprint:
         if not isinstance(data, dict):
             raise ValueError(f"fingerprint data must be a dict, got {type(data).__name__}")
         version = data.get("schema_version")
@@ -164,7 +164,7 @@ class Fingerprint:
         return str(save_sidecar(path, self.to_dict()))
 
     @classmethod
-    def load(cls, path) -> "Fingerprint":
+    def load(cls, path) -> Fingerprint:
         """Load a fingerprint from a sidecar file written by `save`."""
         from .sidecar import load_sidecar
 
@@ -172,9 +172,9 @@ class Fingerprint:
 
     # -- coherence --------------------------------------------------------
 
-    def validate(self) -> List[str]:
+    def validate(self) -> list[str]:
         """Coherence checks; returns a list of problems (empty = coherent)."""
-        problems: List[str] = []
+        problems: list[str] = []
 
         if not isinstance(self.api_id, int) or self.api_id <= 0:
             problems.append(f"api_id should be a positive int, got {self.api_id!r}")
@@ -243,7 +243,7 @@ class Fingerprint:
     # -- legacy bridge ------------------------------------------------------
 
     @classmethod
-    def from_apidata(cls, api: Union[Any, type]) -> "Fingerprint":
+    def from_apidata(cls, api: Union[Any, type]) -> Fingerprint:
         """Build a Fingerprint from an `APIData` instance or class.
 
         Imports `tgmint.api` lazily so this module never creates an import

@@ -80,7 +80,7 @@ import typing
 from pathlib import Path
 
 from . import codec
-from .codec.data import CodecError, SessionData
+from .codec.data import SessionData
 from .fingerprint import Fingerprint
 
 __all__ = [
@@ -95,7 +95,7 @@ __all__ = [
 
 #: which ``--api-preset`` name maps to which official family.  Mirrors the
 #: CLI's table; only used when no fingerprint was recorded for the session.
-DEFAULT_PRESETS: typing.Dict[str, str] = {
+DEFAULT_PRESETS: dict[str, str] = {
     "desktop": "TelegramDesktop",
     "android": "TelegramAndroid",
     "android-x": "TelegramAndroidX",
@@ -149,7 +149,7 @@ class HealRefusal(HealError):
 # ---------------------------------------------------------------------------
 
 
-def _dead_auth_errors() -> typing.Tuple[type, ...]:
+def _dead_auth_errors() -> tuple[type, ...]:
     """Telethon's "auth key is gone" error classes, when telethon is here."""
     try:
         from telethon import errors
@@ -174,7 +174,7 @@ def is_dead_auth_error(exc: BaseException) -> bool:
     return False
 
 
-async def probe_session(client) -> typing.Dict[str, typing.Any]:
+async def probe_session(client) -> dict[str, typing.Any]:
     """Cheap liveness probe for one stored authorization.
 
     Connects the client (telethon's ``connect`` is idempotent) and asks for
@@ -224,7 +224,7 @@ async def probe_session(client) -> typing.Dict[str, typing.Any]:
     }
 
 
-def make_client(*, kind: str, api, data: typing.Optional[SessionData] = None):
+def make_client(*, kind: str, api: typing.Any, data: typing.Optional[SessionData] = None):
     """Build the Telethon client a heal step needs.
 
     Seam, not API: the tests replace it with a fake, which is the only way
@@ -308,9 +308,9 @@ def _load_source(
     session_path: str,
     session_format: str,
     passphrase: typing.Optional[str],
-) -> typing.Tuple[SessionData, typing.Optional[typing.Any], typing.Dict[str, typing.Any]]:
+) -> tuple[SessionData, typing.Optional[typing.Any], dict[str, typing.Any]]:
     """Read the session under repair -> (session, opened-profile, notes)."""
-    notes: typing.List[str] = []
+    notes: list[str] = []
     if session_format == "profile":
         from .profile import open_profile
 
@@ -332,7 +332,7 @@ def _recorded_fingerprint(
     session_path: str,
     session_format: str,
     opened_profile: typing.Optional[typing.Any],
-) -> typing.Tuple[typing.Optional[Fingerprint], typing.Optional[str]]:
+) -> tuple[typing.Optional[Fingerprint], typing.Optional[str]]:
     """The identity to present again: envelope > sidecar > nothing.
 
     Returns ``(fingerprint, where_it_came_from)``.
@@ -365,7 +365,7 @@ def _passkey_store_user(passkey_path: str) -> typing.Optional[int]:
     return store.user_id
 
 
-def _refuse_symlink(path: typing.Union[str, "os.PathLike[str]"], what: str) -> None:
+def _refuse_symlink(path: typing.Union[str, os.PathLike[str]], what: str) -> None:
     """Refuse a symlinked session path, like ``profile.write_profile`` does.
 
     ``os.replace`` onto a symlink replaces the *link*, leaving the file it
@@ -383,7 +383,7 @@ def _refuse_symlink(path: typing.Union[str, "os.PathLike[str]"], what: str) -> N
         )
 
 
-def _file_snapshot(path: str) -> typing.Optional[typing.Tuple[int, int, str]]:
+def _file_snapshot(path: str) -> typing.Optional[tuple[int, int, str]]:
     """``(size, mtime_ns, sha256)`` of a regular file, else ``None``."""
     try:
         info = os.stat(path)
@@ -400,7 +400,7 @@ def _file_snapshot(path: str) -> typing.Optional[typing.Tuple[int, int, str]]:
 
 
 def _require_unchanged(
-    path: str, snapshot: typing.Optional[typing.Tuple[int, int, str]]
+    path: str, snapshot: typing.Optional[tuple[int, int, str]]
 ) -> None:
     """Refuse to overwrite a session that changed during the read→write window.
 
@@ -443,7 +443,7 @@ def write_session_atomically(
 
 def _write_session_atomically(
     data: SessionData, path: str, destination_format: str
-) -> typing.Dict[str, typing.Any]:
+) -> dict[str, typing.Any]:
     """Like :func:`write_session_atomically`, returning the write result.
 
     The codec writers never overwrite (that is right for ``convert``), so
@@ -499,7 +499,7 @@ def _write_profile_atomically(
     opened_profile: typing.Any,
     passphrase: typing.Optional[str],
     note: str,
-) -> typing.Tuple[str, typing.Optional[str]]:
+) -> tuple[str, typing.Optional[str]]:
     """Rewrite a ``.tgmint`` envelope in place with the fresh session.
 
     Returns ``(path, downgraded_from)`` — ``downgraded_from`` is set when
@@ -600,10 +600,10 @@ async def heal_session(
     password: typing.Optional[str] = None,
     live: bool = False,
     force: bool = False,
-    probe=None,
-    client_factory=None,
-    login=None,
-) -> typing.Dict[str, typing.Any]:
+    probe: typing.Optional[typing.Callable[..., typing.Any]] = None,
+    client_factory: typing.Optional[typing.Callable[..., typing.Any]] = None,
+    login: typing.Optional[typing.Callable[..., typing.Any]] = None,
+) -> dict[str, typing.Any]:
     """Repair one session with the passkey that can sign back into it.
 
     Library entrypoint behind ``tgmint heal``.
@@ -629,8 +629,10 @@ async def heal_session(
             healing needs ``force=True``.
         force: re-login even when the probe is unavailable or inconclusive
             (never overrides "the session is alive" — that always no-ops).
-        probe / client_factory / login: injection seams for the offline
-            tests; production callers leave them ``None``.
+        probe: injection seam for the offline tests; production callers
+            leave it ``None``.
+        client_factory: injection seam for the offline tests (``None``).
+        login: injection seam for the offline tests (``None``).
 
     Returns:
         a JSON-friendly report: ``action`` (``"noop"`` or ``"healed"``),
@@ -657,7 +659,7 @@ async def heal_session(
     probe_fn = probe or probe_session
     client_factory = client_factory or make_client
     login_fn = login or _default_login
-    notes: typing.List[str] = []
+    notes: list[str] = []
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Session does not exist: {path}")
@@ -712,7 +714,7 @@ async def heal_session(
             "probe the session first, or --force to heal it anyway"
         )
 
-    probe_report: typing.Dict[str, typing.Any] = {
+    probe_report: dict[str, typing.Any] = {
         "performed": False,
         "alive": None,
         "dead": False,
@@ -803,7 +805,7 @@ async def heal_session(
         _require_unchanged(path, baseline)
 
     note = f"healed {old['user_id']} on {old['dc_id']} at {_now_iso()}"
-    filled: typing.List[str] = []
+    filled: list[str] = []
     if target_format == "profile":
         if opened_profile is None:
             raise HealRefusal(
@@ -871,7 +873,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def heal_session_sync(*args, **kwargs) -> typing.Dict[str, typing.Any]:
+def heal_session_sync(*args, **kwargs) -> dict[str, typing.Any]:
     """Run :func:`heal_session` from synchronous code (the CLI).
 
     A separate name on purpose: importing ``tgmint.heal`` must not create

@@ -132,5 +132,168 @@ class WireGoldenTest(unittest.TestCase):
         self.assertFalse(hasattr(stub, "params"))
 
 
+# ---------------------------------------------------------------------------
+# QR login (tgmint.qrlogin_core): the five constructors both frameworks ship
+# ---------------------------------------------------------------------------
+
+try:  # the Pyrogram family is optional in the test environment
+    from pyrogram.raw.functions.auth import ExportLoginToken as _KExport
+    from pyrogram.raw.functions.auth import ImportLoginToken as _KImport
+    from pyrogram.raw.types.auth import LoginToken as _KLoginToken
+    from pyrogram.raw.types.auth import LoginTokenMigrateTo as _KMigrateTo
+    from pyrogram.raw.types.auth import LoginTokenSuccess as _KSuccess
+
+    # pyrogram.raw.all.layer is the plain int (229 in kurigram 2.2.26)
+    PYROGRAM_LAYER = __import__("pyrogram.raw.all", fromlist=["layer"]).layer
+    KURIGRAM_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    KURIGRAM_AVAILABLE = False
+
+
+class QrLoginWireGoldenTest(unittest.TestCase):
+    """The QR-login wire: one spec, two generated layers, identical bytes.
+
+    The constructor ids in ``tgmint.qrlogin_core.QRLOGIN_TL_SPEC`` are
+    asserted against BOTH installed frameworks' generated classes —
+    Telethon always, the Pyrogram family when a distribution is present —
+    the same drift-guard arrangement the passkey constructors use
+    (tests/test_passkeys_core.py). The request byte equality makes the
+    neutral writer's output literally the frameworks' own serialization.
+    """
+
+    EXPORT_FIELDS = {
+        "api_id": 2040,
+        "api_hash": "b18441a1ff607e10a989891a5462e627",
+        "except_ids": [777000, 4242],
+    }
+
+    def test_spec_constructors_match_telethon(self):
+        from telethon.tl import functions
+        from telethon.tl import types
+
+        from tgmint.qrlogin_core import QRLOGIN_TL_SPEC
+
+        pairs = (
+            ("auth.exportLoginToken", functions.auth.ExportLoginTokenRequest),
+            ("auth.importLoginToken", functions.auth.ImportLoginTokenRequest),
+            ("auth.loginToken", types.auth.LoginToken),
+            ("auth.loginTokenMigrateTo", types.auth.LoginTokenMigrateTo),
+            ("auth.loginTokenSuccess", types.auth.LoginTokenSuccess),
+        )
+        for name, cls in pairs:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    QRLOGIN_TL_SPEC["constructors"][name],
+                    cls.CONSTRUCTOR_ID,
+                )
+        self.assertEqual(QRLOGIN_TL_SPEC["layer"], LAYER)
+
+    @unittest.skipUnless(KURIGRAM_AVAILABLE, "no pyrogram-family package")
+    def test_spec_constructors_match_the_pyrogram_family(self):
+        from tgmint.qrlogin_core import QRLOGIN_TL_SPEC
+
+        pairs = (
+            ("auth.exportLoginToken", _KExport),
+            ("auth.importLoginToken", _KImport),
+            ("auth.loginToken", _KLoginToken),
+            ("auth.loginTokenMigrateTo", _KMigrateTo),
+            ("auth.loginTokenSuccess", _KSuccess),
+        )
+        for name, cls in pairs:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    QRLOGIN_TL_SPEC["constructors"][name], cls.ID
+                )
+        # The constructor ids above are the real drift guard. The spec's
+        # layer is pinned to Telethon's (checked in the Telethon test).
+        # The installed Pyrogram-family layer depends on which version pip
+        # resolves (Python 3.9 gets kurigram 2.2.25 = layer 228, newer
+        # Pythons get 2.2.26 = 229), so only require it to be a real layer.
+        self.assertIsInstance(PYROGRAM_LAYER, int)
+        self.assertGreater(PYROGRAM_LAYER, 0)
+
+    def test_export_request_bytes_match_telethon(self):
+        from tgmint.qrlogin_core import encode_request
+        from telethon.tl.functions.auth import ExportLoginTokenRequest
+
+        mine = encode_request("exportLoginToken", self.EXPORT_FIELDS)
+        reference = bytes(ExportLoginTokenRequest(**{
+            "api_id": 2040,
+            "api_hash": "b18441a1ff607e10a989891a5462e627",
+            "except_ids": [777000, 4242],
+        }))
+        self.assertEqual(mine, reference)
+
+    def test_import_request_bytes_match_telethon(self):
+        from tgmint.qrlogin_core import encode_request
+        from telethon.tl.functions.auth import ImportLoginTokenRequest
+
+        token = bytes(range(20))
+        self.assertEqual(
+            encode_request("importLoginToken", {"token": token}),
+            bytes(ImportLoginTokenRequest(token=token)),
+        )
+
+    @unittest.skipUnless(KURIGRAM_AVAILABLE, "no pyrogram-family package")
+    def test_request_bytes_match_the_pyrogram_family(self):
+        from tgmint.qrlogin_core import encode_request
+
+        export = _KExport(
+            api_id=2040,
+            api_hash="b18441a1ff607e10a989891a5462e627",
+            except_ids=[777000, 4242],
+        )
+        self.assertEqual(
+            encode_request("exportLoginToken", self.EXPORT_FIELDS), export.write()
+        )
+        token = bytes(range(20))
+        import_ = _KImport(token=token)
+        self.assertEqual(
+            encode_request("importLoginToken", {"token": token}),
+            import_.write(),
+        )
+
+    def test_responses_round_trip_through_the_neutral_parser(self):
+        from tgmint.qrlogin_core import (
+            QrLoginToken,
+            QrMigrateTo,
+            QrSuccess,
+            parse_login_token,
+        )
+        from telethon.tl import types
+
+        token_bytes = bytes(range(20))
+        user = types.User(id=424242, first_name="QR", is_self=True)
+        authorization = types.auth.Authorization(user=user)
+
+        # telethon converts expires_in <-> datetime; expires=None serializes
+        # the wire form of expires_in=0
+        fresh = parse_login_token(
+            bytes(types.auth.LoginToken(expires=None, token=token_bytes))
+        )
+        self.assertIsInstance(fresh, QrLoginToken)
+        self.assertEqual(fresh.token, token_bytes)
+        self.assertEqual(fresh.expires_in, 0)
+
+        migrate = parse_login_token(
+            bytes(types.auth.LoginTokenMigrateTo(dc_id=4, token=token_bytes))
+        )
+        self.assertIsInstance(migrate, QrMigrateTo)
+        self.assertEqual((migrate.dc_id, migrate.token), (4, token_bytes))
+
+        success = parse_login_token(
+            bytes(types.auth.LoginTokenSuccess(authorization=authorization))
+        )
+        self.assertIsInstance(success, QrSuccess)
+        self.assertEqual(success.authorization.user_id, 424242)
+
+    def test_spec_is_plain_json_data(self):
+        import json
+
+        from tgmint.qrlogin_core import QRLOGIN_TL_SPEC
+
+        json.dumps(QRLOGIN_TL_SPEC)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -91,8 +91,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Optional
+from collections.abc import Sequence
 
+from . import dcswitch
 from . import passkeys_core as core
 
 __all__ = [
@@ -175,7 +177,7 @@ def _distribution() -> str:
 # Constructor lookup: TL id -> the distribution's generated class
 # ---------------------------------------------------------------------------
 
-def _object_table() -> Dict[int, Any]:
+def _object_table() -> dict[int, Any]:
     """``pyrogram.raw.all.objects``: constructor id -> class.
 
     The table is the distribution's own registry (``pyrogram/raw/all.py``,
@@ -236,7 +238,7 @@ def _message_key(name: str) -> str:
     )
 
 
-def _type_entry(type_name: str) -> Tuple[Optional[str], Dict[str, Any]]:
+def _type_entry(type_name: str) -> tuple[Optional[str], dict[str, Any]]:
     """``(object key, spec)`` for an object type; key is None for a union."""
     objects = core.PASSKEY_TL_SPEC["objects"]
     unions = core.PASSKEY_TL_SPEC["unions"]
@@ -367,7 +369,7 @@ def _build_object(type_name: str, value: Any, *, what: str) -> Any:
     return cls(**_kwargs_for(spec, fields, what=what))
 
 
-def _flags_word(spec: Dict[str, Any], fields: Dict[str, Any]) -> int:
+def _flags_word(spec: dict[str, Any], fields: dict[str, Any]) -> int:
     """The ``flags`` word a construct would carry (core's rule, mirrored)."""
     flags = 0
     for bit, driver in (spec.get("flag_bits") or {}).items():
@@ -377,8 +379,8 @@ def _flags_word(spec: Dict[str, Any], fields: Dict[str, Any]) -> int:
 
 
 def _kwargs_for(
-    spec: Dict[str, Any], fields: Dict[str, Any], *, what: str
-) -> Dict[str, Any]:
+    spec: dict[str, Any], fields: dict[str, Any], *, what: str
+) -> dict[str, Any]:
     """Convert a spec field dict into the generated class's keyword arguments.
 
     Both Pyrogram and Telethon derive the ``flags`` word from field presence,
@@ -397,7 +399,7 @@ def _kwargs_for(
             f"{what}: unknown field(s) {unknown}; expected {declared}"
         )
     flags = _flags_word(spec, fields)
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     for field in field_specs:
         name, type_name = field["name"], field["type"]
         if type_name == "flags":
@@ -421,7 +423,7 @@ def _kwargs_for(
     return kwargs
 
 
-def build_request(name: str, fields: Optional[Dict[str, Any]] = None) -> Any:
+def build_request(name: str, fields: Optional[dict[str, Any]] = None) -> Any:
     """The distribution's generated request object for a passkey message.
 
     This is the whole field-dict → ``raw`` class conversion, exposed because
@@ -485,7 +487,7 @@ def _options_json(key: str, response: Any) -> str:
     return data
 
 
-def _passkey_list(key: str, response: Any) -> List[Any]:
+def _passkey_list(key: str, response: Any) -> list[Any]:
     if isinstance(response, (list, tuple)):
         return list(response)
     items = getattr(response, "passkeys", None)
@@ -668,12 +670,12 @@ class PyrogramInvoker:
                 f"got {type(client).__name__}"
             )
         self.client = client
-        self.sent: List[Any] = []
+        self.sent: list[Any] = []
         """Every request object this invoker sent, in order (audit/debug)."""
         self.last_finish_response: Any = None
         """The framework's auth.Authorization answer to ``finishPasskeyLogin``."""
 
-    async def native(self, name: str, fields: Optional[Dict[str, Any]] = None) -> Any:
+    async def native(self, name: str, fields: Optional[dict[str, Any]] = None) -> Any:
         """Send one passkey message and return the normalized result."""
         key = _message_key(name)
         request = build_request(key, fields)
@@ -733,112 +735,14 @@ def _auth_key_id(session: Any) -> Optional[int]:
     return core.to_signed_int64(unsigned, what="connection_auth_key_id")
 
 
-def _require_session(client: Any) -> Any:
-    """The client's current session, or a PasskeyError about connect()."""
-    session = getattr(client, "session", None)
-    if session is None:
-        raise core.PasskeyError(
-            "the client has no session yet: await client.connect() first "
-            "(client.start() is interactive and must not be used for a "
-            "passkey login)"
-        )
-    return session
-
-
-async def _dc_option(client: Any, dc_id: int) -> Any:
-    getter = getattr(client, "get_dc_option", None)
-    if not callable(getter):
-        raise core.PasskeyError(
-            f"{_distribution()} has no Client.get_session/get_dc_option, so a "
-            "cross-DC passkey login cannot be completed with it (pyrofork "
-            "builds sessions by hand); use kurigram >= 2.2.26, or connect a "
-            "client that is already on the account's home DC"
-        )
-    ipv6 = bool(getattr(client, "ipv6", False))
-    try:
-        return await getter(dc_id, ipv6=ipv6)
-    except TypeError:  # nocov - a fork whose get_dc_option takes no ipv6
-        return await getter(dc_id)
-
-
-async def _switch_dc(client: Any, dc_id: int) -> Dict[str, Any]:
-    """Move the client to ``dc_id`` with a fresh, unauthorized auth key.
-
-    This is kurigram's own QR-login migration (``pyrogram/qrlogin.py``):
-    ``get_session(..., export_authorization=False, temporary=True)`` creates
-    a *new* auth key on the target DC, then the session is swapped and the
-    storage updated.  ``client.set_dc()`` is not usable here — it keeps the
-    old auth key, and the passkey challenge is bound to the connection named
-    in ``from_dc_id``/``from_auth_key_id``, not to the destination.
-
-    Returns the snapshot :func:`_restore_dc` needs.
-    """
-    getter = getattr(client, "get_session", None)
-    if not callable(getter):
-        raise core.PasskeyError(
-            f"{_distribution()} has no Client.get_session, so the client "
-            "cannot move to the account's home DC; use kurigram >= 2.2.26 "
-            "(pyrofork would need a hand-built Session + Auth.create)"
-        )
-    option = await _dc_option(client, dc_id)
-    old_session = _require_session(client)
-    snapshot = {
-        "session": old_session,
-        "dc_id": await client.storage.dc_id(),
-        "server_address": await client.storage.server_address(),
-        "port": await client.storage.port(),
-        "auth_key": await client.storage.auth_key(),
-    }
-    new_session = await getter(
-        dc_id=dc_id,
-        server_address=option.ip_address,
-        port=option.port,
-        export_authorization=False,
-        temporary=True,
-    )
-    client.session = new_session
-    await client.storage.dc_id(dc_id)
-    await client.storage.server_address(option.ip_address)
-    await client.storage.port(option.port)
-    await client.storage.auth_key(_auth_key_bytes(new_session))
-    stop = getattr(old_session, "stop", None)
-    if callable(stop):
-        try:
-            await stop()
-        except Exception:  # nocov - a session that dislikes being closed
-            pass
-    return snapshot
-
-
-async def _restore_dc(client: Any, snapshot: Dict[str, Any]) -> None:
-    """Put the client back where it was after a failed login.
-
-    Best effort by design: the login error is what the caller needs to see,
-    so a restore that also fails is swallowed (the client is left on the
-    home DC, unauthorized — the same state a failed passkey login leaves in
-    any client).
-    """
-    current = getattr(client, "session", None)
-    stop = getattr(current, "stop", None)
-    if callable(stop):
-        try:
-            await stop()
-        except Exception:  # nocov
-            pass
-    client.session = snapshot["session"]
-    start = getattr(snapshot["session"], "start", None)
-    if callable(start):
-        try:
-            await start()
-        except Exception:  # nocov
-            pass
-    for name in ("dc_id", "server_address", "port", "auth_key"):
-        accessor = getattr(client.storage, name, None)
-        if callable(accessor):
-            try:
-                await accessor(snapshot[name])
-            except Exception:  # nocov
-                pass
+# _require_session / _dc_option / _switch_dc / _restore_dc moved to
+# tgmint.dcswitch (shared verbatim with the QR-login driver, which performs
+# the same kurigram-recipe migration); these spellings keep this module's
+# internal imports and the tests that call them by name working unchanged.
+_require_session = dcswitch._require_session
+_dc_option = dcswitch._dc_option
+_switch_dc = dcswitch.switch_dc
+_restore_dc = dcswitch.restore_dc
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +768,7 @@ async def register_passkey(
     origin: str = core.DEFAULT_ORIGIN,
     name: str = core.DEFAULT_PASSKEY_NAME,
     alg: Optional[int] = None,
-) -> Tuple[core.PasskeyInfo, core.PasskeyStore]:
+) -> tuple[core.PasskeyInfo, core.PasskeyStore]:
     """Register a new passkey on the account this client is logged into.
 
     Mirrors :func:`tgmint.passkeys.register_passkey`: fetch the registration
@@ -956,7 +860,7 @@ async def login_with_passkey(
         snapshot = await _switch_dc(client, plan["switch_to_dc"])
 
     try:
-        result = await core.finish_login(invoker, plan["finish_fields"])
+        result = await core.finish_login(invoker, plan["finish_fields"], store=store)
     except core.TwoFactorRequired:
         if password is None:
             # nothing can be finished without the password: restore the
@@ -970,17 +874,22 @@ async def login_with_passkey(
         # check_password finishes the login and does the same storage
         # bookkeeping, then parses the user — on the home-DC session, so the
         # switch is intentionally kept for the password step
-        return await client.check_password(password)
+        me = await client.check_password(password)
+        core.check_finish_identity(store, user_id=getattr(me, "id", None))
+        return me
     except BaseException:
         if snapshot is not None:
             await _restore_dc(client, snapshot)
         raise
 
-    return await _complete_login(client, invoker, result)
+    return await _complete_login(client, invoker, result, store)
 
 
 async def _complete_login(
-    client: Any, invoker: PyrogramInvoker, result: core.AuthorizationResult
+    client: Any,
+    invoker: PyrogramInvoker,
+    result: core.AuthorizationResult,
+    store: core.PasskeyStore,
 ):
     """Post-login bookkeeping (the three lines kurigram's sign_in.py uses)."""
     if result.sign_up_required:
@@ -1000,6 +909,10 @@ async def _complete_login(
         raise core.PasskeyError(
             f"the authorization user has no usable id ({user_id!r})"
         )
+    # account-mixup guard: the framework's own parse is authoritative here
+    # (the neutral parser may not know the layer's User constructor), and the
+    # check must land before the storage is written.
+    core.check_finish_identity(store, result, user_id=user_id)
     await client.storage.user_id(user_id)
     await client.storage.is_bot(False)
     me = await pyrogram_types.User._parse(client, user)
@@ -1011,7 +924,7 @@ async def _complete_login(
     return me
 
 
-async def list_passkeys(client: Any) -> List[core.PasskeyInfo]:
+async def list_passkeys(client: Any) -> list[core.PasskeyInfo]:
     """Passkeys currently registered on the logged-in account.
 
     Own account only: the server answers for the account the client is

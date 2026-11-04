@@ -4,9 +4,9 @@ This example will show you how to use Telethon with official APIs.
 ## Preparing
 - We need to import these things:
     ```python
-    from opentele.td import TDesktop
-    from opentele.tl import TelegramClient
-    from opentele.api import API, UseCurrentSession, CreateNewSession
+    from tgmint.td import TDesktop
+    from tgmint.tl import TelegramClient
+    from tgmint.api import API, UseCurrentSession, CreateNewSession
     import asyncio
     ```
 - And we need to put the main code inside an async function:
@@ -65,9 +65,9 @@ This example will show you how to use Telethon with official APIs.
 
 ## Final result example
 ```python
-from opentele.td import TDesktop
-from opentele.tl import TelegramClient
-from opentele.api import API, UseCurrentSession
+from tgmint.td import TDesktop
+from tgmint.tl import TelegramClient
+from tgmint.api import API, UseCurrentSession
 import asyncio
 
 async def main():
@@ -139,10 +139,10 @@ Not using unique_id
     {'device_model': 'Huawei HUAWEI Y625-U32', 'system_version': 'SDK 25'}
 ```
 
-[APIDATA]: https://opentele.readthedocs.io/en/latest/documentation/authorization/api/#class-apidata
-[AndroidAPI]: https://opentele.readthedocs.io/en/latest/documentation/authorization/api/#class-telegramandroid
-[DesktopdAPI]: https://opentele.readthedocs.io/en/latest/documentation/authorization/api/#class-telegramdesktop
-[APITemplates]: https://opentele.readthedocs.io/en/latest/documentation/authorization/api/#class-api
-[APIGenerate]: https://opentele.readthedocs.io/en/latest/documentation/authorization/api/#generate
-[TelegramClient]: https://opentele.readthedocs.io/en/latest/documentation/telethon/telegramclient/#class-telegramclient
-[TDesktop]: https://opentele.readthedocs.io/en/latest/documentation/telegram-desktop/tdesktop/#class-tdesktop
+[APIDATA]: ../reference/api.md#tgmint.api.APIData
+[AndroidAPI]: ../reference/api.md
+[DesktopdAPI]: ../reference/api.md
+[APITemplates]: ../reference/api.md
+[APIGenerate]: ../reference/api.md
+[TelegramClient]: ../reference/tl.md
+[TDesktop]: ../reference/td.md

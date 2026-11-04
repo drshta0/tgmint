@@ -271,3 +271,101 @@ class TestNoDuplicates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: Board identifiers Apple lists as macOS 26 (Tahoe) compatible —
+#: https://support.apple.com/en-us/122867 — i.e. every Apple-Silicon Mac
+#: plus the four Intel holdovers 26 still supports. The per-identifier table
+#: must cap exactly these at major 26 and nothing else (review finding #53).
+MACOS_26_IDENTIFIERS = {
+    # Apple Silicon
+    "MacBookAir10,1",  # MacBook Air (M1, 2020)
+    "MacBookPro17,1",  # MacBook Pro (13-inch, M1, 2020)
+    "MacBookPro18,1",  # MacBook Pro (14-inch, M1 Pro, 2021)
+    "MacBookPro18,2",
+    "MacBookPro18,3",  # MacBook Pro (16-inch, M1 Pro/Max, 2021)
+    "MacBookPro18,4",
+    "iMac21,1",  # iMac (24-inch, M1, 2021)
+    "iMac21,2",
+    "Macmini9,1",  # Mac mini (M1, 2020)
+    "MacStudio1,1",  # Mac Studio (2022)
+    "MacStudio1,2",
+    # Intel holdovers (26 is the last macOS with Intel support)
+    "MacBookPro16,1",  # MacBook Pro (16-inch, 2019)
+    "MacBookPro16,2",  # MacBook Pro (13-inch, 2020, four ports)
+    "MacBookPro16,4",  # MacBook Pro (16-inch, 2019, 5600M SKU)
+    "iMac20,1",  # iMac (27-inch, 2020)
+    "iMac20,2",
+    "MacPro7,1",  # Mac Pro (2019)
+}
+
+
+class TestMacOSCapConsistency(unittest.TestCase):
+    """The mac version ceiling is one rule, not a per-entry guess (#53)."""
+
+    def test_only_tahoe_supported_identifiers_cap_at_26(self):
+        capped = {
+            identifier
+            for identifier, (_min_ver, max_ver, _arch) in macOSDevice._IDENTIFIER_INFO.items()
+            if max_ver[0] == 26
+        }
+        self.assertEqual(capped, MACOS_26_IDENTIFIERS)
+
+    def test_every_apple_silicon_identifier_runs_macos_26(self):
+        # Apple ships 26 on every Apple-Silicon Mac — an arm64 row capped at
+        # 15 was the inconsistency #53 reported (the 2020 M1 machines)
+        for identifier, (_min_ver, max_ver, arch) in macOSDevice._IDENTIFIER_INFO.items():
+            if arch != "arm64":
+                continue
+            with self.subTest(identifier=identifier):
+                self.assertEqual(max_ver[0], 26)
+
+    def test_the_m1_2020_machines_get_26_rows(self):
+        macOSDevice.__gen__()
+        rows = {(info.model, info.version, info.suffix) for info in macOSDevice.deviceList}
+        for model in ("MacBook Air", "MacBook Pro", "iMac", "Mac mini"):
+            with self.subTest(model=model):
+                got = {version for name, version, _suffix in rows if name == model}
+                self.assertTrue(
+                    any(version.startswith("macOS 26.") for version in got),
+                    f"{model} has no macOS 26 row: {sorted(got)}",
+                )
+
+
+class TestSystemVersionsDeclaration(unittest.TestCase):
+    """No dead base default: every pool declares its own list (#47)."""
+
+    def test_the_base_class_has_no_system_versions(self):
+        from tgmint.devices import GeneralDesktopDevice, SystemInfo
+
+        # the base default was inherited-but-never-read; a pool that forgets
+        # its own list must fail loudly instead of generating nothing
+        self.assertNotIn("system_versions", SystemInfo.__dict__)
+        self.assertNotIn("system_versions", GeneralDesktopDevice.__dict__)
+
+    def test_every_concrete_pool_declares_its_own_list(self):
+        for pool in (WindowsDevice, LinuxDevice, macOSDevice, AndroidDevice, iOSDeivce):
+            with self.subTest(pool=pool.__name__):
+                self.assertIn("system_versions", pool.__dict__)
+
+
+class TestDesktopBoardStringAgreement(unittest.TestCase):
+    """Windows and Linux pools must agree on the wire board string (#58)."""
+
+    def setUp(self):
+        WindowsDevice.__gen__()
+        LinuxDevice.__gen__()
+
+    def test_the_two_desktop_pools_emit_the_same_model_set(self):
+        windows = {info.model for info in WindowsDevice.deviceList}
+        linux = {info.model for info in LinuxDevice.deviceList}
+        self.assertTrue(windows)
+        self.assertEqual(windows, linux)
+
+    def test_no_pool_model_keeps_an_underscore(self):
+        # tdesktop drops the underscores the SMBIOS product name carries
+        # ("Z97_A" is reported as "Z97A"); Linux used to keep them
+        for pool in (WindowsDevice, LinuxDevice):
+            junk = [info.model for info in pool.deviceList if "_" in info.model]
+            with self.subTest(pool=pool.__name__):
+                self.assertEqual(junk, [])

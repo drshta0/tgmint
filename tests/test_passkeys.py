@@ -16,7 +16,6 @@ import unittest
 from tgmint.passkeys import (
     ALG_ED25519,
     ALG_ES256,
-    CreatedCredential,
     DeletePasskeyRequest,
     FinishPasskeyLoginRequest,
     GetPasskeysRequest,
@@ -30,7 +29,6 @@ from tgmint.passkeys import (
     RegisterPasskeyRequest,
     SoftwareAuthenticator,
     _DataJSONObject,
-    _b64u_decode,
     _b64u_encode,
     _cbor_encode,
     login_with_passkey,
@@ -109,7 +107,6 @@ def parse_auth_data(auth_data: bytes):
     rest = auth_data[37:]
     credential_id = cose = None
     if flags & 0x40:
-        aaguid = rest[:16]
         (cred_len,) = struct.unpack_from(">H", rest, 16)
         credential_id = rest[18:18 + cred_len]
         cose, _ = _cbor_item(rest, 18 + cred_len)
@@ -127,7 +124,6 @@ def cose_to_public_key(cose: dict):
             ec.SECP256R1(),
         ).public_key()
     if alg == ALG_ED25519:
-        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import ed25519
 
         return ed25519.Ed25519PublicKey.from_public_bytes(cose[-1])
@@ -844,3 +840,119 @@ class TestRegisterPasskeyApiDrift(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _AuthorizingClient(_SwitchableClient):
+    """A fake client whose passkey login SUCCEEDS with a chosen user id."""
+
+    def __init__(self, session, login_options_json, user_id):
+        super().__init__(session, login_options_json, None)
+        self.answer_user_id = user_id
+        self.logged_in = []
+
+    async def __call__(self, request):
+        from telethon.tl import types as tl_types
+
+        if isinstance(request, InitPasskeyLoginRequest):
+            return (
+                struct.pack("<I", 0xE2037789)
+                + struct.pack("<I", 0x7D748D04)
+                + TLObject.serialize_bytes(self.login_options_json)
+            )
+        assert isinstance(request, FinishPasskeyLoginRequest), request
+        if self.finish_error is not None:
+            raise self.finish_error
+        user = tl_types.User(id=self.answer_user_id, access_hash=0, is_self=True)
+        return tl_types.auth.Authorization(user=user)
+
+    async def _on_login(self, user):
+        self.logged_in.append(user)
+        return user
+
+
+class TestFinishIdentityGuard(unittest.TestCase):
+    """#61: the finish response must name the account the store belongs to.
+
+    The user handle is ``"<dc>:<user_id>"`` and it is what the assertion was
+    signed for, but nothing compared it to the account the server logged in:
+    a swapped credential or a store file copied from another account would
+    have written one account's session from another account's passkey.
+    """
+
+    def _store(self, tmpdir, user_id=123456789, home_dc=2):
+        options = json.loads(REG_OPTIONS)
+        options["user"]["id"] = _b64u_encode(f"{home_dc}:{user_id}".encode())
+        cred = SoftwareAuthenticator.create_credential(json.dumps(options), alg=ALG_ES256)
+        store = PasskeyStore.from_credential(cred, path=os.path.join(tmpdir, "k.json"))
+        store.save()
+        return store
+
+    def _client(self, store, answer_user_id, home_dc=2):
+        session = _FakeSession(home_dc, "149.154.167.51", 443, _FakeAuthKey(b"\x7f" * 256, 7))
+        return _AuthorizingClient(
+            session,
+            login_options(os.urandom(32), _b64u_encode(store.credential_id)),
+            answer_user_id,
+        )
+
+    def test_a_login_answering_another_account_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            client = self._client(store, answer_user_id=987654321)
+            with self.assertRaises(PasskeyError) as ctx:
+                asyncio.run(login_with_passkey(client, path=store.path))
+            message = str(ctx.exception)
+            self.assertIn("123456789", message)  # the store's account
+            self.assertIn("987654321", message)  # the account the server named
+            self.assertIn("passkey belongs to user", message)
+            # nothing was written into the session: _on_login never ran
+            self.assertEqual(client.logged_in, [])
+
+    def test_a_login_answering_the_same_account_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+            client = self._client(store, answer_user_id=123456789)
+            me = asyncio.run(login_with_passkey(client, path=store.path))
+            self.assertEqual(getattr(me, "id", None), 123456789)
+            self.assertEqual(len(client.logged_in), 1)
+
+    def test_the_guard_also_runs_on_the_two_factor_password_path(self):
+        # review finding #61 covers the password branch too: sign_in
+        # finishes the login there, so its user is the id to check
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp, user_id=123456789)
+
+            class Client(_AuthorizingClient):
+                async def sign_in(self, password=None):
+                    from telethon.tl import types as tl_types
+
+                    self.signed_in.append(password)
+                    return tl_types.User(id=555000111, access_hash=0, is_self=True)
+
+            client = Client(
+                _FakeSession(2, "149.154.167.51", 443, _FakeAuthKey(b"\x7f" * 256, 7)),
+                login_options(os.urandom(32), _b64u_encode(store.credential_id)),
+                123456789,
+            )
+            # the first pass asked for a password: the neutral 2FA signal
+            client.finish_error = _two_factor_error()
+            with self.assertRaises(_two_factor_required()):
+                asyncio.run(login_with_passkey(client, path=store.path))
+
+            # ... and the retry (still 2FA-gated) finishes with a DIFFERENT
+            # account than the store's
+            with self.assertRaises(PasskeyError) as ctx:
+                asyncio.run(login_with_passkey(client, path=store.path, password="pw"))
+            self.assertIn("555000111", str(ctx.exception))
+
+
+def _two_factor_error():
+    from telethon.errors import SessionPasswordNeededError
+
+    return SessionPasswordNeededError(object())
+
+
+def _two_factor_required():
+    from tgmint import passkeys_core as core
+
+    return core.TwoFactorRequired

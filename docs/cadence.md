@@ -88,6 +88,12 @@ Undo with `tgmint.cadence.restore(client)`: the instance attribute goes away (Te
 or the framework value is written back (Pyrogram family). Nothing here ever patches a
 class, a module or a global, so a second client in the same process is unaffected.
 
+`apply()` is idempotent: applying twice — android then desktop, or again after new
+sessions appeared — re-wraps the framework's **own** `send` and `connection_factory`,
+never a wrapper onto a wrapper (a chain would put the *first* platform's delay on the
+wire, because the inner rewrite would undo the outer one). A single `restore()`
+therefore always unwinds to the pre-tgmint state, with no wrapper left installed.
+
 ## This is not ban evasion
 
 Matching a cadence removes **one** signal among many — the device fingerprint, the wire
@@ -127,6 +133,17 @@ hardcodes `disconnect_delay = WAIT_TIMEOUT + 10 = 25`. So after fixing the read 
 | a patient `_recv_from_socket` (2 × interval + 7 s, min 25 s), installed through the client's `connection_factory` so it lands **before** the first read of every connection | removes the framework's own 10 s self-close |
 | a `Session.send` wrapper that rewrites the outgoing `PingDelayDisconnect` to the official 35 s / 60 s | the server enforces it and the worker hardcodes 25 s |
 
+The `Session.send` wrapper resolves `raw.functions.PingDelayDisconnect` from the
+client's **own package** — the top-level package of `type(session).__module__`
+/ `type(client).__module__`, then the `pyrogram` name kurigram, pyrofork and
+vanilla share — so a fork installed under another name gets the rewrite instead
+of an `ImportError` on its first ping. Hydrogram is the one that installs as
+`hydrogram`; its wheel (0.2.0, PyPI, github.com/hydrogram/hydrogram) mirrors
+the layout: `hydrogram/raw/__init__.py` exposes `functions` and
+`raw/functions/__init__.py` re-exports `PingDelayDisconnect`. If nothing
+resolves (a stand-in object that is not a real package), the ping goes out
+unrewritten rather than crashing the worker.
+
 One side effect: the read already in flight when `apply()` is called keeps the old 10 s
 timeout, so the session reconnects **once** right after apply and is stable afterwards
 (verified: 100 s with pings at 19.0-19.1 s on Android, 30 s on desktop, zero further
@@ -138,7 +155,11 @@ reconnects).
   each, the framework defaults against the *installed* packages (a bump that changes its
   own default fails the suite), `apply` against a real `TelegramClient` (instance
   shadowing only, class untouched, `restore` puts it back), fake Pyrogram-family clients
-  (`_session` / `session` / `sessions`), the copied Telethon loop actually driven for
+  (`_session` / `session` / `sessions`), a fake framework package installed under a
+  non-`pyrogram` name (the rewrite resolves from the client's own package), an
+  unresolvable family (ping sent unrewritten, worker not crashed), `apply` → `apply` →
+  `restore` leaving the framework's own `send` / `connection_factory` in place, the
+  copied Telethon loop actually driven for
   several ticks, `dry_run` mutating nothing, the cap arithmetic, and every refusal path
   (unknown platform, undetectable family, an unrecognised Telethon loop, a Pyrogram
   client with no `Session` yet).

@@ -20,6 +20,17 @@ git history — is one `git log` away.
   (MIT) — the session-conversion matrix done right, long before us: the
   reference design for our Telethon / Pyrogram-family / GramJS / tdata
   session codec.
+- **[batreller/AndroidTelePorter](https://github.com/batreller/AndroidTelePorter)**
+  (MIT, on PyPI) — the prior art for reading the official Android app's
+  `tgnet.dat` + `userconfing.xml` as a session source, in Python,
+  before us. Our `android-dir` codec was cross-checked against it and
+  makes no "first" claim; where it parses the `user` blob through
+  Telethon's TL machinery, ours stays stdlib-only.
+- **[DrKLO/Telegram](https://github.com/DrKLO/Telegram)** (GPL-2.0-or-later;
+  source consulted, no code taken) — the official Android client whose
+  `TMessagesProj/jni/tgnet/` serialization defines the `tgnet.dat`
+  format our `android-dir` reader implements; every field cites the
+  file and the pinned commit it was verified against.
 - **[LonamiWebs/Telethon](https://github.com/LonamiWebs/Telethon)** (MIT) —
   the MTProto client everything here runs on, and whose documented internals
   made the scoped `initConnection` override possible.

@@ -1,0 +1,63 @@
+# Release publishing: on tag push v*, build sdist + wheel, twine-check,
+# publish to PyPI with Trusted Publishing. No API tokens, no secrets —
+# the only credential is the OIDC token GitHub mints for this job.
+#
+# One-time setup (repo owner, do this before the first release tag):
+#   1. GitHub repo -> Settings -> Environments -> create "pypi".
+#   2. On pypi.org: Publishing -> "Add a new pending publisher"
+#      (https://pypi.org/manage/account/publishing/) with
+#      owner = drshta0, repository = tgmint,
+#      workflow name = release.yml, environment = pypi.
+#      The first tag publish then creates/claims the tgmint project;
+#      if the name is already registered, use "add publisher" on that
+#      project instead.
+#   3. Tag a release (vX.Y.Z) and push the tag; this workflow does the rest.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

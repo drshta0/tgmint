@@ -3,6 +3,8 @@ from __future__ import annotations
 from .configs import *
 from . import shared as td
 
+import typing
+
 from telethon.network.connection.connection import Connection
 from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions.abstract import Session
@@ -164,12 +166,11 @@ class MapData(BaseObject):  # nocov
             raise TDataReadMapDataFailed("Could not decrypt map data") from e
 
         selfSerialized = QByteArray()
-        draftsMap: typing.Dict[PeerId, FileKey] = {}
-        draftCursorsMap: typing.Dict[PeerId, FileKey] = {}
-        draftsNotReadMap: typing.Dict[PeerId, bool] = {}
+        draftsMap: dict[PeerId, FileKey] = {}
+        draftCursorsMap: dict[PeerId, FileKey] = {}
+        draftsNotReadMap: dict[PeerId, bool] = {}
 
         locationsKey = 0
-        reportSpamStatusesKey = 0
         trustedBotsKey = 0
         recentStickersKeyOld = 0
         installedStickersKey = 0
@@ -196,12 +197,12 @@ class MapData(BaseObject):  # nocov
         roundPlaceholder = 0
         inlineBotsDownloads = 0
         mediaLastPlaybackPositions = 0
-        botStoragesMap: typing.Dict[PeerId, FileKey] = {}
-        botStoragesNotReadMap: typing.Dict[PeerId, bool] = {}
+        botStoragesMap: dict[PeerId, FileKey] = {}
+        botStoragesNotReadMap: dict[PeerId, bool] = {}
         prefsKey = 0
         # the two legacy wallet records (0x1F/0x20) are consumed straight
         # into the instance (see __init__); 0x21 is a map, accumulated here
-        walletEngineStoragesMap: typing.Dict[str, FileKey] = {}
+        walletEngineStoragesMap: dict[str, FileKey] = {}
 
         is_finished = False
 
@@ -239,16 +240,16 @@ class MapData(BaseObject):  # nocov
                 # key + first + second (uint64 each) + size (int32)
                 MapData._checkCount(map.stream, count, 28, "legacy images")
                 for i in range(count):
-                    filekey = map.stream.readUInt64()
-                    first = map.stream.readUInt64()
-                    second = map.stream.readUInt64()
-                    size = map.stream.readInt32()
+                    map.stream.readUInt64()
+                    map.stream.readUInt64()
+                    map.stream.readUInt64()
+                    map.stream.readInt32()
 
             elif keyType == lskType.lskLocations:
                 locationsKey = map.stream.readUInt64()
 
             elif keyType == lskType.lskReportSpamStatusesOld:
-                reportSpamStatusesKey = map.stream.readUInt64()
+                map.stream.readUInt64()
                 # ClearKey(reportSpamStatusesKey, _basePath);
 
             elif keyType == lskType.lskTrustedBots:
@@ -785,15 +786,17 @@ class StorageAccount(BaseObject):  # nocov
 
             self.__config = td.MTP.Config.FromSerialized(serialized)
             return self.__config
-        except OpenTeleException as e:
+        except OpenTeleException:
             pass
 
         return td.MTP.Config(td.MTP.Environment.Production)
 
     def readMapWith(
-        self, localKey: td.AuthKey, legacyPasscode: QByteArray = QByteArray()
+        self, localKey: td.AuthKey, legacyPasscode: QByteArray = None
     ):
         # Intended for internal usage only
+        if legacyPasscode is None:
+            legacyPasscode = QByteArray()
         try:
             self.__mapData.read(localKey, legacyPasscode)
         except OpenTeleException:
@@ -964,8 +967,8 @@ class Account(BaseObject):
         self.__basePath = td.Storage.GetAbsolutePath(basePath)
         self.__keyFile = keyFile if (keyFile != None) else td.TDesktop.kDefaultKeyFile
 
-        self.__mtpKeys: typing.List[td.AuthKey] = []
-        self.__mtpKeysToDestroy: typing.List[td.AuthKey] = []
+        self.__mtpKeys: list[td.AuthKey] = []
+        self.__mtpKeysToDestroy: list[td.AuthKey] = []
         self.api = api
 
         self._local = StorageAccount(
@@ -1083,9 +1086,11 @@ class Account(BaseObject):
         dcId: DcId,
         userId: int,
         mtpKeys: List[td.AuthKey],
-        mtpKeysToDestroy: List[td.AuthKey] = [],
+        mtpKeysToDestroy: List[td.AuthKey] = None,
     ):
         # Intended for internal usage only
+        if mtpKeysToDestroy is None:
+            mtpKeysToDestroy = []
 
         self.__MainDcId = dcId
         self.__UserId = userId
@@ -1122,7 +1127,7 @@ class Account(BaseObject):
             QDataStreamFailed("Could not read main fields from mtp authorization."),
         )
 
-        def readKeys(keys: typing.List[td.AuthKey]):
+        def readKeys(keys: list[td.AuthKey]):
 
             key_count = stream.readInt32()
             Expects(
@@ -1182,10 +1187,10 @@ class Account(BaseObject):
         # Intended for internal usage only
         Expects(self.isLoaded(), "Account data not loaded yet")
 
-        def keysSize(list: typing.List[td.AuthKey]):
+        def keysSize(list: list[td.AuthKey]):
             return 4 + len(list) * (4 + td.AuthKey.kSize)
 
-        def writeKeys(stream: QDataStream, keys: typing.List[td.AuthKey]):
+        def writeKeys(stream: QDataStream, keys: list[td.AuthKey]):
 
             stream.writeInt32(len(keys))
             for key in keys:
@@ -1266,7 +1271,7 @@ class Account(BaseObject):
         api: Union[Type[APIData], APIData] = API.TelegramDesktop,
         password: str = None,
         *,
-        connection: typing.Type[Connection] = ConnectionTcpFull,
+        connection: type[Connection] = ConnectionTcpFull,
         use_ipv6: bool = False,
         proxy: Union[tuple, dict] = None,
         local_addr: Union[str, tuple] = None,

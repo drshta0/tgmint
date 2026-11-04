@@ -90,7 +90,7 @@ class SessionData(typing.NamedTuple):
     test_mode: bool = False
     api_id: typing.Optional[int] = None
 
-    def validated(self) -> "SessionData":
+    def validated(self) -> SessionData:
         """Validate invariants and return ``self`` (chainable)."""
         validate(self.dc_id, self.auth_key, self.user_id)
         return self
@@ -127,7 +127,7 @@ def decode_b64(value: str, *, max_len: int = 512) -> bytes:
         raise CodecError("Invalid session string encoding") from None
 
 
-def read_sqlite_row(path: typing.Union[str, Path], required: typing.Set[str]) -> typing.Dict[str, typing.Any]:
+def read_sqlite_row(path: typing.Union[str, Path], required: set[str]) -> dict[str, typing.Any]:
     """Read exactly one authorization row from a ``sessions`` table, read-only.
 
     The source file is never modified (opened through a ``mode=ro`` URI) and
