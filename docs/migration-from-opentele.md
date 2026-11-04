@@ -113,7 +113,7 @@ the session file itself: never commit them, never share them.
 
 ## Getting help
 
-- Framework support matrix: [frameworks.md](frameworks.md)
+- Framework support matrix: [Frameworks](frameworks/index.md)
 - What changed and why: [FORK.md](https://github.com/drshta0/tgmint/blob/main/FORK.md),
   [CHANGELOG.md](https://github.com/drshta0/tgmint/blob/main/CHANGELOG.md)
 - Found a migration case this page misses? Open an

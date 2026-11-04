@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/tgmint/"><img alt="PyPI" src="https://img.shields.io/pypi/v/tgmint?color=0f766e&label=pypi"></a>
-  <a href="https://pypi.org/project/tgmint/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/tgmint?color=0f766e&label=pypi"></a>
+  <a href="https://pypi.org/project/tgmint/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/tgmint?color=0f766e&label=python"></a>
   <a href="https://github.com/drshta0/tgmint/actions/workflows/package.yml"><img alt="tests" src="https://github.com/drshta0/tgmint/actions/workflows/package.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-0f766e"></a>
 </p>
@@ -61,7 +61,7 @@ Also included: QR-code login, one-file encrypted account backups, automatic repa
 
 ## Docs
 
-**[Getting started](docs/getting-started.md)** · [How it works](docs/concepts.md) · [Passkeys](docs/passkeys.md) · [CLI](docs/cli.md) · [API reference](docs/reference/index.md) · [Supported libraries](docs/frameworks.md)
+**[Getting started](docs/getting-started.md)** · [How it works](docs/concepts.md) · [Passkeys](docs/passkeys.md) · [CLI](docs/cli.md) · [API reference](docs/reference/index.md) · [Supported libraries](docs/frameworks/index.md)
 
 ## Responsible use
 

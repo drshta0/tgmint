@@ -1,173 +1,133 @@
-# tgmint passkeys — log into Telegram without the phone number
+# Passkeys
 
-`tgmint.passkeys` — register a passkey on any account you have a session
-for, then log back in later with **just the passkey file**. No phone, no
-SMS, no OTP, no tdata. The private key is generated on your machine and
-never leaves it; Telegram only sees a public key and WebAuthn signatures,
-exactly like a password manager or hardware key would produce.
+Register a passkey on your account once. After that you can log in with
+just the passkey file: no phone number, no SMS code. The private key is
+created on your machine and never leaves it.
 
-Verified working live (two real accounts, full end-to-end).
-
-## Which frameworks can use passkeys
-
-The data and ceremony layer lives in `tgmint.passkeys_core`: it has no
-Telethon imports and is driven through one small invoker contract, so each
-framework only supplies TL plumbing. What each one gets today:
-
-| Framework | Passkeys | How |
-|---|---|---|
-| Telethon | Full | `tgmint.passkeys` (`register_passkey`, `login_with_passkey`, same API as before) |
-| Pyrogram family: kurigram | Full, including cross-DC logins | `tgmint.passkeys_pyrogram`, native. Needs kurigram >= 2.2 (TL layer 229), which ships all fourteen passkey constructors |
-| Pyrogram family: pyrofork | Partial: register, list, delete and same-DC login | `tgmint.passkeys_pyrogram`; pyrofork has no cross-DC session move, so a login whose home DC differs raises an error that says so |
-| Pyrogram family: hydrogram | Unsupported | hydrogram 0.2.0 is TL layer 181 and does not ship the passkey constructors; the driver reports that instead of failing obscurely |
-| Any other framework (GramJS/Node, tdata, Go, Rust, ...) | Bridged through the CLI | `login-passkey` in (network, once), `convert` out (offline) |
-| Bot API | Never | a different protocol with no MTProto surface, so there is nothing to present a passkey to |
-
-The bridge is what makes a passkey-created session usable everywhere. The
-`login-passkey` command logs in with only the passkey file over the network,
-then writes the session in any codec format; the conversion step is offline.
-The client is built from a minted fingerprint, so the session it creates
-carries a real device identity rather than a default one.
-
-```sh
-# passkey in, session out in any format (offline conversion after one login)
-python -m tgmint login-passkey --passkey acc1.passkey.json --preset android \
-    --to out.session --to-format gramjs-string
+```bash
+pip install "tgmint[passkeys]"
 ```
 
-For the Pyrogram family the driver is native, so no bridge is needed:
+!!! warning "The file is the login"
+    Anyone with the passkey file (plus your 2FA password, if you have one)
+    can log in. Back it up, never commit it, never share it.
 
-```python
-from pyrogram import Client
+## Which libraries support it
 
-from tgmint.adapters.pyrogram import client_kwargs
-from tgmint.api import API
-from tgmint.fingerprint import Fingerprint
-from tgmint.passkeys_pyrogram import login_with_passkey, register_passkey
+| Library | Support |
+|---|---|
+| Telethon | full |
+| kurigram ≥ 2.2 | full |
+| pyrofork | works, except when the account lives on a different data center than the one you connect to |
+| Pyrogram 2.0, Hydrogram | no (too old); use the CLI below and convert |
+| GramJS, MadelineProto, anything else | through the CLI |
+| Bot API | never; bots don't have passkeys |
 
-fp = Fingerprint.from_apidata(API.TelegramAndroid.Generate())
+## 1. Register
 
-# once: an already authorized client registers the passkey
-creator = Client("acct", **client_kwargs(fp), in_memory=True)
-await creator.connect()
-info, store = await register_passkey(creator, path="acc1.passkey.json")
-await creator.disconnect()
+You need a session that's already logged in and **at least about 24 hours
+old**. Telegram refuses passkey registration from a fresh login.
 
-# later: a fresh connected client, not authorized, plus only the file
-client = Client("acc1", **client_kwargs(fp), in_memory=True)
-await client.connect()                    # connected, NOT started
-me = await login_with_passkey(client, path="acc1.passkey.json")
-await client.storage.save()               # the framework owns its storage
+=== "Telethon"
+
+    ```python
+    from tgmint.passkeys import register_passkey
+
+    info, store = await register_passkey(client, path="me.passkey")
+    print(info.id, info.created_on)
+    ```
+
+=== "kurigram / pyrofork"
+
+    ```python
+    from tgmint.passkeys_pyrogram import register_passkey
+
+    await app.connect()
+    info, store = await register_passkey(app, path="me.passkey")
+    ```
+
+The passkey now shows up in *Settings → Privacy and Security → Passkeys*.
+An account can hold at most 5, and every call creates a new one, so
+register once and reuse the file.
+
+## 2. Log in with the file
+
+Use a fresh client that is connected but **not** started (`start()` would
+ask for a phone number).
+
+=== "Telethon"
+
+    ```python
+    from tgmint.api import API
+    from tgmint.tl import TelegramClient
+    from tgmint.passkeys import login_with_passkey
+
+    client = TelegramClient("new.session", api=API.TelegramAndroid.Generate())
+    await client.connect()
+    me = await login_with_passkey(client, path="me.passkey")
+    ```
+
+=== "kurigram / pyrofork"
+
+    ```python
+    from pyrogram import Client
+    from tgmint.api import API
+    from tgmint.adapters.pyrogram import client_kwargs
+    from tgmint.passkeys_pyrogram import login_with_passkey
+
+    app = Client("new", **client_kwargs(API.TelegramAndroid.Generate()))
+    await app.connect()
+    me = await login_with_passkey(app, path="me.passkey")
+    await app.storage.save()
+    ```
+
+=== "CLI (any library)"
+
+    ```bash
+    tgmint login-passkey --passkey me.passkey --preset android \
+                         --to me.gramjs --to-format gramjs-string
+    ```
+
+    `--to-format` can be any session format tgmint writes.
+
+If the account has a 2FA password, pass `password="..."`. The passkey
+replaces the SMS code, not the password.
+
+## 3. Bring a dead session back
+
+If Telegram has logged a session out, `heal` logs it back in with the
+passkey and rewrites the file in place:
+
+```bash
+tgmint heal me.session --passkey me.passkey --live    # checks first, leaves a working session alone
+tgmint heal me.session --passkey me.passkey --force   # skips the check
 ```
 
-Use `client.connect()`, never `client.start()`: start is interactive and
-prompts for a phone number, which is exactly what a passkey login avoids.
+It reuses the session's saved identity, so the account sees the same
+device as before. It refuses a passkey that belongs to a different account.
 
-**Own account only.** Registration needs a session you are already logged
-into and login needs the passkey file you created there. tgmint never
-registers a passkey on somebody else's account and never enables passkey
-login for an account you cannot already access. Whoever holds the file (plus
-the 2FA password, if one is set) can log in, so treat it like a password.
+To keep everything for one account in one file, seal a profile:
 
----
-
-## Install
-
-```pip
-pip install cryptography        # or: pip install tgmint[passkeys]
+```bash
+export TGMINT_PASS='...'
+tgmint profile seal --session me.session --from-format telethon-session \
+                    --passkey me.passkey --passphrase-env TGMINT_PASS --out me.tgmint
+tgmint heal me.tgmint --passkey me.passkey --passphrase-env TGMINT_PASS --live
 ```
 
-## Usage
-
-### 1. Register — while you still have ANY authorized session
-
-```python
-from tgmint.passkeys import register_passkey
-
-info, store = await register_passkey(client, path="acc1.passkey.json")
-print(info.id, info.created_on)
-```
-
-`client` = any connected client authorized for the account (from tdata,
-an existing .session, whatever). The account now shows a new passkey in
-Settings → Privacy & Security → Passkeys, and `acc1.passkey.json`
-(chmod 600) is the credential.
-
-The session has to be at least about 24 hours old. Telegram refuses
-sensitive account changes, registering a passkey among them, from a
-session that has just logged in. Register from a session you've had for
-a day or more, or wait 24 hours after a fresh login.
-
-### 2. Log in later — with NOTHING but the file
-
-```python
-from tgmint.api import API
-from tgmint.tl import TelegramClient
-from tgmint.passkeys import login_with_passkey
-
-client = TelegramClient("recovered.session", api=API.TelegramAndroid.Generate())
-await client.connect()                    # connected, NOT authorized
-me = await login_with_passkey(client, path="acc1.passkey.json")
-# "recovered.session" is now a fully authorized session
-```
-
-No phone number involved anywhere. If the account has a 2FA cloud
-password, pass `password="..."` (the passkey replaces the OTP, not the
-password — by design).
-
-### 3. Recover a dead session (and keep the passkey with it)
-
-A session the server has logged out cannot be repaired locally - which is
-exactly when the passkey pays off. `heal` repairs ONE session you own:
-
-```sh
-# probe first; an alive session is left untouched
-python -m tgmint heal myaccount.session --passkey acc1.passkey.json --live
-
-# no probe, re-login anyway (e.g. you know the session is gone)
-python -m tgmint heal myaccount.session --passkey acc1.passkey.json --force
-```
-
-It reads the session (any codec format), probes it with a single `get_me`,
-and when the server rejects the auth key it signs back in with the passkey
-on a client minted from the session's *recorded* fingerprint (a sidecar, or
-the fingerprint inside a `.tgmint` envelope, else a freshly minted identity)
-and rewrites the session file in place, atomically, in the same format. It
-refuses when the passkey belongs to a different account than the session, and
-there is deliberately no batch mode: one account, one session, per
-invocation.
-
-To make that pairing portable in the first place, put the session, its
-fingerprint and the passkey into one envelope:
-
-```sh
-# needs the passkeys extra only to SEAL (cryptography)
-TGMINT_PASS='...' python -m tgmint profile seal \
-    --session myaccount.session --from-format telethon-session \
-    --passkey acc1.passkey.json --passphrase-env TGMINT_PASS \
-    --out myaccount.tgmint
-
-python -m tgmint profile inspect myaccount.tgmint          # no secrets, no passphrase
-TGMINT_PASS='...' python -m tgmint heal myaccount.tgmint --passkey acc1.passkey.json \
-    --passphrase-env TGMINT_PASS --live
-```
-
-`heal` is verified offline only (fake clients, mocked ceremony, mocked
-probe): the live "the dead session really came back" round trip needs an
-account whose session you can afford to lose.
-
-### 4. Manage
+## 4. List and delete
 
 ```python
 from tgmint.passkeys import list_passkeys, delete_passkey
 
 for pk in await list_passkeys(client):
-    print(pk.id, pk.name, "last used:", pk.last_usage_date)
+    print(pk.id, pk.name, pk.last_usage_date)
 
-await delete_passkey(client, pk.id)   # remove from the account
+await delete_passkey(client, pk.id)
 ```
 
----
+Frozen accounts can't register passkeys, so set one up while the account
+is healthy.
 
 ## How it works
 

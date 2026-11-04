@@ -100,21 +100,23 @@ nav:
   - Home: README.md
   - Getting started: getting-started.md
   - How it works: concepts.md
+  - Frameworks:
+      - frameworks/index.md
+      - Telethon: frameworks/telethon.md
+      - Pyrogram / kurigram / pyrofork: frameworks/pyrogram.md
+      - Hydrogram: frameworks/hydrogram.md
+      - GramJS (Node.js): frameworks/gramjs.md
+      - MadelineProto (PHP): frameworks/madelineproto.md
+      - TDLib: frameworks/tdlib.md
+      - Bot API: frameworks/bot-api.md
   - Guides:
-      - Frameworks: frameworks.md
       - Passkeys: passkeys.md
       - QR login: qr-login.md
       - Android import: android-acquisition.md
       - Startup like the real app: bootstrap.md
       - Ping timing like the real app: cadence.md
-      - Bot API recipes: bot-api.md
-      - Migration from opentele: migration-from-opentele.md
-      - Examples:
-          - examples/README.md
-          - Convert tdata to Telethon: examples/convert-tdata-to-telethon.md
-          - Convert Telethon to tdata: examples/convert-telethon-to-tdata.md
-          - Using official APIs: examples/using-official-apis.md
-  - CLI reference: cli.md
+      - Migrating from opentele: migration-from-opentele.md
+  - CLI: cli.md
   - API reference:
       - reference/index.md
       - Presets & devices: reference/api.md

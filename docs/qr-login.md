@@ -1,11 +1,10 @@
-# QR login — `tgmint login-qr`
+# QR login
 
-Acquire a Telegram session by showing a `tg://login` QR code and confirming
-it from **your own** logged-in Telegram app (*Settings → Devices → Link
-Desktop Device*). The new session is born with a minted official-client
-fingerprint and can be written in any format tgmint converts to. Single
-account, interactive, own-device only — there is no batch mode and there
-will not be one.
+Get a new session by scanning a QR code with the Telegram app on your
+phone (*Settings → Devices → Link Desktop Device*). The new session gets an
+official app identity and can be saved in any format tgmint writes.
+
+## From the command line
 
 ```console
 $ tgmint login-qr --to me.session --to-format telethon-session
@@ -16,19 +15,55 @@ Scan with the Telegram app on your phone:
 ▄▄▄▄▄▄▄█ ▀▀ ▄▀▄█▀▀▀█ ▀█▀▀█ ▀▄█▀
 █ ▀▀▀ █ ▀█▄▄▀▄▀█ ▀▄▄▀ ▄█▀▄ ▀▄█ █
 …
-(valid for 900s; a fresh code follows expiry)
 logged in with the scanned QR (user_id 424242, dc_id 2)
 wrote me.session (telethon-session)
 ```
 
-`--timeout SECONDS` bounds the overall wait (default 300; an expired code
-is refreshed inside it), `--invert` renders light-on-dark for terminals
-that scan better inverted, `--password 2FA` supplies a cloud password (or
-you are prompted on a terminal), and `--preset/--system/...` mint the
-fingerprint like every other tgmint command. The output path is never
-overwritten.
+| Option | What it does |
+|---|---|
+| `--to-format` | `telethon-session`, `pyrogram-session`, `pyrogram-string`, `gramjs-string`, `tdata`, … |
+| `--preset` | which official app to appear as (`desktop`, `android`, `ios`, …) |
+| `--timeout` | give up after this many seconds (default 300) |
+| `--invert` | light-on-dark QR, for terminals where the default won't scan |
+| `--password` | your 2FA password; you're prompted if it's needed and missing |
 
-## The wire
+The output file is never overwritten.
+
+## From Python
+
+=== "Telethon"
+
+    ```python
+    from tgmint.api import API
+    from tgmint.tl import TelegramClient
+    from tgmint.qrlogin import login_with_qr
+
+    client = TelegramClient("me.session", api=API.TelegramDesktop.Generate())
+    await client.connect()
+    me = await login_with_qr(client, timeout=300)
+    ```
+
+=== "kurigram / pyrofork"
+
+    ```python
+    from pyrogram import Client
+    from tgmint.api import API
+    from tgmint.adapters.pyrogram import client_kwargs
+    from tgmint.qrlogin_pyrogram import login_with_qr
+
+    app = Client("me", **client_kwargs(API.TelegramDesktop.Generate()))
+    await app.connect()
+    me = await login_with_qr(app, timeout=300)
+    ```
+
+By default the `tg://login` link is printed. Pass `render=` a function to
+show it your own way (it gets a token object with a `.url`). With 2FA on,
+pass `password=`, or catch `TwoFactorRequired` and call the library's own
+password step.
+
+## How it works
+
+### The wire
 
 TL layer 229 (verified against the generated layers of **Telethon 1.45.0**
 and **kurigram 2.2.26** in this repo's venvs; both distributions ship these
@@ -66,48 +101,7 @@ telethon import):
 `except_ids` exists in the wire API for "don't offer accounts already
 logged in on this device"; a single-account tool leaves it empty.
 
-## Architecture — the passkey pattern, again
-
-Mirrors `passkeys_core.py` deliberately, so the two ceremonies share every
-rule they can:
-
-* **`qrlogin_core.py`** — TL spec as JSON-serializable data, a neutral
-  writer/reader, the state machine (`QrLoginMachine`:
-  `start/refresh/poll/import_token` + `seconds_left/expired`), and the
-  interactive loop (`run_ceremony`). All framework I/O goes through a
-  duck-typed invoker (`request_bytes(name, fields) -> bytes`); the
-  embedded `auth.Authorization` is parsed by the exact reader the passkey
-  ceremony uses (`passkeys_core._read_authorization`), so the two cannot
-  disagree about that response.
-* **`qrlogin.py`** (Telethon) / **`qrlogin_pyrogram.py`** (kurigram &
-  family) — thin drivers: the invoker, the `updateLoginToken` wait, the
-  migrate handoff and the post-login bookkeeping (`client._on_login` /
-  `storage.user_id` + `is_bot`).
-* **`dcswitch.py`** — the DC-switch snapshot/rollback, **shared** with the
-  passkey drivers (refactored out of `passkeys.py` /
-  `passkeys_pyrogram.py`): Telethon's `client._switch_dc` rewrites the
-  caller's session and erases its auth key, so a failed import rolls the
-  session back (DC, address, port, key) and re-connects on the restored
-  DC; the Pyrogram side is kurigram's own migration recipe
-  (`get_session(temporary=True)` + storage swap). A 2FA stop intentionally
-  keeps the migrated session — the password step belongs on the account's
-  home DC, where a wrong password stays retryable.
-
-Library use:
-
-```python
-from tgmint import qrlogin, qrlogin_core
-
-machine = qrlogin.qr_login(client)            # connected, unauthorized
-result = await machine.start()                # QrLoginToken -> render .url
-...
-me = await qrlogin.login_with_qr(client, render=show, timeout=300)
-```
-
-The Pyrogram-family driver has the same surface (`tgmint.qrlogin_pyrogram`)
-for kurigram/pyrofork clients connected with `await client.connect()`.
-
-## The QR in the terminal — no new dependency
+### The QR in the terminal — no new dependency
 
 The QR is encoded and rendered by `src/tgmint/qrrender.py`, tgmint's own
 pure-Python implementation of the ISO/IEC 18004 slice this needs: byte
@@ -129,9 +123,43 @@ encoder emit.) The test suite imports neither library; the recorded
 fixtures run in CI. No `[qr]` extra exists because nothing external is
 needed.
 
-## What tgmint adds
+??? info "Code layout"
 
-Telethon and kurigram can already log in by QR. tgmint adds one login flow
-that works the same in both, a shared DC-switch with rollback, an official
-identity for the new session, and a terminal QR code with no extra
-dependencies.
+    Mirrors `passkeys_core.py` deliberately, so the two ceremonies share every
+    rule they can:
+
+    * **`qrlogin_core.py`** — TL spec as JSON-serializable data, a neutral
+      writer/reader, the state machine (`QrLoginMachine`:
+      `start/refresh/poll/import_token` + `seconds_left/expired`), and the
+      interactive loop (`run_ceremony`). All framework I/O goes through a
+      duck-typed invoker (`request_bytes(name, fields) -> bytes`); the
+      embedded `auth.Authorization` is parsed by the exact reader the passkey
+      ceremony uses (`passkeys_core._read_authorization`), so the two cannot
+      disagree about that response.
+    * **`qrlogin.py`** (Telethon) / **`qrlogin_pyrogram.py`** (kurigram &
+      family) — thin drivers: the invoker, the `updateLoginToken` wait, the
+      migrate handoff and the post-login bookkeeping (`client._on_login` /
+      `storage.user_id` + `is_bot`).
+    * **`dcswitch.py`** — the DC-switch snapshot/rollback, **shared** with the
+      passkey drivers (refactored out of `passkeys.py` /
+      `passkeys_pyrogram.py`): Telethon's `client._switch_dc` rewrites the
+      caller's session and erases its auth key, so a failed import rolls the
+      session back (DC, address, port, key) and re-connects on the restored
+      DC; the Pyrogram side is kurigram's own migration recipe
+      (`get_session(temporary=True)` + storage swap). A 2FA stop intentionally
+      keeps the migrated session — the password step belongs on the account's
+      home DC, where a wrong password stays retryable.
+
+    Library use:
+
+    ```python
+    from tgmint import qrlogin, qrlogin_core
+
+    machine = qrlogin.qr_login(client)            # connected, unauthorized
+    result = await machine.start()                # QrLoginToken -> render .url
+    ...
+    me = await qrlogin.login_with_qr(client, render=show, timeout=300)
+    ```
+
+    The Pyrogram-family driver has the same surface (`tgmint.qrlogin_pyrogram`)
+    for kurigram/pyrofork clients connected with `await client.connect()`.

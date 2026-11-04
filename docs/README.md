@@ -82,8 +82,9 @@ pip install "tgmint[passkeys]"
 
 - **New here?** [Getting started](getting-started.md) has three short
   recipes.
-- **Which library?** [Frameworks](frameworks.md) shows exactly what works
-  where.
+- **Which library?** [Frameworks](frameworks/index.md) has a working
+  example for Telethon, Pyrogram, kurigram, Hydrogram, GramJS,
+  MadelineProto and TDLib.
 - **Coming from opentele?** See [Migration from opentele](migration-from-opentele.md).
 
 !!! note "Your own accounts only"
